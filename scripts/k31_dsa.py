@@ -3,12 +3,12 @@ pages, as vLLM's Kimi K3.1 runs them on SM100 (FlashInferMLASparse over the plai
 
 Both sides project the indexer from the layer's input (`wk | weights_proj`, 160 bf16 columns) and from q_norm
 (`wq_b`, 32 heads of 128), bf16 GEMMs as vLLM's unquantized ones. The key goes through its LayerNorm into
-`idx.<l>`, a token-major state of 144-byte rows (128 e4m3, the f32 scale, padding) on the latent pages' slots;
-the query to e4m3 with its head weights folded (source/k31_dsa.cu).
+`idx.<l>`, a token-major state of 144-byte rows (128 e4m3, a UE8M0 scale word, padding) on the latent pages'
+slots; the query to e4m3 with UE8M0 scales and bf16 head weights (source/k31_dsa.cu).
 
 P scores every row against its sequence's keys up to its own position: the keys gathered sequence after
-sequence into one stream (k31_idx_plan / k31_idx_gather), DeepGEMM's MQA logits over it, vLLM's prefill top-k
-per row, the picks as cache slots. D scores its rows against their paged keys (DeepGEMM's paged MQA logits and
+sequence into one stream (k31_idx_plan / k31_idx_gather), DeepGEMM's bf16 MQA logits over it, a top-k per bf16
+row, the picks as cache slots. D scores its rows against their paged keys (DeepGEMM's paged MQA logits and
 its scheduler), the same top-k, the same slots. Then both run the absorbed query (k31_absorb on P,
 k3_mla_absorb_mma's OUT_HEADS=128 build on D) through TRT-LLM gen's sparse MLA and the latent output through
 W_UV and the gate (k31_vup_gate): the 96 heads ride as 128, the pad heads' query never written and their
@@ -24,13 +24,15 @@ IH, ID, IDX_ROW, TOPK, PAGE = 32, 128, 144, 2048, 64
 IDX_KW = ID + IH  # wk | weights_proj
 IDX_Q = IH * ID
 SMS = 152
-MQA = ("_ZN9deep_gemm16sm100_mqa_logitsILj32ELj128ELb0ELb1ELb0ELb0ELj4ELj256ELj3ELj5ELj152ELj128ELj256E"
-       "N7cutlass12float_e4m3_tEffLj2EEEvjjjPKjS4_S4_PT13_14CUtensorMap_stS7_S7_S7_S7_")
-MQA_SMEM = 220160
-PAGED = ("_ZN9deep_gemm22sm100_paged_mqa_logitsILj1ELj32ELj128ELj64ELb0ELb1ELb0ELj3ELj4ELj256ELj16ELj128ELj256E"
-         "N7cutlass12float_e4m3_tEffLj2EEEvjjjPKjPT13_S4_S4_S4_14CUtensorMap_stS7_S7_S7_S7_")
-PAGED_SMEM = 198656
-META = "_ZN9deep_gemm5sched31sm100_paged_mqa_logits_metadataILj1ELb1ELb0ELj256ELj152EEEvjjPKjS3_Pj"
+MQA = ("_ZN9deep_gemm16sm100_mqa_logitsILj32ELj128ELb0ELj4ELj384ELj128ELj3ELj3ELj3ELj152ELj128ELj384E"
+       "N7cutlass12float_e4m3_tELj3EEEvjjjPKjS4_S4_P13__nv_bfloat1614CUtensorMap_stS7_S7_S7_S7_")
+MQA_SMEM = 203776
+PAGED = ("_ZN9deep_gemm22sm100_paged_mqa_logitsILj32ELj128ELj64ELj4ELj128ELj3ELj3ELj3ELj384ELj8ELj128ELj384E"
+         "N7cutlass12float_e4m3_tELj3EEEvjjjPKjP13__nv_bfloat16S4_S4_S4_14CUtensorMap_stS7_S7_S7_S7_")
+PAGED_SMEM = 218112
+META = "_ZN9deep_gemm5sched31sm100_paged_mqa_logits_metadataILj384ELj152ELj4ELj256EEEvjPKjS3_Pj"
+META_THREADS = 256
+SPLIT_KV = 384  # DeepGEMM's KV split: the paged kernel's logits rows are whole splits
 # k31_absorb_tc's grid is odd so a block's items alternate halves (the rope rides on the first)
 ABSORB_TC_SMEM = 1024 + 3 * (16384 + 4 * 8192) + 32768 + 16384 + 8192 + 256  # its SMEM_BYTES
 VUP_SMEM = 3 * (64 + 128) * 72 * 2
@@ -41,8 +43,8 @@ HEADC_BYTES = (Q_LORA + KV_LORA + 64) * 2  # the gate's columns in P's fused pro
 
 
 def stride(ctx):
-    """A logits row: DeepGEMM's blocks of 256 keys."""
-    return -(-ctx // 256) * 256
+    """A logits row: DeepGEMM's KV splits."""
+    return -(-ctx // SPLIT_KV) * SPLIT_KV
 
 
 def tmap(param, dtype, dims, strides, box, swizzle):
@@ -60,18 +62,25 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1):
                        "inout state", "i32"],
             "impl": {"launches": [dsa("k31_idx_key", [{"ceil_div": [T, 4]}, 1, 1], [128, 1, 1])]},
         },
+        # (q, ldq, weights_proj, ldw, iq, sfq, w, rid, B); P has no request ids
         "idx_q": {
-            "params": ["in buffer<bf16>", "i32", "in buffer<bf16>", "i32", "out buffer<u8>", "out buffer<f32>", "i32"],
-            "impl": {"launches": [dsa("k31_idx_q", [T, 1, 1], [256, 1, 1])]},
+            "params": ["in buffer<bf16>", "i32", "in buffer<bf16>", "i32", "out buffer<u8>", "out buffer<u32>",
+                       "out buffer<bf16>", *([] if chunk else ["out buffer<u32>"]), "i32"],
+            "impl": {"launches": [dsa(
+                "k31_idx_q", [T, 1, 1], [256, 1, 1],
+                params=["in buffer<bf16>", "i32", "in buffer<bf16>", "i32", "out buffer<u8>", "out buffer<u32>",
+                        "out buffer<bf16>", "i64" if chunk else "out buffer<u32>", "i32"],
+                args=[*({"param": i} for i in range(7)), i64(0) if chunk else {"param": 7},
+                      {"param": 7 if chunk else 8}])]},
         },
         # each row's top TOPK over [0, len) as ascending positions (k31_topk, vLLM's set, deterministic);
         # D's few rows take one block an SM, a row of up to 32k keys read once into registers
         "idx_topk": {
-            "params": ["in buffer<f32>", "in buffer<i32>", "out buffer<i32>", "i32"],
+            "params": ["in buffer<bf16>", "in buffer<i32>", "out buffer<i32>", "i32"],
             "impl": {"launches": [launch(
                 "k31_topk", "k31_topk" if chunk else "k31_topk_held", grid=[T, 1, 1], block=[512, 1, 1],
                 smem=TOPK_SMEM,
-                params=["in buffer<f32>", "i32", "in buffer<i32>", "out buffer<i32>"],
+                params=["in buffer<bf16>", "i32", "in buffer<i32>", "out buffer<i32>"],
                 args=[{"param": 0}, {"param": 3}, {"param": 1}, {"param": 2}])]},
         },
         "absorb": {
@@ -122,25 +131,25 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1):
             # (cache, block_table, max_pages, seq_lens, seqs, kg, ksf)
             "idx_gather": {
                 "params": ["in state", "in buffer<i32>", "i32", "in buffer<i32>", "i32", "out buffer<u8>",
-                           "out buffer<f32>"],
+                           "out buffer<u32>"],
                 "impl": {"launches": [dsa("k31_idx_gather", [{"add": [{"ceil_div": [CTX, PAGE]}, "seqs"]}, 1, 1],
                                           [256, 1, 1])]},
             },
-            # (iq, wout, kg, ksf, ks, ke, logits, rows, keys): row r's logits at [r][0, ke - ks), rows n apart
+            # (iq, sfq, w, kg, ksf, ks, ke, logits, rows, keys): row r's logits at [r][0, ke - ks), rows n apart
             "idx_logits": {
-                "params": ["in buffer<u8>", "in buffer<f32>", "in buffer<u8>", "in buffer<f32>", "in buffer<u32>",
-                           "in buffer<u32>", "out buffer<f32>", "i32", "i32"],
+                "params": ["in buffer<u8>", "in buffer<u32>", "in buffer<bf16>", "in buffer<u8>", "in buffer<u32>",
+                           "in buffer<u32>", "in buffer<u32>", "out buffer<bf16>", "i32", "i32"],
                 "impl": {"launches": [{
-                    **module("k31_mqa_logits"), "entry": MQA, "grid": [SMS, 1, 1], "block": [384, 1, 1],
+                    **module("k31_mqa_logits"), "entry": MQA, "grid": [SMS, 1, 1], "block": [512, 1, 1],
                     "shared_mem": MQA_SMEM,
-                    "params": ["i32", "i32", "i32", "in buffer<u32>", "in buffer<u32>", "i64", "out buffer<f32>",
+                    "params": ["i32", "i32", "i32", "in buffer<u32>", "in buffer<u32>", "i64", "out buffer<bf16>",
                                *[TMAP] * 5],
-                    "args": [{"param": 7}, {"param": 8}, i32(n), {"param": 4}, {"param": 5}, i64(0), {"param": 6},
+                    "args": [{"param": 8}, {"param": 9}, i32(n), {"param": 5}, {"param": 6}, i64(0), {"param": 7},
                              tmap(0, "u8", [ID, 0], [ID], [ID, 128], 128),
-                             tmap(3, "f32", [n, 1], [n * 4], [256, 1], 0),
-                             tmap(2, "u8", [ID, 0], [ID], [ID, 256], 128),
-                             tmap(3, "f32", [n, 1], [n * 4], [256, 1], 0),
-                             tmap(1, "f32", [IH, 0], [IH * 4], [IH, 4], 0)],
+                             tmap(1, "u32", [IH, 0], [IH * 4], [IH, 4], 0),
+                             tmap(3, "u8", [ID, 0], [ID], [ID, 128], 128),
+                             tmap(4, "u32", [n, 1], [n * 4], [128, 1], 0),
+                             tmap(2, "bf16", [IH, 0], [IH * 2], [IH, 4], 0)],
                 }]},
             },
             # (ind, block_table, max_pages, row_seq, klen, tlen, B)
@@ -154,32 +163,33 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1):
         n = stride(max_ctx)
         page_bytes = PAGE * IDX_ROW
         o.update({
-            # (seq_lens, schedule, rows): DeepGEMM's split of the batch's pages over the SMs
+            # (seq_lens, rid, schedule, rows): DeepGEMM's split of the batch's KV splits over the SMs
             "idx_sched": {
-                "params": ["in buffer<i32>", "out buffer<i32>", "i32"],
+                "params": ["in buffer<i32>", "in buffer<u32>", "out buffer<i32>", "i32"],
                 "impl": {"launches": [{
-                    **module("k31_paged_mqa_logits"), "entry": META, "grid": [1, 1, 1], "block": [1024, 1, 1],
-                    "shared_mem": (seqs_max + 33) * 4,
-                    "params": ["i32", "i32", "in buffer<i32>", "i64", "out buffer<i32>"],
-                    "args": [{"param": 2}, {"param": 2}, {"param": 0}, i64(0), {"param": 1}],
+                    **module("k31_paged_mqa_logits"), "entry": META, "grid": [1, 1, 1], "block": [META_THREADS, 1, 1],
+                    "shared_mem": (2 * seqs_max + META_THREADS // 32 + 1) * 4,
+                    "params": ["i32", "in buffer<i32>", "in buffer<u32>", "out buffer<i32>"],
+                    "args": [{"param": 3}, {"param": 0}, {"param": 1}, {"param": 2}],
                 }]},
             },
-            # (iq, wout, cache, cache + 128, seq_lens, block_table, schedule, logits, rows)
+            # (iq, sfq, w, cache, cache + 128, seq_lens, block_table, rid, schedule, logits, rows)
             "idx_logits": {
-                "params": ["in buffer<u8>", "in buffer<f32>", "in state", "in state", "in buffer<i32>",
-                           "in buffer<i32>", "in buffer<i32>", "out buffer<f32>", "i32"],
+                "params": ["in buffer<u8>", "in buffer<u32>", "in buffer<bf16>", "in state", "in state",
+                           "in buffer<i32>", "in buffer<i32>", "in buffer<u32>", "in buffer<i32>", "out buffer<bf16>",
+                           "i32"],
                 "impl": {"launches": [{
-                    **module("k31_paged_mqa_logits"), "entry": PAGED, "grid": [SMS, 1, 1], "block": [384, 1, 1],
+                    **module("k31_paged_mqa_logits"), "entry": PAGED, "grid": [SMS, 1, 1], "block": [512, 1, 1],
                     "shared_mem": PAGED_SMEM,
-                    "params": ["i32", "i32", "i32", "in buffer<i32>", "out buffer<f32>", "in buffer<i32>", "i64",
-                               "in buffer<i32>", *[TMAP] * 5],
-                    "args": [{"param": 8}, i32(n), i32(max_pages), {"param": 4}, {"param": 7}, {"param": 5}, i64(0),
-                             {"param": 6},
+                    "params": ["i32", "i32", "i32", "in buffer<i32>", "out buffer<bf16>", "in buffer<i32>",
+                               "in buffer<u32>", "in buffer<i32>", *[TMAP] * 5],
+                    "args": [{"param": 10}, i32(n), i32(max_pages), {"param": 5}, {"param": 9}, {"param": 6},
+                             {"param": 7}, {"param": 8},
                              tmap(0, "u8", [ID, 0], [ID], [ID, 128], 128),
-                             tmap(3, "f32", [4, PAGE, 0], [IDX_ROW, page_bytes], [4, PAGE, 1], 0),
-                             tmap(2, "u8", [ID, PAGE, 0], [IDX_ROW, page_bytes], [ID, PAGE, 1], 128),
-                             tmap(3, "f32", [4, PAGE, 0], [IDX_ROW, page_bytes], [4, PAGE, 1], 0),
-                             tmap(1, "f32", [IH, 0], [IH * 4], [IH, 4], 0)],
+                             tmap(1, "u32", [IH, 0], [IH * 4], [IH, 4], 0),
+                             tmap(3, "u8", [ID, PAGE, 0], [IDX_ROW, page_bytes], [ID, PAGE, 1], 128),
+                             tmap(4, "u32", [4, PAGE, 0], [IDX_ROW, page_bytes], [4, PAGE, 1], 0),
+                             tmap(2, "bf16", [IH, 0], [IH * 2], [IH, 4], 0)],
                 }]},
             },
             # (ind, block_table, max_pages, seq_lens, tlen, B): row r is sequence r
@@ -198,10 +208,10 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1):
         o.update({
             # (logits, stride, ind, cand): the local top-k as (score, global position) candidates
             "idx_pack": {
-                "params": ["in buffer<f32>", "i32", "in buffer<i32>", "out buffer<f32>"],
+                "params": ["in buffer<bf16>", "i32", "in buffer<i32>", "out buffer<f32>"],
                 "impl": {"launches": [dsa(
                     "k31_dcp_pack", [T, 1, 1], [256, 1, 1],
-                    params=["in buffer<f32>", "i32", "in buffer<i32>", "i32", "i32", "out buffer<f32>"],
+                    params=["in buffer<bf16>", "i32", "in buffer<i32>", "i32", "i32", "out buffer<f32>"],
                     args=[{"param": 0}, {"param": 1}, {"param": 2}, {"rank": "tp"}, i32(tp), {"param": 3}])]},
             },
             # every member's candidates, member-major
@@ -238,21 +248,23 @@ def buffers(work, bufs, chunk, max_ctx, seqs_max, tp=1):
     work("idx_kwo", IDX_KW)
     work("idx_qb", IDX_Q)
     work("idx_iq", IDX_Q, "u8")
-    work("idx_w", IH, "f32")
+    work("idx_sfq", IH, "u32")
+    work("idx_w", IH)
     work("idx_ind", TOPK, "i32")
     work("idx_tlen", 1, "i32")
     work("mla_q_abs", sparse.HEADS * sparse.D_QK, "fp8e4m3")
     work("mla_o", sparse.HEADS * sparse.D_V)
     work("mla_md", sparse.HEADS * 2, "f32")
-    work("idx_logits", stride(max_ctx), "f32")
+    work("idx_logits", stride(max_ctx))
     if chunk:
         for x in ("idx_ks", "idx_ke"):
             work(x, 1, "u32")
         work("idx_klen", 1, "i32")
         work("idx_row_seq", 1, "i32")
         bufs["idx_kg"] = {"dtype": "u8", "shape": [stride(max_ctx), ID], "kind": "workspace"}
-        bufs["idx_ksf"] = {"dtype": "f32", "shape": [stride(max_ctx)], "kind": "workspace"}
+        bufs["idx_ksf"] = {"dtype": "u32", "shape": [stride(max_ctx)], "kind": "workspace"}
     else:
+        work("idx_rid", 1, "u32")
         bufs["idx_sched"] = {"dtype": "i32", "shape": [(SMS + 1) * 2], "kind": "workspace"}
         if tp > 1:
             # (score, global position) a candidate: this member's, then every member's
@@ -269,19 +281,21 @@ def steps(step, w, L, kv, idx, chunk, gate, max_pages, max_ctx, q, exchange=None
     step(L + "idx_key", "idx_key", b("idx_kwo"), i32(IDX_KW), w("idx_kn_w"), w("idx_kn_b"), b("slot_mapping"),
          {"state": idx}, B)
     step(L + "idx_qb", "gemm_bf16", b("q_norm"), w("idx_qw"), b("idx_qb"), B, i32(IDX_Q), i32(Q_LORA), i32(IDX_Q))
-    step(L + "idx_q", "idx_q", b("idx_qb"), i32(IDX_Q), b("idx_kwo", ID * 2), i32(IDX_KW), b("idx_iq"), b("idx_w"), B)
+    step(L + "idx_q", "idx_q", b("idx_qb"), i32(IDX_Q), b("idx_kwo", ID * 2), i32(IDX_KW), b("idx_iq"), b("idx_sfq"),
+         b("idx_w"), *([] if chunk else [b("idx_rid")]), B)
     if chunk:
         step(L + "idx_plan", "idx_plan", b("cu_seqlens"), b("seq_lens"), {"var": "seqs"}, b("idx_ks"), b("idx_ke"),
              b("idx_klen"), b("idx_row_seq"), B)
         step(L + "idx_gather", "idx_gather", {"state": idx}, b("block_table"), i32(max_pages), b("seq_lens"),
              {"var": "seqs"}, b("idx_kg"), b("idx_ksf"))
-        step(L + "idx_logits", "idx_logits", b("idx_iq"), b("idx_w"), b("idx_kg"), b("idx_ksf"), b("idx_ks"),
-             b("idx_ke"), b("idx_logits"), B, {"var": CTX})
+        step(L + "idx_logits", "idx_logits", b("idx_iq"), b("idx_sfq"), b("idx_w"), b("idx_kg"), b("idx_ksf"),
+             b("idx_ks"), b("idx_ke"), b("idx_logits"), B, {"var": CTX})
         ends = b("idx_klen")
     else:
-        step(L + "idx_sched", "idx_sched", b("seq_lens"), b("idx_sched"), B)
-        step(L + "idx_logits", "idx_logits", b("idx_iq"), b("idx_w"), {"state": idx}, {"state": idx, "offset": ID},
-             b("seq_lens"), b("block_table"), b("idx_sched"), b("idx_logits"), B)
+        step(L + "idx_sched", "idx_sched", b("seq_lens"), b("idx_rid"), b("idx_sched"), B)
+        step(L + "idx_logits", "idx_logits", b("idx_iq"), b("idx_sfq"), b("idx_w"), {"state": idx},
+             {"state": idx, "offset": ID}, b("seq_lens"), b("block_table"), b("idx_rid"), b("idx_sched"),
+             b("idx_logits"), B)
         ends = b("seq_lens")
     step(L + "idx_topk", "idx_topk", b("idx_logits"), ends, b("idx_ind"), i32(stride(max_ctx)))
     if chunk:

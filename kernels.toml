@@ -9,7 +9,7 @@ arch = "sm_103a"
 # Git submodules under third_party/ (their CUTLASS submodules at `cutlass`), MIT-licensed by DeepSeek.
 [upstreams.DeepGEMM]
 url = "https://github.com/deepseek-ai/DeepGEMM"
-commit = "ab69f76be5bb9ea3499bc755002b1a876cb0b3d9"
+commit = "5081f8513af57e61696de4f4f04b0e707ffb503e"
 cutlass = "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8"
 
 [flags]
@@ -17,27 +17,26 @@ plain = ["-std=c++17", "-O3"]
 deepgemm = ["-std=c++20", "-O3", "--expt-relaxed-constexpr", "-DDG_NO_TORCH", "-diag-suppress", "20012,177"]
 
 [includes]
-deepgemm = ["third_party/DeepGEMM/deep_gemm/include", "third_party/DeepGEMM/third-party/cutlass/include"]
-deepgemm_k31 = ["source/deepgemm-k31", "third_party/DeepGEMM/deep_gemm/include", "third_party/DeepGEMM/third-party/cutlass/include"]
+deepgemm = ["source/deepgemm-k31", "third_party/DeepGEMM/deep_gemm/include", "third_party/DeepGEMM/third-party/cutlass/include"]
 
-# K3.1's indexer: DeepGEMM's fp8 MQA logits (32 heads of 128) and vLLM's prefill top-2048, the
-# instances kern-glm53-pp-prefill runs for GLM-5.3's identical indexer.
+# K3.1's indexer as vLLM runs it on SM100: DeepGEMM's MQA logits (32 heads of 128, bf16 out), P's over
+# the gathered key stream, D's over the paged cache, and a top-2048 over bf16 rows.
 [kernels."k31_mqa_logits"]
-sha256 = "d103d30479cbae2a4c33b83efb85a07e1c93b03b96c3748501586b404557a1aa"
+sha256 = "b2caebce3c2b82fb553aa0cd883c9c2c5d28291235579dc2b0edbc565842c7d5"
 source = "source/k31_mqa_logits.cu"
+flags = "deepgemm"
+includes = ["deepgemm"]
+
+[kernels."k31_paged_mqa_logits"]
+sha256 = "39b444c6ec14b9514ca496b8decd98ff84bdd85ef1bd9ba18523236e2baa3a21"
+source = "source/k31_paged_mqa_logits.cu"
 flags = "deepgemm"
 includes = ["deepgemm"]
 
 # K3.1's DSA glue: the indexer key into its cache, the query and head weights, the key stream the
 # MQA logits read, the top-k as cache slots. Ours, after vLLM's K3.1 math.
-[kernels."k31_paged_mqa_logits"]
-sha256 = "c372df6859a27173f1fe2f82629247682de1eb5c2e071ce89dfa4cb091f5f7a6"
-source = "source/k31_paged_mqa_logits.cu"
-flags = "deepgemm"
-includes = ["deepgemm_k31"]
-
 [kernels."k31_dsa"]
-sha256 = "283b9c4f212d2cd7daa690472e4820c2243d585b0387187510ceae176c48fdcf"
+sha256 = "2f90d02358c7546e9891309bea2c2c67e365b4df8260f56e7aad33a433f2e5f5"
 source = "source/k31_dsa.cu"
 flags = "plain"
 
@@ -47,7 +46,7 @@ source = "source/vllm-topk/topk.cu"
 flags = "plain"
 
 [kernels."k31_topk"]
-sha256 = "1543557fb458506bc73657a707f6e761406dc03e8f572b1766c56d3040a6582f"
+sha256 = "bf49310b44828a376ecb36b0250d6725e49300f73d7f5d30be8a0317799f2708"
 source = "source/k31_topk.cu"
 flags = "plain"
 
@@ -446,7 +445,7 @@ source = "source/peer_allreduce_bf16.cu"
 defines = { NRANKS = 4 }
 
 [kernels."k31_dsa+DCP_W=4"]
-sha256 = "597090675cfd98a99970e2ffc0f3a688a17295b794498178979aa69a0eb2ac10"
+sha256 = "1bda69a82b1f99d886ec567a058171d7bbc9d8696c79a81d82282340a7166fa2"
 source = "source/k31_dsa.cu"
 flags = "plain"
 defines = { DCP_W = 4 }

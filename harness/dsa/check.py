@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The indexer chain of a K3.1 prefill call against a torch reference, on one GPU, no checkpoint:
-k31_idx_key -> k31_idx_q -> k31_idx_plan -> k31_idx_gather -> DeepGEMM MQA logits -> vLLM top-k ->
+k31_idx_key -> k31_idx_q -> k31_idx_plan -> k31_idx_gather -> DeepGEMM's bf16 MQA logits -> k31_topk ->
 k31_topk_slots, launched from the cubins scripts/build.py wrote, with the parameter blocks and
 tensor maps the generator will use. Prints each stage's agreement and each launch's time.
 
@@ -18,9 +18,10 @@ from cuda.bindings import driver as cu
 
 ROOT = Path(__file__).resolve().parents[2]
 IH, ID, TOPK, PAGE, ROW = 32, 128, 2048, 64, 144
-SMS, SMEM = 152, 220160
-MQA = ("_ZN9deep_gemm16sm100_mqa_logitsILj32ELj128ELb0ELb1ELb0ELb0ELj4ELj256ELj3ELj5ELj152ELj128ELj256E"
-       "N7cutlass12float_e4m3_tEffLj2EEEvjjjPKjS4_S4_PT13_14CUtensorMap_stS7_S7_S7_S7_")
+SMS, SMEM, TOPK_SMEM, SPLIT_KV = 152, 203776, 93408, 384
+MQA = ("_ZN9deep_gemm16sm100_mqa_logitsILj32ELj128ELb0ELj4ELj384ELj128ELj3ELj3ELj3ELj152ELj128ELj384E"
+       "N7cutlass12float_e4m3_tELj3EEEvjjjPKjS4_S4_P13__nv_bfloat1614CUtensorMap_stS7_S7_S7_S7_")
+U8, U32, BF16 = (getattr(cu.CUtensorMapDataType, f"CU_TENSOR_MAP_DATA_TYPE_{t}") for t in ("UINT8", "UINT32", "BFLOAT16"))
 
 
 def ok(r):
@@ -75,6 +76,16 @@ def ue8m0(amax, eps):
     return torch.exp2(torch.ceil(torch.log2(torch.clamp(amax, min=eps) / 448.0)))
 
 
+def ue8m0_byte(sc):
+    return (sc.contiguous().view(torch.int32) >> 23).to(torch.uint8)
+
+
+def topk_exact(got, row, k):
+    """`got` holds k of `row`'s largest values: ties may pick any of the equal positions."""
+    want = torch.topk(row, min(k, row.numel())).values
+    return got.numel() == want.numel() and bool((row[got].sort().values == want.sort().values).all())
+
+
 def ref_key(k, w, b):
     y = torch.nn.functional.layer_norm(k.float(), (ID,), w.float(), b.float(), 1e-5).bfloat16().float()
     sc = ue8m0(y.abs().amax(-1, keepdim=True), 1e-4)
@@ -82,9 +93,16 @@ def ref_key(k, w, b):
 
 
 def ref_q(q, iw):
+    """The e4m3 query, its per-head UE8M0 scale and the bf16 head weights."""
     v = q.float()
     sc = ue8m0(v.abs().amax(-1, keepdim=True), 1e-10)
-    return (v / sc).clamp(-448, 448).to(torch.float8_e4m3fn), iw.float() * sc.squeeze(-1) * 0.015625
+    return (v / sc).clamp(-448, 448).to(torch.float8_e4m3fn), sc.squeeze(-1), (iw.float() * 0.015625).bfloat16()
+
+
+def ref_logits(rq, rsq, rw, kd):
+    """f32 logits of rows (rq, rsq, rw) against dequantized keys `kd`."""
+    s = torch.einsum("rhd,nd->rhn", rq.float() * rsq[..., None], kd)
+    return (s.relu() * rw.float()[..., None]).sum(1)
 
 
 def main():
@@ -108,15 +126,15 @@ def main():
     bt = bt.to(dev)
     cache = torch.zeros((sum(pages) + 1) * PAGE * ROW, dtype=torch.uint8, device=dev)
     L = Launcher()
-    g, mqa_mod, topk_mod = module("k31_dsa"), module("k31_mqa_logits"), module("vllm_topk")
+    g, mqa_mod, topk_mod = module("k31_dsa"), module("k31_mqa_logits"), module("k31_topk")
     fn = {n: ok(cu.cuModuleGetFunction(g, n.encode())) for n in
           ("k31_idx_key", "k31_idx_q", "k31_idx_plan", "k31_idx_gather", "k31_topk_slots")}
     mqa = ok(cu.cuModuleGetFunction(mqa_mod, MQA.encode()))
     ok(cu.cuFuncSetAttribute(mqa, cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                               SMEM))
-    topk = ok(cu.cuModuleGetFunction(topk_mod, b"glm_topk_prefill"))
+    topk = ok(cu.cuModuleGetFunction(topk_mod, b"k31_topk"))
     ok(cu.cuFuncSetAttribute(topk, cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                              TOPK * 4))
+                              TOPK_SMEM))
     times = {}
 
     # 1. every position's key into the cache (prefix and this call alike), a slot through the page table
@@ -133,7 +151,7 @@ def main():
     rk, rsc = ref_key(proj[:, :ID], kw, kb)
     rows = cache.view(-1, ROW)[slot]
     kbytes = (rows[:, :ID] == rk.view(torch.uint8)).float().mean().item()
-    kscale = (rows[:, ID:ID + 4].contiguous().view(torch.float32).squeeze(-1) == rsc).float().mean().item()
+    kscale = (rows[:, ID:ID + 4] == ue8m0_byte(rsc)[:, None]).float().mean().item()
     print(f"key   bytes equal {kbytes:.6f}, scales equal {kscale:.6f}")
     bad = (rows[:, :ID] != rk.view(torch.uint8)).nonzero()
     for r, c in bad[:4].tolist():
@@ -147,12 +165,14 @@ def main():
     q = torch.randn(R, ldq, device=dev).bfloat16()
     iw = torch.randn(R, IH + 8, device=dev).bfloat16()
     iq = torch.empty(R, IH, ID, dtype=torch.uint8, device=dev)
-    wout = torch.empty(R, IH, dtype=torch.float32, device=dev)
+    sfq = torch.empty(R, IH, 4, dtype=torch.uint8, device=dev)
+    wout = torch.empty(R, IH, dtype=torch.bfloat16, device=dev)
     qq = lambda: L(fn["k31_idx_q"], (R, 1, 1), (256, 1, 1),
-                   [q, ctypes.c_int(ldq), iw, ctypes.c_int(IH + 8), iq, wout, ctypes.c_int(R)])
+                   [q, ctypes.c_int(ldq), iw, ctypes.c_int(IH + 8), iq, sfq, wout, ctypes.c_int64(0), ctypes.c_int(R)])
     times["k31_idx_q"] = L.time(a.iters, qq)
-    rq, rw = ref_q(q[:, :IH * ID].view(R, IH, ID), iw[:, :IH])
+    rq, rsq, rw = ref_q(q[:, :IH * ID].view(R, IH, ID), iw[:, :IH])
     print(f"query bytes equal {(iq == rq.view(torch.uint8)).float().mean().item():.6f}, "
+          f"scales equal {(sfq == ue8m0_byte(rsq)[..., None]).float().mean().item():.6f}, "
           f"weights equal {(wout == rw).float().mean().item():.6f}")
 
     # 3. plan, gather, logits, top-k, slots
@@ -163,51 +183,47 @@ def main():
                      [cu_rows, seq_lens, ctypes.c_int(nseq), ks, ke, klen, row_seq, ctypes.c_int(R)])
     times["k31_idx_plan"] = L.time(a.iters, plan)
     kg = torch.empty(N, ID, dtype=torch.uint8, device=dev)
-    ksf = torch.empty(N, dtype=torch.float32, device=dev)
+    ksf = torch.empty(N, 4, dtype=torch.uint8, device=dev)
     gblocks = sum(pages) + nseq
     gather = lambda: L(fn["k31_idx_gather"], (gblocks, 1, 1), (256, 1, 1),
                        [cache, bt, ctypes.c_int(max_pages), seq_lens, ctypes.c_int(nseq), kg, ksf])
     times["k31_idx_gather"] = L.time(a.iters, gather)
     print(f"gather keys equal {(kg == rk.view(torch.uint8)).float().mean().item():.6f}, "
-          f"scales equal {(ksf == rsc).float().mean().item():.6f}")
+          f"scales equal {(ksf == ue8m0_byte(rsc)[:, None]).float().mean().item():.6f}")
 
-    stride = math.ceil(N / 256) * 256
-    logits = torch.full((R, stride), float("nan"), dtype=torch.float32, device=dev)
-    U8, F32 = cu.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8, cu.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_FLOAT32
-    sf_map = tmap(ksf, F32, [N, 1], [N * 4], [256, 1], 0)
-    maps = [tmap(iq, U8, [ID, R * IH], [ID], [ID, 128], 128), sf_map,
-            tmap(kg, U8, [ID, N], [ID], [ID, 256], 128), sf_map,
-            tmap(wout, F32, [IH, R], [IH * 4], [IH, 4], 0)]
-    mqa_call = lambda: L(mqa, (SMS, 1, 1), (384, 1, 1),
+    stride = math.ceil(N / SPLIT_KV) * SPLIT_KV
+    logits = torch.full((R, stride), float("nan"), dtype=torch.bfloat16, device=dev)
+    maps = [tmap(iq, U8, [ID, R * IH], [ID], [ID, 128], 128),
+            tmap(sfq, U32, [IH, R], [IH * 4], [IH, 4], 0),
+            tmap(kg, U8, [ID, N], [ID], [ID, 128], 128),
+            tmap(ksf, U32, [N, 1], [stride * 4], [128, 1], 0),
+            tmap(wout, BF16, [IH, R], [IH * 2], [IH, 4], 0)]
+    mqa_call = lambda: L(mqa, (SMS, 1, 1), (512, 1, 1),
                          [ctypes.c_int(R), ctypes.c_int(N), ctypes.c_int(stride), ks, ke, ctypes.c_int64(0), logits,
                           *maps], SMEM)
     times["mqa_logits"] = L.time(a.iters, mqa_call)
     kd = rk.float() * rsc[:, None]
     ref = torch.empty(R, N, device=dev)
     for r0 in range(0, R, 256):
-        s = torch.einsum("rhd,nd->rhn", rq[r0:r0 + 256].float(), kd)
-        ref[r0:r0 + 256] = (s.relu() * rw[r0:r0 + 256, :, None]).sum(1)
+        ref[r0:r0 + 256] = ref_logits(rq[r0:r0 + 256], rsq[r0:r0 + 256], rw[r0:r0 + 256], kd)
     err = []
     for r in range(R):
         n, s0 = int(klen[r]), int(ks[r])
-        x, y = logits[r, :n], ref[r, s0:s0 + n]
+        x, y = logits[r, :n].float(), ref[r, s0:s0 + n]
         err.append(((x - y).abs().max() / y.abs().max().clamp(min=1e-6)).item())
     print(f"logits max relative error {max(err):.3e}")
 
     ind = torch.empty(R, TOPK, dtype=torch.int32, device=dev)
-    tk = lambda: L(topk, (R, 1, 1), (512, 1, 1),
-                   [logits, zero, klen, ind, ctypes.c_int(stride), ctypes.c_int(1), ctypes.c_int(TOPK),
-                    ctypes.c_int(0)], TOPK * 4)
+    tk = lambda: L(topk, (R, 1, 1), (512, 1, 1), [logits, ctypes.c_int(stride), klen, ind], TOPK_SMEM)
     times["topk"] = L.time(a.iters, tk)
-    recall, rrecall = [], []
+    exact, rrecall = 0, []
     for r in range(R):
         n, s0 = int(klen[r]), int(ks[r])
-        got = set(ind[r][ind[r] >= 0].tolist())
-        want = set(torch.topk(logits[r, :n], min(n, TOPK)).indices.tolist())
-        recall.append(len(got & want) / len(want))
+        got = ind[r][ind[r] >= 0].long()
+        exact += topk_exact(got, logits[r, :n], TOPK)
         true = set(torch.topk(ref[r, s0:s0 + n], min(n, TOPK)).indices.tolist())
-        rrecall.append(len(got & true) / len(true))
-    print(f"top-k recall vs torch.topk of the kernel's own logits: min {min(recall):.6f}")
+        rrecall.append(len(set(got.tolist()) & true) / len(true))
+    print(f"top-k: rows holding the k largest of the kernel's own logits {exact}/{R}")
     print(f"top-k recall vs the f32 reference's top-k: min {min(rrecall):.6f}, mean {sum(rrecall) / R:.6f}")
 
     picked = ind.clone()
