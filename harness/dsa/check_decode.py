@@ -2,8 +2,8 @@
 """D's indexer under DCP on one GPU, W = 8 members emulated: every member's keys in its own 144-byte
 token-major pages (position p on member p % 8), its local logits by the paged MQA kernel
 (k31_paged_mqa_logits, bf16 out, with DeepGEMM's metadata kernel), its local top-k (k31_topk_held), its
-candidates (k31_dcp_pack), the all-gather as a concatenation, and every member's share of the group's top 2048
-(k31_dcp_select). Checks the local logits against a torch reference and the union of the members' selections
+candidates pushed into every member's Lamport stage (k31_dcp_pack, the members' stages and states on one GPU),
+and every member's share of the group's top 2048 (k31_dcp_select). Checks the local logits against a torch reference and the union of the members' selections
 against the global top 2048 of the same logits, by value: bf16 ties may pick any of the equal positions.
 
     python3 harness/dsa/check_decode.py [--ctx-max 200000] [--rows 64]
@@ -40,7 +40,7 @@ def main():
     L = Launcher()
     g, pm, topk_mod = module("k31_dsa"), module("k31_paged_mqa_logits"), module("k31_topk")
     fn = {n: ok(cu.cuModuleGetFunction(g, n.encode())) for n in ("k31_idx_key", "k31_idx_q", "k31_dcp_pack",
-                                                                  "k31_dcp_select")}
+                                                                  "k31_dcp_poison", "k31_dcp_select")}
     paged, meta = ok(cu.cuModuleGetFunction(pm, PAGED.encode())), ok(cu.cuModuleGetFunction(pm, META.encode()))
     topk = ok(cu.cuModuleGetFunction(topk_mod, b"k31_topk_held"))
     attr = cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
@@ -61,7 +61,7 @@ def main():
     kw = (1 + 0.1 * torch.randn(ID, device=dev)).bfloat16()
     kb = (0.1 * torch.randn(ID, device=dev)).bfloat16()
 
-    gathered, members, times, err = [], [], {}, (0.0,)
+    members, times, err = [], {}, (0.0,)
     for m in range(W):
         lens = [max(0, (c - m + W - 1) // W) for c in ctx]
         pages = [max(1, math.ceil(n / PAGE)) for n in lens]
@@ -113,21 +113,36 @@ def main():
         ind = torch.empty(R, TOPK, dtype=torch.int32, device=dev)
         tk = lambda: L(topk, (R, 1, 1), (512, 1, 1), [logits, ctypes.c_int(stride), lens_t, ind], TOPK_SMEM)
         times.setdefault("local_topk", []).append(L.time(a.iters, tk))
-        cand = torch.empty(R, TOPK, 2, dtype=torch.float32, device=dev)
-        pk = lambda: L(fn["k31_dcp_pack"], (R, 1, 1), (256, 1, 1), [logits, ctypes.c_int(stride), ind, ctypes.c_int(m),
-                                                                     ctypes.c_int(W), cand])
-        times.setdefault("pack", []).append(L.time(a.iters, pk))
-        gathered.append(cand)
-        members.append((bt, max_pages, logits, lens))
+        members.append((bt, max_pages, logits, lens, stride, ind))
 
-    allc = torch.stack(gathered)  # [W, R, 2048, 2], as the all-gather lays it out
+    # every member's three stages of [W][R][2048] candidates, poisoned once, and its zeroed state
+    stage_bytes = W * R * TOPK * 8
+    lam = [torch.empty(3 * stage_bytes, dtype=torch.uint8, device=dev) for _ in range(W)]
+    state = [torch.zeros(8, dtype=torch.int32, device=dev) for _ in range(W)]
+    late = torch.zeros(1, dtype=torch.int32, device=dev)
+    peers = torch.tensor([x.data_ptr() for x in lam], dtype=torch.int64, device=dev)
+    for x in lam:
+        L(fn["k31_dcp_poison"], (SMS, 1, 1), (256, 1, 1), [x, ctypes.c_longlong(3 * stage_bytes)])
+    outs = [(torch.empty(R, TOPK, dtype=torch.int32, device=dev), torch.empty(R, dtype=torch.int32, device=dev),
+             torch.empty(R, dtype=torch.int32, device=dev)) for _ in range(W)]
+
+    def exchange():
+        for m, (bt, max_pages, logits, lens, stride, ind) in enumerate(members):
+            L(fn["k31_dcp_pack"], (R, 1, 1), (256, 1, 1), [logits, ctypes.c_int(stride), ind, ctypes.c_int(m),
+              ctypes.c_int(W), ctypes.c_int(R), peers, state[m], ctypes.c_longlong(stage_bytes)])
+        for m, (bt, max_pages, *_rest) in enumerate(members):
+            sel, sl, live = outs[m]
+            L(fn["k31_dcp_select"], (R, 1, 1), (1024, 1, 1),
+              [lam[m], state[m], late, ctypes.c_longlong(stage_bytes), ctypes.c_longlong(10**9), ctypes.c_int(R),
+               ctypes.c_int(m), bt, ctypes.c_int(max_pages), sel, sl, live])
+
+    times["pack + select"] = [L.time(a.iters, exchange) / W]
+    exchange()
+    torch.cuda.synchronize()
+    assert int(late) == 0
     picked = [set() for _ in range(R)]
-    for m, (bt, max_pages, logits, lens) in enumerate(members):
-        sel, sl, live = (torch.empty(R, TOPK, dtype=torch.int32, device=dev), torch.empty(R, dtype=torch.int32,
-                         device=dev), torch.empty(R, dtype=torch.int32, device=dev))
-        sc = lambda: L(fn["k31_dcp_select"], (R, 1, 1), (1024, 1, 1),
-                       [allc, ctypes.c_int(R), ctypes.c_int(m), bt, ctypes.c_int(max_pages), sel, sl, live])
-        times.setdefault("select", []).append(L.time(a.iters, sc))
+    for m, (bt, max_pages, logits, lens, *_rest) in enumerate(members):
+        sel, sl, live = outs[m]
         # back from slots to local positions to global positions
         inv = {}
         for r in range(R):
@@ -141,7 +156,7 @@ def main():
     bad = 0
     for r in range(R):
         row = torch.empty(ctx[r], device=dev)
-        for m, (_, _, logits, lens) in enumerate(members):
+        for m, (_, _, logits, lens, *_rest) in enumerate(members):
             row[m::W] = logits[r, :lens[r]].float()
         got = torch.tensor(sorted(picked[r]), dtype=torch.long, device=dev)
         bad += not topk_exact(got, row, TOPK)
