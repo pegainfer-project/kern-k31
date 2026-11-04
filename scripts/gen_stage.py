@@ -88,6 +88,7 @@ KV = {"fp8": k3_kv_fp8, "bf16": k3_kv_bf16}
 # k3_ar_fused.cu's KGRID, one block an SM: every block resident on 148 and 152 SMs, a multiple of the cluster of 8
 # and under the 256-row flag table
 TP_AR_GRID = 144
+SMEM_MAX = 232448  # opt-in shared memory a block, GB300 and B300
 DCP_GRID = 2 * 144  # k3_dcp.cu bounds the exchange to two blocks an SM: every block resident on 148 and 152 SMs
 KDA_SMEM_BLOCKS = 2 * 152  # ... and two of its blocks an SM: the batches of one wave of them
 CAND_SMEM = NB_MAX * H * 2  # k3_ar_fused.cu: a row's snapshots prefetched into shared memory
@@ -229,8 +230,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     # A D member's MoE front is one GEMM over the router, lat_down and this
     # rank's shared gate | up rows (one read of 86 MB at 6016 columns instead of
     # three launches with their split-K reduces); each reader takes its
-    # columns of the f32 row.
-    front = EXPERTS + LATENT + 2 * sh_l if xchg else 0
+    # columns of the f32 row. Its kernel holds the rank's shared down projection in shared memory, so a
+    # group too small for that (TP4: 1536 columns) runs the three launches.
+    front = EXPERTS + LATENT + 2 * sh_l if xchg and 1024 + 2 * sh_l * 128 + 64 * 64 * 2 <= SMEM_MAX else 0
     # P's projections land in their GEMM's epilogue (cuBLASLt, bf16 D); D's
     # KDA kernels read f32 projections.
     kpart = "bf16" if chunk else "f32"
@@ -519,8 +521,10 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         # members' partials of this member's heads merged by their LSE, expanded by v-up and gated.
         tail = ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "inout buffer<u8>", "in buffer<u64>",
                 "inout buffer<i32>", "out buffer<i32>", "i32", "i32", "i64", "i64"]
-        xg = lambda **extra: launch("k3_dcp", "kern_k3_dcp_exchange", grid=[DCP_GRID, 1, 1], block=[256, 1, 1],
-                                    smem=HEAD_DIM // 2 * KV_LORA * 2, **extra)
+        ranks = {"NRANKS": tp} if tp != 8 else {}
+        xg = lambda defines=None, **extra: launch("k3_dcp", "kern_k3_dcp_exchange", grid=[DCP_GRID, 1, 1],
+                                                  block=[256, 1, 1], smem=HEAD_DIM // 2 * KV_LORA * 2,
+                                                  defines={**(defines or {}), **ranks}, **extra)
         ops["dcp_exchange"] = flavor.d_exchange_op(g, xg, tail)
         ops["dcp_init"] = {
             "params": ["inout buffer<u8>", "i64"],

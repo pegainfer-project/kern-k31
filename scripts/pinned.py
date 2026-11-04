@@ -15,4 +15,7 @@ def module(family, **defines):
     if name in PINNED:
         sha = PINNED[name]["sha256"]
         return {"cubin": index.source(sha), "sha256": sha, "label": name}
-    return index.variant(family, **defines).module
+    try:
+        return index.variant(family, **defines).module
+    except KeyError as e:
+        raise KeyError(f"kernel family `{family}`: no variant `{name}` in the index; pin it in kernels.toml") from e
