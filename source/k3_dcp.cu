@@ -103,6 +103,15 @@
 //   merge as Cake's reduction does: m their largest, w = exp2(l_s - m),
 //   o = bf16(sum_s w o_s / sum_s w), lse = (m + log2(sum_s w)) / log2(e).
 //
+//   -DSPARSE: the partial is K3.1's sparse MLA over this member's selected positions (TRT-LLM gen's
+//   sparse kernel, scripts/k31_sparse_mla_abi.py), one split a row, its heads padded to HEADS_PAD,
+//   the first three parameters
+//       const bf16* part_o,     // [R][HEADS_PAD][LAT]  normalized o
+//       const float2* md,       // [R][HEADS_PAD]       (max of the scaled logits, natural units; sum below it)
+//       const int* live         // [R]  selected positions this member holds; 0: an empty partial
+//   Its lse is (log2(e) * max + log2(sum)) / log2(e), as FlashInfer's ComputeLSEFromMD has it; a row
+//   with nothing here ran one dummy position, and travels as the empty partial.
+//
 //   nvcc -cubin -arch=sm_103a source/k3_dcp.cu
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -113,6 +122,9 @@
 #endif
 #ifndef NRANKS
 #define NRANKS 8
+#endif
+#ifndef HEADS_PAD
+#define HEADS_PAD 128
 #endif
 #define LAT 512
 #define HL (HEADS / NRANKS)
@@ -337,6 +349,8 @@ extern "C" __global__ void __launch_bounds__(256, 2) kern_k3_dcp_exchange(
 #ifdef CAKE
     const bf16* __restrict__ part_o, const float* __restrict__ part_max, const float* __restrict__ part_sum,
     const int* __restrict__ seq_lens, int split,
+#elif defined(SPARSE)
+    const bf16* __restrict__ part_o, const float2* __restrict__ md, const int* __restrict__ live,
 #else
     const float* __restrict__ acc_o, const float* __restrict__ acc_lse, const int* __restrict__ seq_lens,
     const int* __restrict__ bsk, int split_max,
@@ -399,6 +413,18 @@ extern "C" __global__ void __launch_bounds__(256, 2) kern_k3_dcp_exchange(
         for (int k = 0; k < VEC / 2; ++k) v2[k] = __floats2bfloat162_rn(a[2 * k] * r, a[2 * k + 1] * r);
         v = make_uint4(unpoison(v.x), unpoison(v.y), unpoison(v.z), unpoison(v.w));
         l = (m + lg2(den)) * (1.0f / LOG2E);
+      }
+    }
+#elif defined(SPARSE)
+    const long long rec = (long long)b * HEADS_PAD + h;
+    float l = -CUDART_INF_F;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (live[b] != 0) {
+      const float2 s = md[rec];
+      if (s.x != -CUDART_INF_F && s.y > 0.f) {
+        v = reinterpret_cast<const uint4*>(part_o + rec * LAT)[lane];
+        v = make_uint4(unpoison(v.x), unpoison(v.y), unpoison(v.z), unpoison(v.w));
+        l = (LOG2E * s.x + lg2(s.y)) * (1.0f / LOG2E);
       }
     }
 #else

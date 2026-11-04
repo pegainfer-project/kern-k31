@@ -1,3 +1,51 @@
+# Every module the K3.1 manifests launch that kern's kernel index does not hold.
+# `scripts/build.py` compiles each from `source` with the named `flags` and `includes` sets (none
+# when unnamed) and `defines`, or copies `prebuilt`, and checks it against `sha256`.
+
+[toolchain]
+nvcc = "13.0.88"
+arch = "sm_103a"
+
+# Git submodules under third_party/ (their CUTLASS submodules at `cutlass`), MIT-licensed by DeepSeek.
+[upstreams.DeepGEMM]
+url = "https://github.com/deepseek-ai/DeepGEMM"
+commit = "ab69f76be5bb9ea3499bc755002b1a876cb0b3d9"
+cutlass = "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8"
+
+[flags]
+plain = ["-std=c++17", "-O3"]
+deepgemm = ["-std=c++20", "-O3", "--expt-relaxed-constexpr", "-DDG_NO_TORCH", "-diag-suppress", "20012,177"]
+
+[includes]
+deepgemm = ["third_party/DeepGEMM/deep_gemm/include", "third_party/DeepGEMM/third-party/cutlass/include"]
+deepgemm_k31 = ["source/deepgemm-k31", "third_party/DeepGEMM/deep_gemm/include", "third_party/DeepGEMM/third-party/cutlass/include"]
+
+# K3.1's indexer: DeepGEMM's fp8 MQA logits (32 heads of 128) and vLLM's prefill top-2048, the
+# instances kern-glm53-pp-prefill runs for GLM-5.3's identical indexer.
+[kernels."k31_mqa_logits"]
+sha256 = "d103d30479cbae2a4c33b83efb85a07e1c93b03b96c3748501586b404557a1aa"
+source = "source/k31_mqa_logits.cu"
+flags = "deepgemm"
+includes = ["deepgemm"]
+
+# K3.1's DSA glue: the indexer key into its cache, the query and head weights, the key stream the
+# MQA logits read, the top-k as cache slots. Ours, after vLLM's K3.1 math.
+[kernels."k31_paged_mqa_logits"]
+sha256 = "c372df6859a27173f1fe2f82629247682de1eb5c2e071ce89dfa4cb091f5f7a6"
+source = "source/k31_paged_mqa_logits.cu"
+flags = "deepgemm"
+includes = ["deepgemm_k31"]
+
+[kernels."k31_dsa"]
+sha256 = "436f71bf61054745e62f2ec884f4e65fec37c9acea61e5bc0f07249c29ac4bcc"
+source = "source/k31_dsa.cu"
+flags = "plain"
+
+[kernels."vllm_topk"]
+sha256 = "b80a4549fabad26bfc8c3c123be15dda42660f87e98748bace4c409cf794dfec"
+source = "source/vllm-topk/topk.cu"
+flags = "plain"
+
 [kernels."bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x128x256u2_s4_et128x64_m256x128x32_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f"]
 sha256 = "820c5022ded989438c60a7c42122876ac936c4adcc6f01352d63f80c54b4aa5d"
 prebuilt = "prebuilt/bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x128x256u2_s4_et128x64_m256x128x32_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f.cubin"
@@ -45,6 +93,11 @@ source = "source/k3_dcp.cu"
 sha256 = "e6f36607ab035880774036b15471c647c5277ab55aa6d81962d3b23cf568638c"
 source = "source/k3_dcp.cu"
 defines = { CAKE = 1 }
+
+[kernels."k3_dcp+SPARSE=1"]
+sha256 = "079c0615ec11db9e3b66929ee4ab255c74784fba786b555a0fdf7b347b27f3d2"
+source = "source/k3_dcp.cu"
+defines = { SPARSE = 1 }
 
 [kernels."k3_kda_core+HEADS=12"]
 sha256 = "ba7763168aa013bec36cf8008ecc3da37a0050029d95fa512cdba04c029dbc01"
@@ -124,6 +177,11 @@ sha256 = "42d1628971703b9dba7e93d393abc3c7306a37d8a556a2ca8966e12f09b52737"
 prebuilt = "prebuilt/trtllm_fmha_dense_h192_v128_e4m3.cubin"
 upstream = "flashinfer-cubin 0.6.18, bundle 2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c, fmha/trtllm-gen/fmhaSm103aKernel_QkvE4m3OBfloat16HQk192HV128SeparateQkvDenseVarSeqQ256Kv128PersistentContext.cubin"
 
+[kernels."trtllm_sparse_mla_h576_v512_e4m3"]
+sha256 = "dce16ffbfb2e6cf34a5607137afed685e47c292666ce0dbd0f9f1f8de7a86e57"
+prebuilt = "prebuilt/trtllm_sparse_mla_h576_v512_e4m3.cubin"
+upstream = "flashinfer-cubin 0.7.2.post1, bundle 2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c, fmha/trtllm-gen/fmhaSm100fKernel_QkvE4m3OBfloat16HQk576HV512HVPerCta256PagedKvDenseStaticTokenSparseP1VarSeqQ64Kv128Persistent2CtaKeepsAbForGen.cubin"
+
 [kernels."weight_prep"]
 sha256 = "040f51b01c421b9c69a2090034ff1bc4741e40c02f5ea52bd04a3e62e5c1af4d"
 source = "source/weight_prep.cu"
@@ -137,6 +195,12 @@ defines = { NRANKS = 8 }
 sha256 = "2c5ba09f971561547e148f2075a4288da3af41725438beeac55ee0c6043c3bbe"
 source = "source/k3_mla_absorb_mma.cu"
 defines = { Q_FP8 = 1 }
+
+
+[kernels."k3_mla_absorb_mma+OUT_HEADS=128+Q_FP8=1"]
+sha256 = "d0d06d0ca048ffbb7e5aa3f6dd8de0524d99644f0dd560926934bac1f3b537a5"
+source = "source/k3_mla_absorb_mma.cu"
+defines = { Q_FP8 = 1, OUT_HEADS = 128 }
 
 [kernels."k3_mla_decode"]
 sha256 = "7da9b64f6dd04356435706aa23ae8f43e339d32a5a11224222ab493b38268c19"
@@ -326,3 +390,11 @@ defines = { HEADS = 12, KDA_CONV = 1, KDA_PDL = 1, KDA_SMEM_STATE = 1, KDA_STATE
 sha256 = "a5760df1ac0f2d7d9efc605d80a3e4f4f92a4fa140aed8a5e1b5b50b8ff04d46"
 source = "source/k3_kda_core.cu"
 defines = { HEADS = 12, KDA_CONV = 1, KDA_MINB = 4, KDA_STATE_BF16 = 1, LDS = 6400, ROWS_PER_ITER = 2, WSM_FA = 12, WSM_LDS = 6400 }
+
+[kernels."k31_vup_gate"]
+sha256 = "d4adc6c577aaacbe95ef0f9b1c637d3bed9d5edc777fe27eb76612d4bee984b4"
+source = "source/k31_vup_gate.cu"
+
+[kernels."k31_absorb"]
+sha256 = "250f86168c5d3c493384975d34ebaaafb786e7d958259aed16efd4892230b1cd"
+source = "source/k31_absorb.cu"

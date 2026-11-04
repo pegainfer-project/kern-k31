@@ -31,6 +31,9 @@
 // element: each bf16 above goes on through f32 to e4m3 by cvt.rn without
 // saturation, the aten cast SGLang applies to its bf16 query (k3_e4m3.cuh).
 //
+// -DOUT_HEADS=128: q_abs rows are OUT_HEADS heads apart, K3.1's sparse attention's padded layout
+// (heads HEADS.. never written). P's long calls take source/k31_absorb.cu instead.
+//
 //   nvcc -cubin -arch=sm_103a -O3 source/k3_mla_absorb_mma.cu
 #include <cuda_bf16.h>
 
@@ -54,6 +57,9 @@ typedef __nv_bfloat16 q_t;
 #define ROW 576
 #define QW 192
 #define BMAX 64
+#ifndef OUT_HEADS
+#define OUT_HEADS HEADS
+#endif
 #ifndef CS
 #define CS 128     // columns per block
 #endif
@@ -133,14 +139,14 @@ extern "C" __global__ void __launch_bounds__(THREADS, 3) kern_k3_mla_absorb_mma(
     for (int hr = 0; hr < 2; ++hr) {
       const int b = m * 16 + g + 8 * hr;
       if (b < B) {
-        q_t* o = q_abs + ((size_t)b * HEADS + h) * ROW + c0 + warp * 16 + 2 * tq;
+        q_t* o = q_abs + ((size_t)b * OUT_HEADS + h) * ROW + c0 + warp * 16 + 2 * tq;
 #pragma unroll
         for (int n = 0; n < 2; ++n) PUT2(o + n * 8, 0, __floats2bfloat162_rn(c[n][2 * hr], c[n][2 * hr + 1]));
       }
     }
   }
   if (rr < B) {
-    q_t* o = q_abs + ((size_t)rr * HEADS + h) * ROW + LAT + rc;
+    q_t* o = q_abs + ((size_t)rr * OUT_HEADS + h) * ROW + LAT + rc;
     PUT2(o, 0, __floats2bfloat162_rn(rv.x, rv.y));
     PUT2(o, 1, __floats2bfloat162_rn(rv.z, rv.w));
   }
