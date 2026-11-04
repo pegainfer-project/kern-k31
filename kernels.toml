@@ -37,7 +37,7 @@ flags = "deepgemm"
 includes = ["deepgemm_k31"]
 
 [kernels."k31_dsa"]
-sha256 = "46d602637f94cd8713b47c698ec8976ca9fc037c0f9506aa704f734be68e1ca2"
+sha256 = "283b9c4f212d2cd7daa690472e4820c2243d585b0387187510ceae176c48fdcf"
 source = "source/k31_dsa.cu"
 flags = "plain"
 
@@ -398,3 +398,8 @@ source = "source/k31_vup_gate.cu"
 [kernels."k31_absorb"]
 sha256 = "250f86168c5d3c493384975d34ebaaafb786e7d958259aed16efd4892230b1cd"
 source = "source/k31_absorb.cu"
+
+[kernels."k3_mla_prep+KV_FP8=1"]
+sha256 = "53306380a16f1a15ef46fbb0ec0890e8cea478584a95010c2c0d7f36febd333f"
+source = "source/k3_mla_prep.cu"
+defines = { KV_FP8 = 1 }

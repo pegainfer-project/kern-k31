@@ -46,6 +46,10 @@ on one GPU holding every expert, with nothing to exchange or sum: the oracle
 the group is checked against (step/, scripts/compare_steps.py). `--layers 2`
 (one KDA layer, one MoE layer) has no MLA layer and no paged state.
 
+K3.1's MLA layers are DSA layers (scripts/k31_dsa.py): over the fp8 cache, P and a one-GPU D score the
+keys with the indexer and attend each row's top 2048 through TRT-LLM gen's sparse MLA in place of the
+dense passes above; D under DCP is not wired yet.
+
 `--kv` picks the MLA cache: SGLang's fp8 (scripts/k3_kv_fp8.py, the default)
 or bf16 (scripts/k3_kv_bf16.py). A flavor owns its page bytes, D's absorb,
 attention and exchange, and P's absorbed short path (bf16's alone).
@@ -77,6 +81,7 @@ import k3_once  # noqa: F401  K3's load-time ops, which kern's `once` no longer 
 from k3_common import *  # noqa: F403
 import k3_kv_bf16
 import k3_kv_fp8
+import k31_dsa
 
 KV = {"fp8": k3_kv_fp8, "bf16": k3_kv_bf16}
 
@@ -155,7 +160,10 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     fused_ar = xchg and peer_ar
     flavor = KV[kv]
     assert kda_state in ("bf16", "f32")
-    flavor.check(decode, xchg, seqs_max)
+    # K3.1's MLA layers attend sparsely over the fp8 pages (k31_dsa.py); the bf16 flavor is K3's dense path
+    dsa = kv == "fp8"
+    assert not (dsa and decode and tp > 1), "D's DSA under DCP is not wired yet"
+    flavor.check(decode, xchg, seqs_max, dsa)
     if chunk:
         mla_short = flavor.p_short(mla_short)
     state_bytes = 2 if kda_state == "bf16" else 4
@@ -394,7 +402,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             "impl": {"launches": [launch("k3_mla_prep", "kern_k3_mla_prep", grid=[T, 1 + -(-inner_l // 4096), 1],
                                          defines={"INNER": inner_l, "MLA_FUSED": mla_fused_l, **flavor.D_PREP})
                                   if tp > 1
-                                  else launch("k3_mla_prep", "kern_k3_mla_prep")]},
+                                  else launch("k3_mla_prep", "kern_k3_mla_prep", defines=flavor.D_PREP or None)]},
         },
         # every member absorbs the whole batch's 96 heads, at most `seqs` rows
         "mla_absorb": flavor.d_absorb_op(),
@@ -599,6 +607,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         return name
 
     ops.update(bp["ops"])
+    if dsa and mla:
+        ops.update(k31_dsa.ops(chunk, t_max, seqs_max, max_ctx // tp, max_pages))
     if chunk and not mx:
         ops["k3_concat_cols"] = {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
@@ -646,6 +656,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                             "segments": [[1, HEADS * HEAD_DIM * HEAD_DIM * state_bytes], [9, INNER * 2]]}}
                  if xchg else {})
     states = {**{f"kv.{i}": {"bytes_per_token": LATENT_ROW * flavor.BYTES, **kv_shard} for i in mla_layers},
+              **({f"idx.{i}": {"bytes_per_token": k31_dsa.IDX_ROW, **kv_shard} for i in mla_layers} if dsa else {}),
               **{f"kda.{i}": {"bytes_per_seq": line_l, **kda_shard} for i in kda_layers}}
 
     def weight(name, shape, bind, dtype="bf16"):
@@ -757,12 +768,16 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             buffers[q + "_sf"] = {"dtype": "u8", "shape": [sf_len(RW, k)], "kind": "workspace"}
     if mla:
         work("mla_fused_partial", mla_fused_l, kpart)
+        if dsa:
+            k31_dsa.buffers(work, buffers, chunk, t_max, max_ctx // tp, seqs_max)
+            once.call("fill_i32", [buf("idx_zero"), i32(t_max), i32(0)], t_max)
         work("q_norm", Q_LORA)
     if decode and mla:
         work("q_partial", Q_B, "f32")
         work("q_abs", HEADS * LATENT_ROW, flavor.Q_ABS)
         buffers["mla_bsk"] = {"dtype": "i32", "shape": [T], "kind": "workspace"}
-        flavor.d_buffers(work, buffers, g)
+        if not dsa:
+            flavor.d_buffers(work, buffers, g)
     if chunk:
         work("normed_last", H, var="seqs")
         # the absorbed attention of a short call (at most mla_short rows)
@@ -995,47 +1010,57 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                          b("slot_mapping"), {"state": kv, "offset": 0}, i64(page_stride), b("q_norm"),
                          b("block_table"), i32(max_pages), b("fmha_lens"), i32(NS), {"var": "seqs"},
                          b("latent_own"), s_table, s_lens, s_bsk, i32(MLA_SHORT_SPLITS), i32(mla_short), B)
-                    step(L + "expand_own", "gemm_bf16_long", b("latent_own"), w("w_aug"), b("kv_own"),
-                         dim({"add": [T, KV_PAD]}), i32(KV_EXP), i32(KV_A), i32(KV_EXP))
-                    step(L + "q_b", "gemm_bf16", b("q_norm"), w("w_q_b"), b("q_bf16"), B, i32(Q_B), i32(Q_LORA),
-                         i32(Q_B))
-                    if fp8_attn:
-                        step(L + "own_cast", "mla_e4m3", b("kv_own"), b("kv_own_fp8"), dim({"add": [T, KV_PAD]}),
-                             i32(KV_EXP))
-                        step(L + "q_cast", "mla_e4m3", b("q_bf16"), b("q_fp8"), B, i32(Q_B))
-                    if mla_short:
-                        flavor.p_short_steps(step, w, L, kv, max_pages)
-                    lens = lambda k, row: b("fmha_lens", (k * 4 + row) * NS * 4)
-
-                    def fmha(label, op, kv_buf, k):
-                        kv_buf += attn_sfx
-                        step(label, op, b(attn_q), b(kv_buf), b(kv_buf, trtllm_fmha_abi.HQK * attn_bytes),
-                             b("o_bf16"),
-                             lens(k, 0), lens(k, 1), lens(k, 2), b("fmha_scratch"),
-                             b("fmha_scratch", trtllm_fmha_abi.PARTIAL_O_OFFSET), b("fmha_stats"))
-                        step(label + "_merge", "mla_merge_init" if k == 0 else "mla_merge", b("o_bf16"), b("fmha_stats"),
-                             lens(k, 0), i32(NS), {"var": "seqs"}, b("mla_acc"), b("mla_acc_ms"), i32(int(k == 0)),
-                             i32(inner_l), B)
-                    fmha(L + "attn_own", "mla_fmha_own", "kv_own", 0)
-                    for r in range(rounds):
-                        step(L + f"gather{r}", "mla_gather", {"state": kv, "offset": 0}, i64(page_stride),
-                             b("block_table"), i32(max_pages), b("fmha_lens"), i32(NS), {"var": "seqs"}, b("latent_g"),
-                             i32(r), i32(window), dim(round_rows(r)))
-                        step(L + f"expand{r}", "gemm_bf16_long", b("latent_g"), w("w_aug"), b("kv_exp"),
-                             dim(round_rows(r)), i32(KV_EXP), i32(KV_A), i32(KV_EXP))
+                    if dsa:
+                        step(L + "q_b", "gemm_bf16", b("q_norm"), w("w_q_b"), b("q_bf16"), B, i32(Q_B), i32(Q_LORA),
+                             i32(Q_B))
+                        k31_dsa.steps(step, w, L, kv, f"idx.{i}", True, b("mla_fused_partial", k31_dsa.HEADC_BYTES),
+                                      mla_fused_l, max_pages, max_ctx, b("q_bf16"))
+                    else:
+                        step(L + "expand_own", "gemm_bf16_long", b("latent_own"), w("w_aug"), b("kv_own"),
+                             dim({"add": [T, KV_PAD]}), i32(KV_EXP), i32(KV_A), i32(KV_EXP))
+                        step(L + "q_b", "gemm_bf16", b("q_norm"), w("w_q_b"), b("q_bf16"), B, i32(Q_B), i32(Q_LORA),
+                             i32(Q_B))
                         if fp8_attn:
-                            step(L + f"cast{r}", "mla_e4m3", b("kv_exp"), b("kv_exp_fp8"), dim(round_rows(r)),
+                            step(L + "own_cast", "mla_e4m3", b("kv_own"), b("kv_own_fp8"), dim({"add": [T, KV_PAD]}),
                                  i32(KV_EXP))
-                        fmha(L + f"attn{r}", "mla_fmha_round", "kv_exp", 1 + r)
-                    step(L + "gate", "mla_gate", b("gated"), b("mla_acc"), b("mla_fused_partial"), s_acc_o, s_acc_lse,
-                         s_lens, s_bsk, i32(MLA_SHORT_SPLITS), w("w_kv_b"), b("mla_acc_ms"), i32(inner_l),
-                         i32(mla_short), B)
+                            step(L + "q_cast", "mla_e4m3", b("q_bf16"), b("q_fp8"), B, i32(Q_B))
+                        if mla_short:
+                            flavor.p_short_steps(step, w, L, kv, max_pages)
+                        lens = lambda k, row: b("fmha_lens", (k * 4 + row) * NS * 4)
+
+                        def fmha(label, op, kv_buf, k):
+                            kv_buf += attn_sfx
+                            step(label, op, b(attn_q), b(kv_buf), b(kv_buf, trtllm_fmha_abi.HQK * attn_bytes),
+                                 b("o_bf16"),
+                                 lens(k, 0), lens(k, 1), lens(k, 2), b("fmha_scratch"),
+                                 b("fmha_scratch", trtllm_fmha_abi.PARTIAL_O_OFFSET), b("fmha_stats"))
+                            step(label + "_merge", "mla_merge_init" if k == 0 else "mla_merge", b("o_bf16"), b("fmha_stats"),
+                                 lens(k, 0), i32(NS), {"var": "seqs"}, b("mla_acc"), b("mla_acc_ms"), i32(int(k == 0)),
+                                 i32(inner_l), B)
+                        fmha(L + "attn_own", "mla_fmha_own", "kv_own", 0)
+                        for r in range(rounds):
+                            step(L + f"gather{r}", "mla_gather", {"state": kv, "offset": 0}, i64(page_stride),
+                                 b("block_table"), i32(max_pages), b("fmha_lens"), i32(NS), {"var": "seqs"}, b("latent_g"),
+                                 i32(r), i32(window), dim(round_rows(r)))
+                            step(L + f"expand{r}", "gemm_bf16_long", b("latent_g"), w("w_aug"), b("kv_exp"),
+                                 dim(round_rows(r)), i32(KV_EXP), i32(KV_A), i32(KV_EXP))
+                            if fp8_attn:
+                                step(L + f"cast{r}", "mla_e4m3", b("kv_exp"), b("kv_exp_fp8"), dim(round_rows(r)),
+                                     i32(KV_EXP))
+                            fmha(L + f"attn{r}", "mla_fmha_round", "kv_exp", 1 + r)
+                        step(L + "gate", "mla_gate", b("gated"), b("mla_acc"), b("mla_fused_partial"), s_acc_o, s_acc_lse,
+                             s_lens, s_bsk, i32(MLA_SHORT_SPLITS), w("w_kv_b"), b("mla_acc_ms"), i32(inner_l),
+                             i32(mla_short), B)
                 else:
                     step(L + "mla_prep", "mla_prep", b("mla_fused_partial"), w("gamma_q_a"), w("gamma_kv_a"),
                          b("slot_mapping"), {"state": kv}, i64(0), i64(page_stride), b("q_norm"), b("mla_gate"), B)
                     gemm(L + "q_b", b("q_norm"), w("w_q_b"), b("q_partial"), Q_B, Q_LORA)
-                    step(L + "absorb", "mla_absorb", b("q_partial"), w("w_kv_b"), b("q_abs"), B)
-                    flavor.d_attn_steps(step, w, L, kv, g)
+                    if dsa:
+                        k31_dsa.steps(step, w, L, kv, f"idx.{i}", False, b("mla_gate"), inner_l, max_pages,
+                                      max_ctx // tp, b("q_partial"))
+                    else:
+                        step(L + "absorb", "mla_absorb", b("q_partial"), w("w_kv_b"), b("q_abs"), B)
+                        flavor.d_attn_steps(step, w, L, kv, g)
             else:
                 line = b("kda.line_index", kda_k * seqs_max * 4)
                 kda_k += 1
@@ -1186,6 +1211,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             weight(n + "gamma_kv_a", [KV_LORA], [seg(a + "kv_a_layernorm.weight")])
             weight(n + "w_q_b", [Q_B, Q_LORA], [seg(a + "q_b_proj.weight")])
             weight(n + "w_kv_b", [HEADS * 256, KV_LORA], [seg(a + "kv_b_proj.weight")])
+            if dsa:
+                k31_dsa.weights(weight, seg, a, n)
             if xchg:
                 # the v-up's heads: this member's of kv_b, whole for the absorb above
                 weight(n + "w_kv_b_l", [hl * 256, KV_LORA], [seg(a + "kv_b_proj.weight", rows=shard(hl * 256))])

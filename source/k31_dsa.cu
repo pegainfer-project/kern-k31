@@ -151,13 +151,14 @@ extern "C" __global__ void k31_idx_gather(const u8* __restrict__ cache, const in
 }
 
 // The top-k's sequence-relative key indices (-1 past a short row's keys) as cache slots through the
-// row's page table, in place, and the row's live count min(klen, 2048) for the attention.
+// row's page table, in place, and the row's live count min(klen, 2048) for the attention. A null
+// row_seq is D's batch, row r sequence r.
 //   grid (T), block 256
 extern "C" __global__ void k31_topk_slots(int* __restrict__ ind, const int* __restrict__ block_table, int max_pages,
                                           const int* __restrict__ row_seq, const int* __restrict__ klen,
                                           int* __restrict__ tlen, int T) {
   const int r = blockIdx.x;
-  const int* bt = block_table + (size_t)row_seq[r] * max_pages;
+  const int* bt = block_table + (size_t)(row_seq ? row_seq[r] : r) * max_pages;
   int* row = ind + (size_t)r * TOPK;
   for (int i = threadIdx.x; i < TOPK; i += blockDim.x) {
     const int k = row[i];
