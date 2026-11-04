@@ -46,6 +46,11 @@ sha256 = "b80a4549fabad26bfc8c3c123be15dda42660f87e98748bace4c409cf794dfec"
 source = "source/vllm-topk/topk.cu"
 flags = "plain"
 
+[kernels."k31_topk"]
+sha256 = "13866326e3d72e5e183ada7ddbfba46c02335856d01dc54388f759924f12ae6e"
+source = "source/k31_topk.cu"
+flags = "plain"
+
 [kernels."bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x128x256u2_s4_et128x64_m256x128x32_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f"]
 sha256 = "820c5022ded989438c60a7c42122876ac936c4adcc6f01352d63f80c54b4aa5d"
 prebuilt = "prebuilt/bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x128x256u2_s4_et128x64_m256x128x32_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f.cubin"
