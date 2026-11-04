@@ -35,7 +35,7 @@ META = "_ZN9deep_gemm5sched31sm100_paged_mqa_logits_metadataILj1ELb1ELb0ELj256EL
 ABSORB_TC_SMEM = 1024 + 3 * (16384 + 4 * 8192) + 32768 + 16384 + 8192 + 256  # its SMEM_BYTES
 VUP_SMEM = 3 * (64 + 128) * 72 * 2
 VUP_TC_SMEM = 1024 + 6 * 2 * 128 * 64 * 2 + 256  # k31_vup_gate_tc SMEM_BYTES
-TOPK_SMEM = 83008  # k31_topk_smem
+TOPK_SMEM = 93408  # k31_topk_smem
 TMAP = "bytes<128>"
 HEADC_BYTES = (Q_LORA + KV_LORA + 64) * 2  # the gate's columns in P's fused projection (q_a | kv_a | rope | gate)
 

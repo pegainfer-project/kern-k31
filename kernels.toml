@@ -47,7 +47,7 @@ source = "source/vllm-topk/topk.cu"
 flags = "plain"
 
 [kernels."k31_topk"]
-sha256 = "13866326e3d72e5e183ada7ddbfba46c02335856d01dc54388f759924f12ae6e"
+sha256 = "6b962b71b0d1c340eae167610703c2026f61be0043d0409b2d821dabf273cf9d"
 source = "source/k31_topk.cu"
 flags = "plain"
 
