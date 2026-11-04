@@ -608,7 +608,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
 
     ops.update(bp["ops"])
     if dsa and mla:
-        ops.update(k31_dsa.ops(chunk, t_max, seqs_max, max_ctx // tp, max_pages))
+        ops.update(k31_dsa.ops(chunk, t_max, seqs_max, max_ctx // tp, max_pages, mla_fused_l if chunk else inner_l))
     if chunk and not mx:
         ops["k3_concat_cols"] = {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
@@ -1013,7 +1013,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                         step(L + "q_b", "gemm_bf16", b("q_norm"), w("w_q_b"), b("q_bf16"), B, i32(Q_B), i32(Q_LORA),
                              i32(Q_B))
                         k31_dsa.steps(step, w, L, kv, f"idx.{i}", True, b("mla_fused_partial", k31_dsa.HEADC_BYTES),
-                                      mla_fused_l, max_pages, max_ctx, b("q_bf16"))
+                                      max_pages, max_ctx, b("q_bf16"))
                     else:
                         step(L + "expand_own", "gemm_bf16_long", b("latent_own"), w("w_aug"), b("kv_own"),
                              dim({"add": [T, KV_PAD]}), i32(KV_EXP), i32(KV_A), i32(KV_EXP))
@@ -1055,8 +1055,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                          b("slot_mapping"), {"state": kv}, i64(0), i64(page_stride), b("q_norm"), b("mla_gate"), B)
                     gemm(L + "q_b", b("q_norm"), w("w_q_b"), b("q_partial"), Q_B, Q_LORA)
                     if dsa:
-                        k31_dsa.steps(step, w, L, kv, f"idx.{i}", False, b("mla_gate"), inner_l, max_pages,
-                                      max_ctx // tp, b("q_partial"))
+                        k31_dsa.steps(step, w, L, kv, f"idx.{i}", False, b("mla_gate"), max_pages, max_ctx // tp,
+                                      b("q_partial"))
                     else:
                         step(L + "absorb", "mla_absorb", b("q_partial"), w("w_kv_b"), b("q_abs"), B)
                         flavor.d_attn_steps(step, w, L, kv, g)
