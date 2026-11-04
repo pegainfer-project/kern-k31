@@ -64,11 +64,13 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride):
             "params": ["in buffer<bf16>", "i32", "in buffer<bf16>", "i32", "out buffer<u8>", "out buffer<f32>", "i32"],
             "impl": {"launches": [dsa("k31_idx_q", [T, 1, 1], [256, 1, 1])]},
         },
-        # each row's top TOPK over [0, len) as ascending positions (k31_topk, vLLM's set, deterministic)
+        # each row's top TOPK over [0, len) as ascending positions (k31_topk, vLLM's set, deterministic);
+        # D's few rows take one block an SM, a row of up to 32k keys read once into registers
         "idx_topk": {
             "params": ["in buffer<f32>", "in buffer<i32>", "out buffer<i32>", "i32"],
             "impl": {"launches": [launch(
-                "k31_topk", "k31_topk", grid=[T, 1, 1], block=[512, 1, 1], smem=TOPK_SMEM,
+                "k31_topk", "k31_topk" if chunk else "k31_topk_held", grid=[T, 1, 1], block=[512, 1, 1],
+                smem=TOPK_SMEM,
                 params=["in buffer<f32>", "i32", "in buffer<i32>", "out buffer<i32>"],
                 args=[{"param": 0}, {"param": 3}, {"param": 1}, {"param": 2}])]},
         },

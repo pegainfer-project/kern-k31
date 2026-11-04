@@ -36,6 +36,7 @@ def main():
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--cubin", default=None, help="a k31_topk build other than build/k31_topk.cubin")
     ap.add_argument("--nt", type=int, default=512, help="its block size")
+    ap.add_argument("--entry", default="k31_topk", help="the entry measured: k31_topk or k31_topk_held")
     ap.add_argument("--plain", action="store_true", help="random rows only (no degenerate rows at the head)")
     ap.add_argument("--check", type=int, default=64, help="rows of the chunk checked against the reference")
     a = ap.parse_args()
@@ -62,7 +63,7 @@ def main():
         logits[5, : lens[5]] = torch.randn(int(lens[5]), device=dev).half().float()  # fp16-exact: bins hold ties
     zero = torch.zeros(R, dtype=torch.int32, device=dev)
     mod = ok(cu.cuModuleLoadData(Path(a.cubin).read_bytes())) if a.cubin else module("k31_topk")
-    mine = ok(cu.cuModuleGetFunction(mod, b"k31_topk"))
+    mine = ok(cu.cuModuleGetFunction(mod, a.entry.encode()))
     p, _ = ok(cu.cuModuleGetGlobal(mod, b"k31_topk_smem"))
     sm = torch.empty(1, dtype=torch.int32)
     ok(cu.cuMemcpyDtoH(sm.data_ptr(), p, 4))
