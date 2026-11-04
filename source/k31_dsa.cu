@@ -192,8 +192,11 @@ __device__ __forceinline__ unsigned long long stable_key(float2 c) {
   return ((unsigned long long)s << 32) | (unsigned)~g;
 }
 
+#ifndef DCP_W
+#define DCP_W 8  // the DCP group k31_dcp_select merges
+#endif
 #define SEL_THREADS 1024
-#define SEL_PER (8 * TOPK / SEL_THREADS)  // 16 candidates a thread at W = 8
+#define SEL_PER (DCP_W * TOPK / SEL_THREADS)  // 16 candidates a thread at W = 8
 
 // The group's top 2048 of a row from every member's candidates (cand [W][R][2048], member-major as
 // an all-gather lays them out), and of those the positions this member holds, as cache slots
@@ -201,11 +204,11 @@ __device__ __forceinline__ unsigned long long stable_key(float2 c) {
 // (t, i) order, a fixed order of the candidates, so the loads coalesce and the result never depends on
 // the schedule. lens is their count, at least 1 for
 // the attention (a row with none attends slot 0, live 0 says to discard it); live the true count.
-//   grid (R), block 1024, W = 8
+//   grid (R), block 1024, W = DCP_W
 extern "C" __global__ void __launch_bounds__(SEL_THREADS) k31_dcp_select(
     const float2* __restrict__ cand, int R, int rank, const int* __restrict__ block_table, int max_pages,
     int* __restrict__ ind, int* __restrict__ lens, int* __restrict__ live) {
-  constexpr int W = 8;
+  constexpr int W = DCP_W;
   __shared__ unsigned whist[SEL_THREADS / 32][256];  // a warp's own: the top digit is mostly one bin
   __shared__ unsigned hist[256];
   __shared__ unsigned scan[SEL_THREADS / 32];
