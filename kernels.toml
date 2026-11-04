@@ -396,6 +396,11 @@ sha256 = "a5760df1ac0f2d7d9efc605d80a3e4f4f92a4fa140aed8a5e1b5b50b8ff04d46"
 source = "source/k3_kda_core.cu"
 defines = { HEADS = 12, KDA_CONV = 1, KDA_MINB = 4, KDA_STATE_BF16 = 1, LDS = 6400, ROWS_PER_ITER = 2, WSM_FA = 12, WSM_LDS = 6400 }
 
+[kernels."k31_vup_gate_tc"]
+sha256 = "c876b8d6d30eea53a1efd83555386f0d3a2cc4412410ff807bca5682046d56ad"
+source = "source/k31_vup_gate_tc.cu"
+flags = "plain"
+
 [kernels."k31_vup_gate"]
 sha256 = "d4adc6c577aaacbe95ef0f9b1c637d3bed9d5edc777fe27eb76612d4bee984b4"
 source = "source/k31_vup_gate.cu"

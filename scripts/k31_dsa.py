@@ -33,6 +33,7 @@ PAGED_SMEM = 198656
 META = "_ZN9deep_gemm5sched31sm100_paged_mqa_logits_metadataILj1ELb1ELb0ELj256ELj152EEEvjjPKjS3_Pj"
 ABSORB_GRID_X = 3  # k31_absorb's row walkers a (head, column block): 8192 rows at 389 us, flat from 3 on
 VUP_SMEM = 3 * (64 + 128) * 72 * 2
+VUP_TC_SMEM = 1024 + 6 * 2 * 128 * 64 * 2 + 256  # k31_vup_gate_tc SMEM_BYTES
 TOPK_SMEM = 83008  # k31_topk_smem
 TMAP = "bytes<128>"
 HEADC_BYTES = (Q_LORA + KV_LORA + 64) * 2  # the gate's columns in P's fused projection (q_a | kv_a | rope | gate)
@@ -48,8 +49,9 @@ def tmap(param, dtype, dims, strides, box, swizzle):
         "param": param, "dtype": dtype, "dims": dims, "strides": strides, "box": box, "swizzle": swizzle}}]}}
 
 
-def ops(chunk, rows_max, seqs_max, max_ctx, max_pages):
-    """The layer's ops; `rows_max` a call's rows (P) or the batch (D), `max_ctx` a row's keys at most."""
+def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride):
+    """The layer's ops; `rows_max` a call's rows (P) or the batch (D), `max_ctx` a row's keys at most,
+    `gate_stride` the gate's row stride in elements."""
     dsa = lambda entry, grid, block, **kw: launch("k31_dsa", entry, grid=grid, block=block, **kw)
     o = {
         "idx_key": {
@@ -79,11 +81,22 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages):
                        defines={"Q_FP8": 1, "OUT_HEADS": sparse.HEADS})]},
         },
         "sparse_mla": sparse.op(rows_max, T),
-        # (o, w_kv_b, gate, gate_stride, gated, B)
+        # (o_lat, w_kv_b, gate, gated, B): P's chunk on tcgen05, D's batch on mma.sync
         "vup_gate": {
-            "params": ["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "i32", "out buffer<bf16>", "i32"],
-            "impl": {"launches": [launch("k31_vup_gate", "kern_k31_vup_gate", grid=[{"ceil_div": [T, 64]}, HEADS, 1],
-                                         block=[256, 1, 1], smem=VUP_SMEM)]},
+            "params": ["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32"],
+            "impl": {"launches": [launch(
+                "k31_vup_gate_tc", "kern_k31_vup_gate_tc", grid=[SMS, 1, 1], block=[384, 1, 1], smem=VUP_TC_SMEM,
+                params=[*[TMAP] * 4, "i32"],
+                args=[tmap(0, "bf16", [sparse.D_V, sparse.HEADS, 0], [sparse.D_V * 2, sparse.HEADS * sparse.D_V * 2],
+                           [64, 1, 128], 128),
+                      tmap(1, "bf16", [KV_LORA, 0], [KV_LORA * 2], [64, 128], 128),
+                      tmap(2, "bf16", [HEADS * 128, 0], [gate_stride * 2], [64, 128], 128),
+                      tmap(3, "bf16", [HEADS * 128, 0], [HEADS * 128 * 2], [64, 128], 128),
+                      {"param": 4}])] if chunk else [launch(
+                "k31_vup_gate", "kern_k31_vup_gate", grid=[{"ceil_div": [T, 64]}, HEADS, 1], block=[256, 1, 1],
+                smem=VUP_SMEM, params=["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "i32",
+                                       "out buffer<bf16>", "i32"],
+                args=[*({"param": i} for i in range(3)), i32(gate_stride), {"param": 3}, {"param": 4}])]},
         },
     }
     if chunk:
@@ -202,8 +215,8 @@ def buffers(work, bufs, chunk, max_ctx, seqs_max):
         bufs["idx_sched"] = {"dtype": "i32", "shape": [(SMS + 1) * 2], "kind": "workspace"}
 
 
-def steps(step, w, L, kv, idx, chunk, gate, gate_stride, max_pages, max_ctx, q):
-    """The layer from its input projections to `gated`: `gate` / `gate_stride` the gate's columns, `q` the
+def steps(step, w, L, kv, idx, chunk, gate, max_pages, max_ctx, q):
+    """The layer from its input projections to `gated`: `gate` the gate's columns (at ops' stride), `q` the
     q_b output (P's bf16, D's f32), the latent row and q_norm already in place."""
     step(L + "idx_kw", "gemm_bf16", b("normed"), w("idx_kw"), b("idx_kwo"), B, i32(IDX_KW), i32(7168), i32(IDX_KW))
     step(L + "idx_key", "idx_key", b("idx_kwo"), i32(IDX_KW), w("idx_kn_w"), w("idx_kn_b"), b("slot_mapping"),
@@ -233,4 +246,4 @@ def steps(step, w, L, kv, idx, chunk, gate, gate_stride, max_pages, max_ctx, q):
     step(L + "absorb", "absorb", q, w("w_kv_b"), b("mla_q_abs"), B)
     step(L + "attn", "sparse_mla", b("mla_q_abs"), {"state": kv}, b("idx_ind"), b("idx_tlen"), b("mla_o"),
          b("mla_md"))
-    step(L + "vup_gate", "vup_gate", b("mla_o"), w("w_kv_b"), gate, i32(gate_stride), b("gated"), B)
+    step(L + "vup_gate", "vup_gate", b("mla_o"), w("w_kv_b"), gate, b("gated"), B)
