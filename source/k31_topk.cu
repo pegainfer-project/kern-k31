@@ -5,7 +5,12 @@
 // bytes on every run.
 //
 //   extern "C" __global__ void k31_topk(const float* logits, int stride, const int* lens, int* out);
+//   extern "C" __global__ void k31_topk_held(...the same...);
 //   grid (rows), block NT, dynamic smem k31_topk_smem (a __device__ int of the module)
+//
+// k31_topk runs two blocks an SM, for P's thousands of rows. k31_topk_held runs one, for D's few
+// rows, each latency-bound: a row of at most HELD_MAX is read once into registers and every digit
+// below is counted and collected from there.
 //
 // A logit is ranked by its key, the float's bits ordered as the float is, and the key is read in
 // digits: bits 31..20, 19..8, 7..0. A digit's 4096-bin histogram over the keys that share the digits
@@ -97,12 +102,14 @@ __device__ __forceinline__ void cut256(Smem& s, unsigned rem) {
   __syncthreads();
 }
 
-// The rem-th largest (rem in [1, m]) of v[0, m) and how many lie above it, by four 8-bit passes.
+// The rem-th largest (rem in [1, m]) of v[0, m) and how many lie above it, by 8-bit passes over the
+// low `low` bits; every v shares the bits of `base` above them.
 __device__ __forceinline__ void select_smem(Smem& s, const unsigned* v, unsigned m, unsigned rem, unsigned& thr,
-                                            unsigned& gt) {
-  unsigned prefix = 0, mask = 0;
+                                            unsigned& gt, int low, unsigned base) {
+  const int top = (low + 7) / 8 * 8 - 8;
+  unsigned mask = top + 8 >= 32 ? 0u : ~0u << (top + 8), prefix = base & mask;
   gt = 0;
-  for (int shift = 24; shift >= 0; shift -= 8) {
+  for (int shift = top; shift >= 0; shift -= 8) {
     for (int i = threadIdx.x; i < 256; i += NT) s.h256[i] = 0;
     __syncthreads();
     for (unsigned i = threadIdx.x; i < m; i += NT)
@@ -244,12 +251,13 @@ __device__ __forceinline__ void collect(Smem& s, const float* row, unsigned n, i
   __syncthreads();
 }
 
-// The candidates' rem largest by key, ties by smallest position, appended to s.sel.
-__device__ __forceinline__ void finish(Smem& s, unsigned rem) {
+// The candidates' rem largest by key, ties by smallest position, appended to s.sel. Every candidate
+// shares the key bits of `base` above the low `low`, and every position lies below n.
+__device__ __forceinline__ void finish(Smem& s, unsigned rem, unsigned n, int low = 32, unsigned base = 0) {
   const int t = threadIdx.x;
   const unsigned m = s.ncand;
   unsigned kthr, kgt;
-  select_smem(s, s.ckey, m, rem, kthr, kgt);
+  select_smem(s, s.ckey, m, rem, kthr, kgt, low, base);
   if (t == 0) s.ntie = 0;
   __syncthreads();
   for (unsigned i = t; i < m; i += NT) {
@@ -259,7 +267,7 @@ __device__ __forceinline__ void finish(Smem& s, unsigned rem) {
   __syncthreads();
   const unsigned e = s.ntie, need = rem - kgt;
   unsigned pthr = 0, pgt;
-  if (need < e) select_smem(s, s.u.tie, e, need, pthr, pgt);
+  if (need < e) select_smem(s, s.u.tie, e, need, pthr, pgt, 32 - __clz(n - 1), ~0u);
   for (unsigned i = t; i < e; i += NT)
     if (need == e || s.u.tie[i] >= pthr) s.sel[atomicAdd(&s.nsel, 1u)] = ~s.u.tie[i];
   __syncthreads();
@@ -305,8 +313,81 @@ __device__ __forceinline__ bool sampled(Smem& s, const float* row, unsigned n) {
   collect(s, row, n, 8, prefix_of(1, b1, s.cut), 0xffffffu);
   const unsigned kept = s.ncand;
   if (kept < TK || kept > CAP) return false;
-  finish(s, TK);
+  finish(s, TK, n);
   return true;
+}
+
+#define HELD_U 16  // float4s a thread holds: rows of at most NT * 4 * HELD_U stay in registers
+#define HELD_MAX (NT * 4 * HELD_U)
+
+// The exact route over a row held in registers, one read for every level; a cut inside one key held
+// by more than CAP positions takes the ties in position order on one more read. A key of 0 (a negative NaN's) marks a slot past n: it
+// sits in the lowest bin, under the 2049 real keys, so no cut reaches it.
+__device__ __forceinline__ void held(Smem& s, const float* row, unsigned n) {
+  constexpr int Q = 4 * HELD_U;
+  const unsigned t = threadIdx.x, lane = t & 31, last = n >= 4 ? (n - 4) & ~3u : 0;
+  const auto at = [&](int u) { return (u * NT + t) * 4; };
+  float4 v[HELD_U];
+#pragma unroll
+  for (int u = 0; u < HELD_U; ++u) v[u] = __ldg(reinterpret_cast<const float4*>(row + min((unsigned)at(u), last)));
+  unsigned k[Q];
+#pragma unroll
+  for (int u = 0; u < HELD_U; ++u) {
+    float x[4] = {v[u].x, v[u].y, v[u].z, v[u].w};
+    if (at(u) < n && at(u) + 3 >= n)
+#pragma unroll
+      for (int j = 0; j < 4; ++j) x[j] = at(u) + j < n ? row[at(u) + j] : 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) k[4 * u + j] = at(u) + j < n ? okey(x[j]) : 0u;
+  }
+  unsigned rem = TK, fpre = 0;
+  for (int level = 0; level < 3; ++level) {
+    const int sh = SHIFT[level];
+    for (int i = t; i < BINS; i += NT) s.u.hist[i] = 0;
+    __syncthreads();
+#pragma unroll
+    for (int q = 0; q < Q; ++q)
+      if (in_play(k[q], level, fpre)) atomicAdd(&s.u.hist[k[q] >> sh & 0xfff], 1u);
+    __syncthreads();
+    cut_bin(s, rem);
+    const unsigned p = prefix_of(level, fpre, s.cut);
+    if (s.count <= CAP) {
+      // every hit of the row claims its slot at once: one warp scan, one atomic a kind a warp; a
+      // candidate's key is read again rather than indexed out of the registers
+      unsigned long long ma = 0, mc = 0;
+#pragma unroll
+      for (int q = 0; q < Q; ++q) {
+        const unsigned d = k[q] >> sh;
+        ma |= (unsigned long long)(d > p) << q, mc |= (unsigned long long)(d == p) << q;
+      }
+      const unsigned na = __popcll(ma), nc = __popcll(mc);
+      unsigned c = na | nc << 16;
+#pragma unroll
+      for (int o = 1; o < 32; o <<= 1) {
+        const unsigned y = __shfl_up_sync(0xffffffffu, c, o);
+        if (lane >= o) c += y;
+      }
+      const unsigned tot = __shfl_sync(0xffffffffu, c, 31);
+      if (t == 0) s.nsel = 0, s.ncand = 0;
+      __syncthreads();
+      unsigned a0 = 0, c0 = 0;
+      if (lane == 31) a0 = atomicAdd(&s.nsel, tot & 0xffff), c0 = atomicAdd(&s.ncand, tot >> 16);
+      unsigned a = __shfl_sync(0xffffffffu, a0, 31) + (c & 0xffff) - na,
+               b = __shfl_sync(0xffffffffu, c0, 31) + (c >> 16) - nc;
+      const auto pos = [&](int q) { return (unsigned)at(q >> 2) + (q & 3); };
+      for (; ma; ma &= ma - 1) s.sel[a++] = pos(__ffsll(ma) - 1);
+      for (; mc; mc &= mc - 1, ++b) {
+        const unsigned i = pos(__ffsll(mc) - 1);
+        s.ckey[b] = okey(row[i]), s.cpos[b] = i;
+      }
+      __syncthreads();
+      finish(s, TK - s.nsel, n, sh, p << sh);
+      return;
+    }
+    rem -= s.above, fpre = p;
+    __syncthreads();
+  }
+  ties_in_order(s, row, n, fpre, rem);
 }
 
 // The exact route: a level a read until the cut's bin fits CAP.
@@ -319,7 +400,7 @@ __device__ __forceinline__ void exact(Smem& s, const float* row, unsigned n) {
     const unsigned p = prefix_of(level, fpre, s.cut), above = s.above;
     if (s.count <= CAP) {
       collect(s, row, n, SHIFT[level], p, p);
-      finish(s, TK - s.nsel);
+      finish(s, TK - s.nsel, n, SHIFT[level], p << SHIFT[level]);
       return;
     }
     rem -= above, fpre = p;
@@ -327,8 +408,9 @@ __device__ __forceinline__ void exact(Smem& s, const float* row, unsigned n) {
   ties_in_order(s, row, n, fpre, rem);
 }
 
-extern "C" __global__ void __launch_bounds__(NT, 2) k31_topk(const float* __restrict__ logits, int stride,
-                                                            const int* __restrict__ lens, int* __restrict__ out) {
+template <bool HELD>
+__device__ __forceinline__ void topk(const float* __restrict__ logits, int stride, const int* __restrict__ lens,
+                                     int* __restrict__ out) {
   extern __shared__ __align__(16) unsigned char raw[];
   Smem& s = *reinterpret_cast<Smem*>(raw);
   const int t = threadIdx.x;
@@ -339,7 +421,8 @@ extern "C" __global__ void __launch_bounds__(NT, 2) k31_topk(const float* __rest
     for (int i = t; i < TK; i += NT) o[i] = i < (int)n ? i : -1;
     return;
   }
-  if (n < SAMPLE_MIN || !sampled(s, row, n)) exact(s, row, n);
+  if (HELD && n <= HELD_MAX) held(s, row, n);
+  else if (n < SAMPLE_MIN || !sampled(s, row, n)) exact(s, row, n);
   if (n <= BITMAP_MAX) {
     // ascending: each thread a run of words, its bits' rank from a scan of the runs' counts
     const unsigned words = (n + 31) / 32, per = (words + NT - 1) / NT, w0 = min(t * per, words), w1 = min(w0 + per, words);
@@ -361,4 +444,15 @@ extern "C" __global__ void __launch_bounds__(NT, 2) k31_topk(const float* __rest
   Sort(s.u.sort).Sort(k, 0, 32 - __clz(n - 1));
 #pragma unroll
   for (int j = 0; j < TK / NT; ++j) o[t * (TK / NT) + j] = k[j];
+}
+
+extern "C" __global__ void __launch_bounds__(NT, 2) k31_topk(const float* __restrict__ logits, int stride,
+                                                            const int* __restrict__ lens, int* __restrict__ out) {
+  topk<false>(logits, stride, lens, out);
+}
+
+// One block an SM, a row of at most HELD_MAX read once into registers: few rows, each as soon as can be.
+extern "C" __global__ void __launch_bounds__(NT, 1) k31_topk_held(const float* __restrict__ logits, int stride,
+                                                                 const int* __restrict__ lens, int* __restrict__ out) {
+  topk<true>(logits, stride, lens, out);
 }
