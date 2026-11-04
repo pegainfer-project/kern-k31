@@ -204,6 +204,8 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1):
             },
         })
     if not chunk and tp > 1:
+        if max_ctx * tp >= 1 << 24:
+            raise SystemExit(f"k31_dcp_select keys a global position in 24 bits; a context of {max_ctx * tp} is past it")
         sel = {"DCP_W": tp} if tp != 8 else {}
         o.update({
             # (logits, stride, ind, cand): the local top-k as (score, global position) candidates

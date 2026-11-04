@@ -36,7 +36,7 @@ includes = ["deepgemm"]
 # K3.1's DSA glue: the indexer key into its cache, the query and head weights, the key stream the
 # MQA logits read, the top-k as cache slots. Ours, after vLLM's K3.1 math.
 [kernels."k31_dsa"]
-sha256 = "2f90d02358c7546e9891309bea2c2c67e365b4df8260f56e7aad33a433f2e5f5"
+sha256 = "86348c8ebbf1499c4048f280bcc819acb004a9ea21ae6eeba7b692bf66cda4ca"
 source = "source/k31_dsa.cu"
 flags = "plain"
 
@@ -445,7 +445,7 @@ source = "source/peer_allreduce_bf16.cu"
 defines = { NRANKS = 4 }
 
 [kernels."k31_dsa+DCP_W=4"]
-sha256 = "1bda69a82b1f99d886ec567a058171d7bbc9d8696c79a81d82282340a7166fa2"
+sha256 = "8c170f40672b850b1bbd98d8ed7e9652e69629151a4dc48759fa2565a1275f81"
 source = "source/k31_dsa.cu"
 flags = "plain"
 defines = { DCP_W = 4 }

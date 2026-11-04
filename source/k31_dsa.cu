@@ -191,13 +191,15 @@ extern "C" __global__ void k31_dcp_pack(const bf16* __restrict__ logits, int str
 }
 
 // vLLM's order of the merge (dcp_indexer_cutedsl.py stable_key): a higher score first, a smaller
-// global position among equal scores; an empty candidate is 0, below everything.
+// global position among equal scores; an empty candidate is 0, below everything. A score is a widened
+// bf16, so its ordered bits are 16 wide; a global position is below 2^24. 40 bits, five radix digits.
+#define KEY_POS 24
 __device__ __forceinline__ unsigned long long stable_key(float2 c) {
   const int g = __float_as_int(c.y);
   if (g < 0) return 0ull;
   const unsigned b = __float_as_uint(c.x);
-  const unsigned s = b ^ ((b & 0x80000000u) ? 0xffffffffu : 0x80000000u);
-  return ((unsigned long long)s << 32) | (unsigned)~g;
+  const unsigned s = (b ^ ((b & 0x80000000u) ? 0xffffffffu : 0x80000000u)) >> 16;
+  return ((unsigned long long)s << KEY_POS) | ((1u << KEY_POS) - 1 - (unsigned)g);
 }
 
 #ifndef DCP_W
@@ -233,10 +235,10 @@ extern "C" __global__ void __launch_bounds__(SEL_THREADS) k31_dcp_select(
   // the search once the threshold's digit bin is taken whole.
   unsigned long long prefix = 0;
   unsigned need = TOPK;
-  for (int shift = 56; shift >= 0; shift -= 8) {
+  for (int shift = KEY_POS + 8; shift >= 0; shift -= 8) {
     for (int i = t & 31; i < 256; i += 32) whist[t >> 5][i] = 0;
     __syncwarp();
-    const unsigned long long hi = shift == 56 ? 0ull : ~0ull << (shift + 8);
+    const unsigned long long hi = ~0ull << (shift + 8);
 #pragma unroll
     for (int i = 0; i < SEL_PER; ++i)
       if (key[i] != 0 && (key[i] & hi) == prefix) atomicAdd(&whist[t >> 5][(key[i] >> shift) & 0xff], 1u);
@@ -279,7 +281,7 @@ extern "C" __global__ void __launch_bounds__(SEL_THREADS) k31_dcp_select(
 #pragma unroll
   for (int i = 0; i < SEL_PER; ++i) {
     const bool take = key[i] != 0 && key[i] >= thr;
-    const int g = take ? (int)~(unsigned)key[i] : -1;
+    const int g = take ? (int)((1u << KEY_POS) - 1 - (unsigned)(key[i] & ((1u << KEY_POS) - 1))) : -1;
     pos[i] = take && g % W == rank ? g / W : -1;
     mine += pos[i] >= 0;
   }
