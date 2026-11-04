@@ -1,4 +1,4 @@
-// D's K = 7168 f32-out projections (qkvg, front) over 1-48 rows in cuBLAS's own order, the split-K reduce in the
+// D's K = 7168 f32-out projections over 1-64 rows, by default in cuBLAS's own order, the split-K reduce in the
 // same launch: row-major C[m, n] = A[m, K] @ W[N, K]^T, bf16 operands, f32 accumulation and result, m <= BN.
 //
 // cuBLAS (cublasGemmEx f32: nvjet split-K + splitKreduce_kernel) splits K at fixed 64-column blocks (b1, b2),
@@ -8,6 +8,9 @@
 // each pushes row r of its partial into the shared memory of CTA r % SPLITS, one cluster barrier, and each adds
 // its rows' partials in split order. BM = 64: 8 KB weight stages, two or three CTAs an SM (CTA_KB), so every
 // cluster of three is resident at once.
+//
+// EVEN splits K evenly instead (b1, b2 unused), over up to the 8 CTAs of a portable cluster: the order is ours, not
+// cuBLAS's, for the row counts where cuBLAS keeps the projection itself (gen_stage.py --tiny-gemm).
 //
 // W and A come by TMA (128-byte swizzle, 64-column boxes); the first STAGES weight boxes are requested before
 // griddepcontrol.wait (only the weight is read before it), so under PDL they stream while the kernel before
@@ -46,7 +49,11 @@
 #define TMEM_COLS (BN <= 32 ? 32 : 64)
 static_assert(BN % (BM / 8) == 0 && BN <= 64, "UMMA N: a multiple of 8 (M = 64) or 16 (M = 128)");
 static_assert(BM == 64 || BM == 128, "UMMA M");
-static_assert(SPLITS >= 1 && SPLITS <= 3, "bounds b1, b2");
+#ifndef EVEN
+#define EVEN 0
+#endif
+static_assert(SPLITS >= 1 && SPLITS <= 8, "a portable cluster");
+static_assert(EVEN || SPLITS <= 3, "bounds b1, b2");
 
 
 struct __align__(1024) Smem {
@@ -145,7 +152,9 @@ extern "C" __global__ void __launch_bounds__(128, 1)
   const int tile = blockIdx.x / SPLITS, split = (int)cluster_rank();
   const int nkb_all = K / BK;
   const int bounds[4] = {0, SPLITS == 1 ? nkb_all : b1, SPLITS == 2 ? nkb_all : b2, nkb_all};
-  const int kb0 = bounds[split], nkb = bounds[split + 1] - kb0;
+  constexpr bool even = EVEN;
+  const int kb0 = even ? split * nkb_all / SPLITS : bounds[split],
+            nkb = even ? (split + 1) * nkb_all / SPLITS - kb0 : bounds[split + 1] - kb0;
 #define LOAD_W(dst, i, bar) tma_2d(dst, &tw, bar, (kb0 + (i)) * BK, tile * BM)
 
   if (threadIdx.x == 0) {

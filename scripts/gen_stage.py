@@ -110,26 +110,44 @@ PF_LAST = ".o_proj"
 # cuBLAS keeps them (ours, at most 4 stages of a 40-48-row A, was 1-2 us a call slower there).
 GEMM_T_SPLIT = (38, 76)
 GEMM_T_BN = ((8, 8), (16, 16), (24, 24), (32, 32))  # (max rows, BN)
-GEMM_T_BM = 64
 GEMM_T_KB = {6016: 100}  # n -> a CTA's shared memory (KB): 100 two CTAs an SM where its clusters all fit, else 73
+# --tiny-gemm: the same kernel with K split evenly, for the K = 7168 f32 shapes and rows where it beat cuBLAS on a
+# GB300 under PDL (n -> (max rows = BN, BM, SPLITS, CTA_KB) a bucket); qkvg 6400 past 32 rows stays cuBLAS's.
+TINY_GEMM = {
+    896: ((16, 64, 6, 200), (32, 64, 6, 200), (48, 64, 6, 200)),
+    3584: ((16, 128, 4, 200), (32, 64, 4, 110), (48, 64, 4, 110)),
+    3648: ((16, 128, 4, 200), (32, 64, 4, 110), (48, 64, 4, 110)),
+    5184: ((16, 128, 4, 110), (32, 64, 3, 110), (48, 64, 3, 110), (64, 64, 3, 110)),
+    6016: ((48, 64, 3, 110),),
+}
 
 
-def gemm_t_op(n, k):
+def gemm_t_buckets(n, own, tiny):
+    """The row buckets of n's own GEMM, (max rows, BN, BM, SPLITS, CTA_KB, (b1, b2)): cuBLAS's order over 1-32 rows
+    for `own`, then the even split (b1 = 0) of --tiny-gemm past those."""
+    first = tuple((hi, bn, 64, 3, GEMM_T_KB.get(n, 73), GEMM_T_SPLIT) for hi, bn in GEMM_T_BN) if own else ()
+    after = first[-1][0] if first else 0
+    return first + (tuple((hi, hi, bm, sp, kb, (0, 0)) for hi, bm, sp, kb in TINY_GEMM.get(n, ()) if hi > after)
+                    if tiny else ())
+
+
+def gemm_t_op(n, k, buckets):
     """C[m, n] = A[m, k] @ W[n, k]^T, f32: one launch for each row bucket, cuBLAS past the last."""
-    tiles = -(-n // GEMM_T_BM)
-    kb = GEMM_T_KB.get(n, 73)
     tmap = lambda param, rows, box: pack(128, {"at": 0, "tensormap": {
         "param": param, "dtype": "bf16", "dims": [k, rows], "strides": [k * 2], "box": [64, box], "swizzle": 128,
         "l2_promotion": 256}})
     launches, lo = [], 1
-    for hi, bn in GEMM_T_BN:
-        launches.append({**module("k3_gemm_f32", BN=bn, CTA_KB=kb, SPLITS=3), "entry": "kern_k3_gemm_f32",
-                         "block": [128, 1, 1], "grid": [tiles * 3, 1, 1], "cluster": [3, 1, 1],
+    for hi, bn, bm, splits, kb, (b1, b2) in buckets:
+        tiles = -(-n // bm)
+        launches.append({**module("k3_gemm_f32", BN=bn, CTA_KB=kb, SPLITS=splits,
+                                    **({"BM": bm} if bm != 64 else {}), **({} if b1 else {"EVEN": 1})),
+                         "entry": "kern_k3_gemm_f32",
+                         "block": [128, 1, 1], "grid": [tiles * splits, 1, 1], "cluster": [splits, 1, 1],
                          "shared_mem": (kb + 1) * 1024, "pdl": True, "when": {"var": T, "min": lo, "max": hi},
                          "params": ["bytes<128>", "bytes<128>", "out buffer<f32>", "i32", "i32", "i32", "i32", "i32",
                                     "i32", "in buffer<bf16>", "i64", "in buffer<bf16>", "i64"],
-                         "args": [tmap(1, n, GEMM_T_BM), tmap(0, 0, bn), {"param": 2}, {"param": 6}, {"param": 3},
-                                  {"param": 4}, {"param": 5}, {"i32": GEMM_T_SPLIT[0]}, {"i32": GEMM_T_SPLIT[1]},
+                         "args": [tmap(1, n, bm), tmap(0, 0, bn), {"param": 2}, {"param": 6}, {"param": 3},
+                                  {"param": 4}, {"param": 5}, {"i32": b1}, {"i32": b2},
                                   *({"param": i} for i in range(7, 11))]})
         lo = hi + 1
     launches.append({"entry": "extern:cublas_bf16_tn_f32", "when": {"var": T, "min": lo},
@@ -146,7 +164,7 @@ def is_mla(i):
 
 
 def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_variants=None, pack=16,
-          mla_short=128, kv="fp8", mla_ours_from=None, window=65536, kda_state="bf16"):
+          mla_short=128, kv="fp8", mla_ours_from=None, window=65536, kda_state="bf16", tiny_gemm=False):
     """P with `chunk_max`, else D over a `tp` group (see the module doc), of layers [0, `end`). `pack`: P's sequences a call; `window`: the cached keys a
     P's MLA layer expands and attends at once; `kv`: the MLA cache, SGLang's fp8 (e4m3, scale 1; D
     attends it with the Cake kernel, P lifts it to bf16 for the expansion) or bf16; `kda_state`: the KDA
@@ -258,7 +276,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32", "i32"],
             "impl": {"launches": [{"entry": "extern:cublas_bf16_tn_f32"}]},
         },
-        **({f"gemm_t{n}": gemm_t_op(n, H) for n in (front, kfused)} if xchg else {}),
+        **({f"gemm_t{n}": gemm_t_op(n, H, gemm_t_buckets(n, n in (front, kfused), tiny_gemm))
+            for n in sorted({front, kfused} | (set(TINY_GEMM) if tiny_gemm else set())) if n} if xchg else {}),
         # K1 residual stream
         # The embedding gather and the first layer's norm (nb == 0: the mix is the row) in one launch.
         **({"embed_rms": {
@@ -1390,16 +1409,21 @@ def main():
                     help="the MLA cache: SGLang's fp8 (e4m3; D attends it with FlashInfer's Cake kernel, P lifts it to "
                          "bf16 for the expansion and has no absorbed short path) or bf16")
     ap.add_argument("--kda-state", choices=("bf16", "f32"), default="bf16", help="the KDA recurrent state's storage")
+    ap.add_argument("--tiny-gemm", action="store_true",
+                    help="D: our split-K GEMM (K split evenly) for the f32 K = 7168 projections and rows where it beat "
+                         "cuBLAS (TINY_GEMM)")
     ap.add_argument("--moe-variants", metavar="FC1,FC2",
                     help="the batched-GEMM variants of the MoE by name (default: the index's picks)")
     a = ap.parse_args()
     if a.chunk and a.tp > 1:
         ap.error("--tp is D's; P runs on one GPU")
+    if a.tiny_gemm and (a.chunk or a.tp == 1):
+        ap.error("--tiny-gemm is a D group's (--tp > 1)")
     if not a.chunk and a.seqs > 64:
         ap.error("D absorbs on tensor cores for at most 64 rows (k3_mla_absorb_mma BMAX)")
     names = tuple(a.moe_variants.split(",")) if a.moe_variants else None
     json.dump(build(a.layers, a.max_ctx, a.seqs, a.tp, a.mla_split_max, a.chunk, names, a.pack,
-                    a.mla_short, a.kv, a.mla_ours_from, a.window, a.kda_state),
+                    a.mla_short, a.kv, a.mla_ours_from, a.window, a.kda_state, a.tiny_gemm),
               sys.stdout, indent=1)
     print()
 
