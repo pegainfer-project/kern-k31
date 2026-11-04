@@ -196,7 +196,9 @@ __device__ __forceinline__ unsigned long long stable_key(float2 c) {
 
 // The group's top 2048 of a row from every member's candidates (cand [W][R][2048], member-major as
 // an all-gather lays them out), and of those the positions this member holds, as cache slots
-// through its page table in candidate order, -1 after them. lens is their count, at least 1 for
+// through its page table, -1 after them: thread t owns candidates t + 1024 i, and the slots go out in
+// (t, i) order, a fixed order of the candidates, so the loads coalesce and the result never depends on
+// the schedule. lens is their count, at least 1 for
 // the attention (a row with none attends slot 0, live 0 says to discard it); live the true count.
 //   grid (R), block 1024, W = 8
 extern "C" __global__ void __launch_bounds__(SEL_THREADS) k31_dcp_select(
@@ -212,7 +214,7 @@ extern "C" __global__ void __launch_bounds__(SEL_THREADS) k31_dcp_select(
   unsigned long long key[SEL_PER];
 #pragma unroll
   for (int i = 0; i < SEL_PER; ++i) {
-    const int c = t * SEL_PER + i;  // candidate c of the row: member c / 2048, slot c % 2048
+    const int c = t + i * SEL_THREADS;  // candidate c of the row: member c / 2048, slot c % 2048
     key[i] = stable_key(cand[((size_t)(c / TOPK) * R + r) * TOPK + c % TOPK]);
   }
   // the 2048-th largest key by an 8-bit MSB-first radix select; keys are distinct but 0. A pass ends

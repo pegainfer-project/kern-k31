@@ -37,7 +37,7 @@ flags = "deepgemm"
 includes = ["deepgemm_k31"]
 
 [kernels."k31_dsa"]
-sha256 = "436f71bf61054745e62f2ec884f4e65fec37c9acea61e5bc0f07249c29ac4bcc"
+sha256 = "46d602637f94cd8713b47c698ec8976ca9fc037c0f9506aa704f734be68e1ca2"
 source = "source/k31_dsa.cu"
 flags = "plain"
 
