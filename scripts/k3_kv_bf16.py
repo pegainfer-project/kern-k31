@@ -36,7 +36,7 @@ MLA_REDUCE_SMEM = 1024    # 256-split reducer scratch
 ABSORB_SMEM = 1024 + 2 * 4 * 64 * 128 * 2 + 2 * 64 * 128 + 128  # k3_mla_absorb_tc.cu SMEM_BYTES
 
 
-check = lambda decode, xchg, seqs_max: None
+check = lambda decode, xchg, seqs_max, dsa: None
 
 
 def fast_divmod(d):
