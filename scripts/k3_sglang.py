@@ -1,6 +1,6 @@
 """K3 decode on SGLang's memory.
 
-Rewrites a `gen_stage.py --tp N --peer-ar` decode manifest into one SGLang's
+Rewrites a `gen_stage.py --tp N` decode manifest into one SGLang's
 model runner drives (kern's `python/kern_sglang`): `k3_hosted.py`'s program
 boundary, and every state a host state over the tensors SGLang allocates for
 a hybrid MLA + KDA model, one per layer and kind:

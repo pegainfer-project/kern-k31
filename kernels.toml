@@ -459,3 +459,8 @@ defines = { NRANKS = 4 }
 sha256 = "e44bf92a1417c428b6c644d20625460e1def8eadea62857f37397d7b85dcaecd"
 source = "source/k3_mla_vup_gate.cu"
 defines = { HEADS = 24 }
+
+[kernels."k3_ar_fused+NRANKS=4"]
+sha256 = "c1a8a94bdb88d4606c65456c7ba26bd9312377c897d89aa9340b5670362e35ae"
+source = "source/k3_ar_fused.cu"
+defines = { NRANKS = 4 }
