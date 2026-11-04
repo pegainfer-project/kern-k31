@@ -15,10 +15,13 @@
 //
 // A row of at least SAMPLE_MIN is first tried on a sample: its ends whole and an eighth of the rest in
 // chunks spread evenly, weighted to the row, two digits deep, puts a threshold where 1.5x 2048 keys
-// are expected above it, and one read keeps every key at or above it. When the kept count lands in [2048, CAP], that is the row: one read and an eighth.
-// Otherwise (a sample that misleads) the row takes the exact route above, a read a digit plus the
-// one that collects; a cut inside one exact key held by more than CAP positions takes the ties in
-// position order on one more read.
+// are expected above it, and one read keeps every key at or above it. When the kept count lands in
+// [2048, CAP], that is the row: one read and an eighth. Otherwise (a sample that misleads) the row
+// takes the exact route above, a read a digit plus the one that collects; a cut inside one exact key
+// held by more than CAP positions takes the ties in position order on one more read.
+//
+// The 2048 positions leave in ascending order: through a bitmap of the row for a row of at most
+// BITMAP_MAX, a radix sort past it.
 #include <cub/cub.cuh>
 
 #define TK 2048
@@ -41,13 +44,16 @@ __device__ __forceinline__ unsigned okey(float x) {
 using Scan = cub::BlockScan<unsigned, NT>;
 using Sort = cub::BlockRadixSort<int, NT, TK / NT>;
 
+#define BITMAP_MAX 262144  // rows up to this long order their 2048 by a bitmap, longer ones by a sort
+
 struct Smem {
   union {
     unsigned hist[BINS];
     unsigned tie[CAP];
-    typename Scan::TempStorage scan;
+    unsigned bits[BITMAP_MAX / 32];
     typename Sort::TempStorage sort;
   } u;
+  typename Scan::TempStorage scan;
   unsigned h256[256];
   unsigned wsum[8];
   int sel[TK];
@@ -158,20 +164,28 @@ __device__ __forceinline__ Sample sample_of(unsigned n) {
           (unsigned)((16ull * len + interior * SAMPLE_CHUNK / 2) / (interior * SAMPLE_CHUNK))};
 }
 
-// f(x[4], i, weight) over the sample.
+// f(x[4], i, weight) over the sample, a thread's loads issued four at a time.
 template <class F>
 __device__ __forceinline__ void each_sample(const float* row, unsigned n, Sample m, F f) {
-  constexpr unsigned PER = SAMPLE_CHUNK / 4, ENDS = (HEAD + TAIL) / SAMPLE_CHUNK;
-  for (unsigned c = threadIdx.x / PER; c < m.chunks; c += NT / PER) {
-    const unsigned at =
-        c == 0      ? 0
-        : c < ENDS  ? ((n - TAIL) & ~3u) + (c - 1) * SAMPLE_CHUNK
-                    : HEAD + (unsigned)((unsigned long long)(c - ENDS) * (n - HEAD - TAIL - SAMPLE_CHUNK) /
-                                        (m.interior - 1)) & ~3u;
-    const unsigned i = at + threadIdx.x % PER * 4;
-    float x[4];
-    load4(row, i, n, x);
-    f(x, i, c < ENDS ? 16u : m.w16);
+  constexpr unsigned PER = SAMPLE_CHUNK / 4, ENDS = (HEAD + TAIL) / SAMPLE_CHUNK, STEP = NT / PER;
+  const auto at = [&](unsigned c) {
+    return c == 0     ? 0
+           : c < ENDS ? ((n - TAIL) & ~3u) + (c - 1) * SAMPLE_CHUNK
+                      : HEAD + (unsigned)((unsigned long long)(c - ENDS) * (n - HEAD - TAIL - SAMPLE_CHUNK) /
+                                          (m.interior - 1)) & ~3u;
+  };
+  for (unsigned c0 = threadIdx.x / PER; c0 < m.chunks; c0 += 4 * STEP) {
+    float x[4][4];
+    unsigned i[4];
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+      const unsigned c = c0 + u * STEP;
+      i[u] = c < m.chunks ? at(c) + threadIdx.x % PER * 4 : n;
+      load4(row, i[u], n, x[u]);
+    }
+#pragma unroll
+    for (int u = 0; u < 4; ++u)
+      if (i[u] < n) f(x[u], i[u], c0 + u * STEP < ENDS ? 16u : m.w16);
   }
 }
 
@@ -200,7 +214,7 @@ __device__ __forceinline__ void cut_bin(Smem& s, unsigned want) {
   for (int k = 0; k < BPT; ++k) c[k] = s.u.hist[BINS - 1 - BPT * t - k], sum += c[k];
   __syncthreads();
   unsigned ab;
-  Scan(s.u.scan).ExclusiveSum(sum, ab);
+  Scan(s.scan).ExclusiveSum(sum, ab);
 #pragma unroll
   for (int k = 0; k < BPT; ++k) {
     if (ab < want && ab + c[k] >= want) s.cut = BINS - 1 - BPT * t - k, s.above = ab, s.count = c[k];
@@ -265,7 +279,7 @@ __device__ void ties_in_order(Smem& s, const float* row, unsigned n, unsigned ke
 #pragma unroll
     for (int j = 0; j < 4; ++j) e += i + j < n && okey(x[j]) == key;
     unsigned off, tot;
-    Scan(s.u.scan).ExclusiveSum(e, off, tot);
+    Scan(s.scan).ExclusiveSum(e, off, tot);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       const unsigned k = okey(x[j]);
@@ -326,6 +340,20 @@ extern "C" __global__ void __launch_bounds__(NT, 2) k31_topk(const float* __rest
     return;
   }
   if (n < SAMPLE_MIN || !sampled(s, row, n)) exact(s, row, n);
+  if (n <= BITMAP_MAX) {
+    // ascending: each thread a run of words, its bits' rank from a scan of the runs' counts
+    const unsigned words = (n + 31) / 32, per = (words + NT - 1) / NT, w0 = min(t * per, words), w1 = min(w0 + per, words);
+    for (unsigned w = t; w < words; w += NT) s.u.bits[w] = 0;
+    __syncthreads();
+    for (int i = t; i < TK; i += NT) atomicOr(&s.u.bits[s.sel[i] >> 5], 1u << (s.sel[i] & 31));
+    __syncthreads();
+    unsigned c = 0, at;
+    for (unsigned w = w0; w < w1; ++w) c += __popc(s.u.bits[w]);
+    Scan(s.scan).ExclusiveSum(c, at);
+    for (unsigned w = w0; w < w1; ++w)
+      for (unsigned b = s.u.bits[w]; b; b &= b - 1) o[at++] = (int)(w * 32 + __ffs(b) - 1);
+    return;
+  }
   int k[TK / NT];
 #pragma unroll
   for (int j = 0; j < TK / NT; ++j) k[j] = s.sel[t * (TK / NT) + j];
