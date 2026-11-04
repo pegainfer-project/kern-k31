@@ -32,8 +32,8 @@ CAKE_SMEM = 232448
 CAKE_PLAN_SMS = 148
 
 
-def check(decode, xchg, seqs_max):
-    assert not decode or (xchg and seqs_max <= 64), "D's fp8 cache is under DCP, at most 64 rows"
+def check(decode, xchg, seqs_max, dsa):
+    assert not decode or ((xchg or dsa) and seqs_max <= 64), "D's fp8 cache is under DCP (or DSA), at most 64 rows"
 
 
 p_short = lambda mla_short: 0
