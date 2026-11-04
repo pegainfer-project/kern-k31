@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# withgpu [-n N] [-H HOSTS] [-t TIMEOUT_S] CMD...
+#
+# Runs CMD on N exclusively leased GPUs from the pool, in the current
+# directory (which must be on the shared filesystem). A lease is a flock per
+# GPU on its host, held for CMD's lifetime, so agents sharing the pool never
+# time each other's kernels; a GPU running compute outside any lease (someone
+# else's job) is skipped. Waits up to TIMEOUT_S (default: forever).
+#
+# -H 1 (default): N GPUs of one host; CMD runs on that host with
+#   CUDA_VISIBLE_DEVICES set to them and WITHGPU_HOST its name.
+# -H K > 1: N GPUs on each of K hosts; CMD runs here with
+#   WITHGPU_LEASE="host:g,g,.. host:g,g,.." and starts its own processes there.
+#
+#   WITHGPU_HOSTS   hosts of the pool, e.g. "a b" (default: loop/local.env's, else this host)
+#   WITHGPU_HOST_FORMAT  printf format from a pool name to an ssh host (default: %s)
+#   WITHGPU_GPUS    candidate GPU indices per host (default: 0 1 2 3)
+#   WITHGPU_LOCKS   lock directory on each host (default: /dev/shm/withgpu)
+#
+# Exit status is CMD's, or 75 when the timeout passed with no lease.
+set -euo pipefail
+
+n=1 hosts_n=1 timeout_s=0
+while [[ ${1:-} == -* ]]; do
+  case $1 in
+    -n) n=$2; shift 2 ;;
+    -H) hosts_n=$2; shift 2 ;;
+    -t) timeout_s=$2; shift 2 ;;
+    *) break ;;
+  esac
+done
+if [[ $# -eq 0 ]]; then
+  sed -n '2,20s/^# \{0,1\}//p' "$0" >&2
+  exit 2
+fi
+
+[[ -f $(dirname "$0")/local.env ]] && eval "$(grep -E '^WITHGPU_(HOSTS|HOST_FORMAT)=' "$(dirname "$0")/local.env")"
+hosts=${WITHGPU_HOSTS:-$(hostname -s)}
+pool_n=$(wc -w <<<"$hosts")
+gpus=${WITHGPU_GPUS:-0 1 2 3}
+locks=${WITHGPU_LOCKS:-/dev/shm/withgpu}
+here=$(pwd)
+cmd=$(printf '%q ' "$@")
+host_name() { printf "${WITHGPU_HOST_FORMAT:-%s}\n" "$1"; }
+is_local() { [[ $(host_name "$1") == "$(hostname)" || $1 == "$(hostname -s)" ]]; }
+
+# On a host: take N free leases without blocking (75 when fewer are free),
+# then either run CMD holding them, or (CMD "-") print the GPUs and hold them
+# until stdin closes.
+read -r -d '' lease <<'EOF' || true
+set -uo pipefail
+n=$1 locks=$2 here=$3 gpus=$4; shift 4
+mkdir -p "$locks" && chmod 1777 "$locks" 2>/dev/null
+got=()
+for g in $gpus; do
+  exec {fd}>>"$locks/gpu$g.lock"
+  # Memory too: a process in another container is invisible to --query-compute-apps.
+  if flock -n "$fd" && [[ -z $(nvidia-smi -i "$g" --query-compute-apps=pid --format=csv,noheader) ]] &&
+    (($(nvidia-smi -i "$g" --query-gpu=memory.used --format=csv,noheader,nounits) < 1024)); then
+    got+=("$g")
+    ((${#got[@]} == n)) && break
+  else
+    exec {fd}>&-
+  fi
+done
+((${#got[@]} == n)) || { [[ $* == - ]] && echo NONE; exit 75; }
+list=$(IFS=,; echo "${got[*]}")
+if [[ $* == - ]]; then
+  echo "$list"
+  cat >/dev/null
+  exit 0
+fi
+cd "$here" && CUDA_VISIBLE_DEVICES=$list WITHGPU_HOST=$(hostname -s) bash -c "$*"
+EOF
+
+on_host() {
+  local h=$1; shift
+  if is_local "$h"; then
+    bash -c "$lease" lease "$@"
+  else
+    ssh -o ConnectTimeout=10 -o BatchMode=yes "$(host_name "$h")" bash -c "$(printf %q "$lease")" lease \
+      "$(printf %q "$1")" "$(printf %q "$2")" "$(printf %q "$3")" "$(printf %q "$4")" "$(printf %q "$5")"
+  fi
+}
+
+# One pass over the pool for K hosts at once: hold each host's lease through
+# a coprocess-like pipe; on a short pass, drop every hold taken so far.
+multi_pass() {
+  local held=() pids=() fds=() h line left=$pool_n
+  for h in $hosts; do
+    # Stop once the hosts left cannot complete the pass: a waiter that skipped past a busy host
+    # would take the next one from whoever holds the first, and both would fail in lockstep.
+    ((${#held[@]} + left < hosts_n)) && break
+    left=$((left - 1))
+    local fifo_dir; fifo_dir=$(mktemp -d)
+    mkfifo "$fifo_dir/in" "$fifo_dir/out"
+    on_host "$h" "$n" "$locks" "$here" "$gpus" - <"$fifo_dir/in" >"$fifo_dir/out" &
+    pids+=($!)
+    exec {w}>"$fifo_dir/in" {r}<"$fifo_dir/out"
+    rm -rf "$fifo_dir"
+    if read -r -t 60 line <&"$r" && [[ $line != NONE && -n $line ]]; then
+      held+=("$h:$line"); fds+=("$w")
+    else
+      exec {w}>&-
+    fi
+    exec {r}<&-
+    ((${#held[@]} == hosts_n)) && break
+  done
+  if ((${#held[@]} == hosts_n)); then
+    local rc=0
+    WITHGPU_LEASE="${held[*]}" bash -c "$cmd" || rc=$?
+    for w in "${fds[@]}"; do exec {w}>&-; done
+    wait "${pids[@]}" 2>/dev/null || true
+    exit "$rc"
+  fi
+  for w in "${fds[@]}"; do exec {w}>&-; done
+  wait "${pids[@]}" 2>/dev/null || true
+  return 75
+}
+
+start=$SECONDS announced=0
+while true; do
+  if ((hosts_n == 1)); then
+    for h in $hosts; do
+      rc=0
+      on_host "$h" "$n" "$locks" "$here" "$gpus" "$cmd" || rc=$?
+      ((rc == 75)) || exit $rc
+    done
+  else
+    multi_pass || true
+  fi
+  if ((timeout_s > 0 && SECONDS - start >= timeout_s)); then
+    echo "withgpu: no $n free GPUs on $hosts_n host(s) of [$hosts] after ${timeout_s}s" >&2
+    exit 75
+  fi
+  ((announced)) || { echo "withgpu: waiting for $n free GPUs on $hosts_n host(s) of [$hosts]" >&2; announced=1; }
+  sleep $((3 + RANDOM % 6))
+done

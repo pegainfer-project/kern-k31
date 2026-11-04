@@ -1,0 +1,39 @@
+{
+  "size": 192,
+  "max_experts": 1024,
+  "max_top_k": 16,
+  "fields": {
+    "mUsePdl": 0,
+    "mIsPow2": 1,
+    "mPtrExpertCounts": 8,
+    "mPtrPermutedIdxSize": 16,
+    "mPtrExpandedIdxToPermutedIdx": 24,
+    "mPtrPermutedIdxToExpandedIdx": 32,
+    "mPtrPermutedIdxToTokenIdx": 40,
+    "mPtrCtaIdxXyToBatchIdx": 48,
+    "mPtrCtaIdxXyToMnLimit": 56,
+    "mPtrNumNonExitingCtas": 64,
+    "mPtrTopKWeights": 72,
+    "mPtrTopKIds": 80,
+    "mPtrScores": 88,
+    "mNumTokens": 96,
+    "mNumExperts": 100,
+    "mPaddingLog2": 104,
+    "mTileTokensDim": 108,
+    "mLocalExpertsStartIdx": 112,
+    "mLocalExpertsStrideLog2": 116,
+    "mNumLocalExperts": 120,
+    "mNumFusedSharedExperts": 124,
+    "mSharedExpertTokenOffset": 128,
+    "mSharedExpertNumTokens": 132,
+    "mTotalExpertsPerToken": 136,
+    "mPtrRoutingReplayOut": 144,
+    "mUseContiguousRouteWindows": 152,
+    "mPtrNumTokensPerExpert": 160,
+    "mPtrTopKPacked": 168,
+    "mTopK": 176
+  },
+  "int_fast_div": {
+    "16": [16, -2147483647, 3, 1]
+  }
+}

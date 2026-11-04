@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# loop/build: compile every source kernel of kernels.toml with the pinned nvcc
+# into build/, repin the ones whose bytes changed (kernels.toml sha256), and
+# put every cubin into the shared content-addressed cache. Prints the repins.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+cd "$REPO"
+python3 - <<'PY'
+import concurrent.futures, hashlib, os, shutil, subprocess, tomllib
+from pathlib import Path
+toml = Path("kernels.toml")
+kernels = tomllib.loads(toml.read_text())["kernels"]
+out, cache = Path("build"), Path(os.environ["KERN_CACHE_DIR"]) / "blobs"
+out.mkdir(exist_ok=True); cache.mkdir(parents=True, exist_ok=True)
+
+
+def build(item):
+    name, k = item
+    dst = out / f"{name}.cubin"
+    if "prebuilt" in k:
+        shutil.copyfile(k["prebuilt"], dst)
+    else:
+        defines = [f"-D{a}={b}" for a, b in sorted(k.get("defines", {}).items())]
+        subprocess.run([os.environ["K3_NVCC"], "-cubin", "-arch=sm_103a", *defines, "-o", str(dst), k["source"]], check=True)
+    sha = hashlib.sha256(dst.read_bytes()).hexdigest()
+    if not (cache / sha).exists():
+        tmp = cache / f"{sha}.tmp.{os.getpid()}.{name}"
+        shutil.copyfile(dst, tmp)
+        tmp.rename(cache / sha)
+    return name, k, sha
+
+
+with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
+    built = list(pool.map(build, sorted(kernels.items())))
+text = toml.read_text()
+for name, k, sha in built:
+    if sha != k["sha256"]:
+        assert "prebuilt" not in k, f"{name}: prebuilt cubin differs from its pin"
+        header = f'[kernels."{name}"]\nsha256 = "{k["sha256"]}"'
+        assert header in text, name
+        text = text.replace(header, f'[kernels."{name}"]\nsha256 = "{sha}"')
+        print(f"repinned {name}: {k['sha256'][:12]} -> {sha[:12]}")
+toml.write_text(text)
+print(f"{len(built)} kernels built")
+PY

@@ -1,0 +1,9 @@
+/build/
+__pycache__/
+*.cubin
+!prebuilt/*.cubin
+!decode/*/prebuilt/*.cubin
+/harness/out/
+/step/target/
+/loop/local.env
+/loop/out/

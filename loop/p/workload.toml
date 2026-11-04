@@ -1,0 +1,21 @@
+# One PP8 stage (12 layers: 9 KDA, 3 MLA) at the item shapes the 1P2D AgentX
+# run (c64) sent it: 8192-row chunks over a growing prefix (1834 of 4304
+# items), 4096-row snapshot items (185), short tails (10 rows: 856; 20-700:
+# ~1400). Contexts span the sessions' prefixes, 0-200k.
+samples = 12
+seed = 24301
+
+[[sweep]]
+groups = [1]
+rows = [8192]
+context = [0, 65536, 131072, 196608]
+
+[[sweep]]
+groups = [1]
+rows = [4096]
+context = [65536]
+
+[[sweep]]
+groups = [1]
+rows = [10, 354]
+context = [131072]

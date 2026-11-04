@@ -1,0 +1,328 @@
+[kernels."bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x128x256u2_s4_et128x64_m256x128x32_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f"]
+sha256 = "820c5022ded989438c60a7c42122876ac936c4adcc6f01352d63f80c54b4aa5d"
+prebuilt = "prebuilt/bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x128x256u2_s4_et128x64_m256x128x32_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f.cubin"
+upstream = "flashinfer-cubin 0.6.18, cubins/8ec29a98612c3670f9f28825d1ed19f09496073b/batched_gemm-fa419f4-31ee4e5, TLLM_GEN_EXPORT_VERSION 7.0.4.0.4.0"
+
+[kernels."bmm_MxE4m3_MxE2m1MxE4m3_Fp32_Ab32_Bb32_Cb32_t128x128x256u2_s4x4x4x4x1x4_et128x32_m256x128x32_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_fCp_bN_ldgsts_ldgstsSf_rgTma_clmp_siTuGlu_lbW4_lsfbW4_dynB_sm100f"]
+sha256 = "84075cb7dbd6887692cade23a8e7ec958af4fed12270a2f4cf8b5cf7aeda3bbe"
+prebuilt = "prebuilt/bmm_MxE4m3_MxE2m1MxE4m3_Fp32_Ab32_Bb32_Cb32_t128x128x256u2_s4x4x4x4x1x4_et128x32_m256x128x32_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_fCp_bN_ldgsts_ldgstsSf_rgTma_clmp_siTuGlu_lbW4_lsfbW4_dynB_sm100f.cubin"
+upstream = "flashinfer-cubin 0.6.18, cubins/8ec29a98612c3670f9f28825d1ed19f09496073b/batched_gemm-fa419f4-31ee4e5, TLLM_GEN_EXPORT_VERSION 7.0.4.0.4.0"
+
+[kernels."copy_rows"]
+sha256 = "9de645ab4053412ee0832c633510308f4cd3c3fa5d25812924d9a799689f5fc9"
+source = "source/copy_rows.cu"
+
+[kernels."cake_k3_mla_wide"]
+sha256 = "ea9833f6b3a5b12350fb0743efdf85aad30fa7cc853934864f712266ce75548a"
+prebuilt = "prebuilt/cake_k3_mla_wide.cubin"
+source = "source/flashinfer-cake-k3-mla/cake_kimi_k3_mla_fp8_paged_attention_ea17187e76fd47ab2653_kernel.cu"
+build = "source/flashinfer-cake-k3-mla/build.sh"
+upstream = "FlashInfer 3637083a, csrc/cake_kimi_k3_mla (Cake-generated, Apache-2.0)"
+
+[kernels."flash_kda_d128_varlen"]
+sha256 = "751d1f12b73863328877fa69595a8ac4436b985905460f374ab34d6a672c5575"
+prebuilt = "prebuilt/flash_kda_d128_varlen.cubin"
+source = "source/flash-kda/kern_flash_kda.cu"
+build = "source/flash-kda/build.sh"
+defines = { KERN_VARLEN = 1 }
+
+[kernels."flashinfer_moe_routing"]
+sha256 = "d797b1d2edad680ecc0578d4d8a57d5f1a6a364bbb3acd7ecd4d6270c6be4ae0"
+prebuilt = "prebuilt/flashinfer_moe_routing.cubin"
+source = "source/flashinfer-moe-routing/kern_moe_routing.cu"
+build = "source/flashinfer-moe-routing/build.sh"
+
+[kernels."k3_conv_silu+HEADS=12"]
+sha256 = "d4ec42f005eea245a18c88761717db54e30421a7158c57b6028b0c19a472a08b"
+source = "source/k3_conv_silu.cu"
+defines = { HEADS = 12 }
+
+[kernels."k3_dcp"]
+sha256 = "88ad388058c3907de8adbe553667f29f134977d2115e705e2ca75fddc5c95890"
+source = "source/k3_dcp.cu"
+
+[kernels."k3_dcp+CAKE=1"]
+sha256 = "e6f36607ab035880774036b15471c647c5277ab55aa6d81962d3b23cf568638c"
+source = "source/k3_dcp.cu"
+defines = { CAKE = 1 }
+
+[kernels."k3_kda_core+HEADS=12"]
+sha256 = "ba7763168aa013bec36cf8008ecc3da37a0050029d95fa512cdba04c029dbc01"
+source = "source/k3_kda_core.cu"
+defines = { HEADS = 12 }
+
+[kernels."k3_kda_out_gate+HEADS=12"]
+sha256 = "0f8596191a55cefabafdd79b283a8ad8a68dea39256502570bd1ea901d963de2"
+source = "source/k3_kda_out_gate.cu"
+defines = { HEADS = 12 }
+
+[kernels."k3_land"]
+sha256 = "2cd68c79bf3243f37d2f1406880060f610b4028f9e843bb356ea8ef0a0352fcc"
+source = "source/k3_land.cu"
+
+[kernels."k3_mla_prep"]
+sha256 = "e2637887194ef0ce631f85716b7ce919654edf3b9c6f41e70049d3c86e26e62e"
+source = "source/k3_mla_prep.cu"
+
+[kernels."k3_mla_prep+INNER=1536+MLA_FUSED=3648"]
+sha256 = "69a1277dced71841680c57c7928d497406e84a8ac709dbcf21c9c705942e47a5"
+source = "source/k3_mla_prep.cu"
+defines = { INNER = 1536, MLA_FUSED = 3648 }
+
+[kernels."k3_mla_prep+INNER=1536+KV_FP8=1+MLA_FUSED=3648"]
+sha256 = "ed18f10e6aaa61fdd32f130cc703dfd3e70be828abe28848ce3e256eeac14953"
+source = "source/k3_mla_prep.cu"
+defines = { INNER = 1536, KV_FP8 = 1, MLA_FUSED = 3648 }
+
+[kernels."k3_mla_vup_gate+HEADS=12"]
+sha256 = "a6b673b9fa7595089c49b403cdf23c8d0224bab53b0b9224fc6392afe87c09c6"
+source = "source/k3_mla_vup_gate.cu"
+defines = { HEADS = 12 }
+
+[kernels."k3_moe_prefill"]
+sha256 = "6b4d144e735a4b08d29bf8d6e302107a4d1396a6967b0b6d342fe263ff6c8bca"
+source = "source/k3_moe_prefill.cu"
+
+[kernels."k3_prefill"]
+sha256 = "8145127fb97b8eeaf18c8cc0ede00ae06e224d0c951734c66f4128e3bef67a92"
+source = "source/k3_prefill.cu"
+
+[kernels."k3_prefill_glue"]
+sha256 = "1bce46950b3ec4e36a1a923fb0dbf86b8509bb95b72056ff7b757da39f583353"
+source = "source/k3_prefill_glue.cu"
+
+[kernels."k3_residual+LAND_BF16=1"]
+sha256 = "1bb60d2f33b04d70d6866b50d12a67340e33cf0f1c555c9da92494dd5c98f254"
+source = "source/k3_residual.cu"
+defines = { LAND_BF16 = 1 }
+
+[kernels."k3_router_argmax"]
+sha256 = "d7f650788bec1a15b13004a9ef0d1bb8dc109866b3189d0b0658ff1bd9dfad29"
+source = "source/k3_router_argmax.cu"
+
+[kernels."k3_weight_prep"]
+sha256 = "a874bd671bfeb90103a3a5330876e062b5583c752b88e1eadb4e84050c18bf02"
+source = "source/k3_weight_prep.cu"
+
+[kernels."trtllm_fmha_ctx_h192_v128"]
+sha256 = "240811d976c01e4a9bee00041d98343f6f9254fefae598df46a97ff07c7df508"
+prebuilt = "prebuilt/trtllm_fmha_ctx_h192_v128.cubin"
+upstream = "flashinfer-cubin 0.6.18, bundle 2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c, fmha/trtllm-gen/fmhaSm103aKernel_QkvBfloat16OBfloat16HQk192HV128SeparateQkvCausalVarSeqQ256Kv128PersistentContext.cubin"
+
+[kernels."trtllm_fmha_dense_h192_v128"]
+sha256 = "6a471f0ff4f8ffae55e48e64c07001ee80fb5bee604269d4814106e9baa98955"
+prebuilt = "prebuilt/trtllm_fmha_dense_h192_v128.cubin"
+upstream = "flashinfer-cubin 0.6.18, bundle 2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c, fmha/trtllm-gen/fmhaSm103aKernel_QkvBfloat16OBfloat16HQk192HV128SeparateQkvDenseVarSeqQ256Kv128PersistentContext.cubin"
+
+[kernels."trtllm_fmha_ctx_h192_v128_e4m3"]
+sha256 = "3118d62ee587d76638710a98c5d40a4a49d799578e088dfa045f3db8dcdc7afd"
+prebuilt = "prebuilt/trtllm_fmha_ctx_h192_v128_e4m3.cubin"
+upstream = "flashinfer-cubin 0.6.18, bundle 2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c, fmha/trtllm-gen/fmhaSm103aKernel_QkvE4m3OBfloat16HQk192HV128SeparateQkvCausalVarSeqQ256Kv128PersistentContext.cubin"
+
+[kernels."trtllm_fmha_dense_h192_v128_e4m3"]
+sha256 = "42d1628971703b9dba7e93d393abc3c7306a37d8a556a2ca8966e12f09b52737"
+prebuilt = "prebuilt/trtllm_fmha_dense_h192_v128_e4m3.cubin"
+upstream = "flashinfer-cubin 0.6.18, bundle 2d6a5a029eefcc388ec0ceb87efb55d8bcce5c3c, fmha/trtllm-gen/fmhaSm103aKernel_QkvE4m3OBfloat16HQk192HV128SeparateQkvDenseVarSeqQ256Kv128PersistentContext.cubin"
+
+[kernels."weight_prep"]
+sha256 = "040f51b01c421b9c69a2090034ff1bc4741e40c02f5ea52bd04a3e62e5c1af4d"
+source = "source/weight_prep.cu"
+
+[kernels."peer_allreduce_bf16+NRANKS=8"]
+sha256 = "bfc0eef4b7c6a71d59fbb0a0bf4a8b3241a6fdb5bbd1d3ae116f18fd056944f3"
+source = "source/peer_allreduce_bf16.cu"
+defines = { NRANKS = 8 }
+
+[kernels."k3_mla_absorb_mma+Q_FP8=1"]
+sha256 = "2c5ba09f971561547e148f2075a4288da3af41725438beeac55ee0c6043c3bbe"
+source = "source/k3_mla_absorb_mma.cu"
+defines = { Q_FP8 = 1 }
+
+[kernels."k3_mla_decode"]
+sha256 = "7da9b64f6dd04356435706aa23ae8f43e339d32a5a11224222ab493b38268c19"
+source = "source/k3_mla_decode.cu"
+
+[kernels."k3_mla_absorb_tc"]
+sha256 = "294904766b0a807501ef596c0698dfa819713085d5510981f427b30c8ef77920"
+source = "source/k3_mla_absorb_tc.cu"
+
+[kernels."k3_kda_core+KDA_CONV=1"]
+sha256 = "92dd3a341f7651dbe7ce50dc5258d180a0492cf0b7a416900f3789228bf759d7"
+source = "source/k3_kda_core.cu"
+defines = { KDA_CONV = 1 }
+
+[kernels."k3_kda_core+KDA_CONV=1+KDA_SMEM_STATE=1+ROWS_PER_ITER=1"]
+sha256 = "c034a55f66779ed94d0c9e7e0f29dc04ab94c9ac3fe77b4d1a27271c51b086f9"
+source = "source/k3_kda_core.cu"
+defines = { KDA_CONV = 1, KDA_SMEM_STATE = 1, ROWS_PER_ITER = 1 }
+
+[kernels."k3_kda_core+KDA_CONV=1+KDA_MINB=4+ROWS_PER_ITER=2"]
+sha256 = "9b810ac0feb9abcfcd710200a401edb41e4b37b5048015fcd9bf459a778d8983"
+source = "source/k3_kda_core.cu"
+defines = { KDA_CONV = 1, KDA_MINB = 4, ROWS_PER_ITER = 2 }
+
+[kernels."k3_kda_core+KDA_CONV=1+KDA_PDL=1+KDA_SMEM_STATE=1+ROWS_PER_ITER=1"]
+sha256 = "3b5cee4e3b53abc419c6ca5a3ba876ed99cee6abd461b7347e866ea187691582"
+source = "source/k3_kda_core.cu"
+defines = { KDA_CONV = 1, KDA_PDL = 1, KDA_SMEM_STATE = 1, ROWS_PER_ITER = 1 }
+
+[kernels."k3_kda_core+HEADS=12+KDA_CONV=1+KDA_PDL=1+KDA_SMEM_STATE=1+LDS=6400+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400"]
+sha256 = "6959515f34ce5511de91684bd5076dd8071194987ba825b9fc93bfc3c213afdb"
+source = "source/k3_kda_core.cu"
+defines = { HEADS = 12, KDA_CONV = 1, KDA_PDL = 1, KDA_SMEM_STATE = 1, LDS = 6400, ROWS_PER_ITER = 1, WSM_FA = 12, WSM_LDS = 6400 }
+
+[kernels."k3_kda_core+HEADS=12+KDA_CONV=1+KDA_SMEM_STATE=1+LDS=6400+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400"]
+sha256 = "819b3fd2cb56e900303a317032175a8bcb6044cb149ee36ef36a093e408bec55"
+source = "source/k3_kda_core.cu"
+defines = { HEADS = 12, KDA_CONV = 1, KDA_SMEM_STATE = 1, LDS = 6400, ROWS_PER_ITER = 1, WSM_FA = 12, WSM_LDS = 6400 }
+
+[kernels."k3_kda_core+HEADS=12+KDA_CONV=1+KDA_MINB=4+LDS=6400+ROWS_PER_ITER=2+WSM_FA=12+WSM_LDS=6400"]
+sha256 = "ec1f9574d83e07211810d17e3718b5b5f7a0cb008c44741b731314771af735db"
+source = "source/k3_kda_core.cu"
+defines = { HEADS = 12, KDA_CONV = 1, KDA_MINB = 4, LDS = 6400, ROWS_PER_ITER = 2, WSM_FA = 12, WSM_LDS = 6400 }
+
+[kernels."k3_kda_core+CONV_TAP_MAJOR=1+HEADS=12+KDA_CONV=1+KDA_SMEM_STATE=1+LDS=6400+LINE_GUARD=1+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400"]
+sha256 = "64aad0b2da69f8ee45652e35c0abaff1bc5de541d061449a9fddf6a1628e94d6"
+source = "source/k3_kda_core.cu"
+defines = { CONV_TAP_MAJOR = 1, HEADS = 12, KDA_CONV = 1, KDA_SMEM_STATE = 1, LDS = 6400, LINE_GUARD = 1, ROWS_PER_ITER = 1, WSM_FA = 12, WSM_LDS = 6400 }
+
+[kernels."k3_kda_core+CONV_TAP_MAJOR=1+HEADS=12+KDA_CONV=1+KDA_PDL=1+KDA_SMEM_STATE=1+LDS=6400+LINE_GUARD=1+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400"]
+sha256 = "4953b5546e900cc4e9eb4bea6ce582d4bd1b2e1301749d827cbeb41fb29864a2"
+source = "source/k3_kda_core.cu"
+defines = { CONV_TAP_MAJOR = 1, HEADS = 12, KDA_CONV = 1, KDA_PDL = 1, KDA_SMEM_STATE = 1, LDS = 6400, LINE_GUARD = 1, ROWS_PER_ITER = 1, WSM_FA = 12, WSM_LDS = 6400 }
+
+[kernels."k3_kda_core+CONV_TAP_MAJOR=1+HEADS=12+KDA_CONV=1+KDA_MINB=4+LDS=6400+LINE_GUARD=1+ROWS_PER_ITER=2+WSM_FA=12+WSM_LDS=6400"]
+sha256 = "19fd3cdd31553e35dc38b38452f17f89a2338d73512cc66624a2d8fdb3a59b54"
+source = "source/k3_kda_core.cu"
+defines = { CONV_TAP_MAJOR = 1, HEADS = 12, KDA_CONV = 1, KDA_MINB = 4, LDS = 6400, LINE_GUARD = 1, ROWS_PER_ITER = 2, WSM_FA = 12, WSM_LDS = 6400 }
+
+[kernels."k3_kda_core+HEADS=12+KDA_CONV=1+LDS=6400+WSM_FA=12+WSM_LDS=6400"]
+sha256 = "df31c34aa46e4ec8a819f43364dfadd21d455304d3fd9ad4cb31529eeeaad60c"
+source = "source/k3_kda_core.cu"
+defines = { HEADS = 12, KDA_CONV = 1, LDS = 6400, WSM_FA = 12, WSM_LDS = 6400 }
+
+[kernels."k3_moe_front+EXPERTS=896+LDS=6016+SH=768+STRIDE=8"]
+sha256 = "ec6433fb5d540821a300043811697a1313ab8864acd09b2d1c0b4b2216ae63f0"
+source = "source/k3_moe_front.cu"
+defines = { EXPERTS = 896, LDS = 6016, SH = 768, STRIDE = 8 }
+
+[kernels."k3_ar_fused+NRANKS=8"]
+sha256 = "1f74c6d6e41efd3fd6e461715852fd269ffb3e37f81781f64aceaf36801314a8"
+source = "source/k3_ar_fused.cu"
+defines = { NRANKS = 8 }
+
+[kernels."k3_moe_route"]
+sha256 = "a8bf7838ec883196b7edfeffaa5f9323533452f7e00dc1502b24da39648b074d"
+source = "source/k3_moe_route.cu"
+
+[kernels."k3_mla_glue"]
+sha256 = "ae5ff7f2ed88159f8214e07a2e4fa3bad3add4e471a65b4fdf8326fb7f6c376b"
+source = "source/k3_mla_glue.cu"
+
+[kernels."k3_mla_absorb+QBF16=1"]
+sha256 = "e255c187107128eefdba22cd7639ae5e0cb33bcb1be12ca3c4f1c9497f3570e9"
+source = "source/k3_mla_absorb.cu"
+defines = { QBF16 = 1 }
+
+[kernels."k3_ar_fused"]
+sha256 = "1f74c6d6e41efd3fd6e461715852fd269ffb3e37f81781f64aceaf36801314a8"
+source = "source/k3_ar_fused.cu"
+
+[kernels."k3_head+NRANKS=8"]
+sha256 = "9fffe9f0f4e32574cbcd777b6e52abe18f02598e5083c1d3c44e7adfcdfa14ac"
+source = "source/k3_head.cu"
+defines = { NRANKS = 8 }
+
+[kernels."k3_span_gather+K9_LD=49408+PARTIAL_BF16=1"]
+sha256 = "8b4a88ab8182727ddf73aa330e3a979513fe36823a5c92a8d5ce16d847bc45a1"
+source = "source/k3_span_gather.cu"
+defines = { K9_LD = 49408, PARTIAL_BF16 = 1 }
+
+[kernels."k3_span_gather+K9_LD=49408+KDA_STATE_BF16=1+PARTIAL_BF16=1"]
+sha256 = "efd9f1d1091899947763d8de18e9c23d093533246a579cfe13adcd35c741270d"
+source = "source/k3_span_gather.cu"
+defines = { K9_LD = 49408, KDA_STATE_BF16 = 1, PARTIAL_BF16 = 1 }
+
+[kernels."k3_mxfp8"]
+sha256 = "470158ca9dd81e26ef800d486ee10fe06b85724c6fde3e49f6bf7918e30ce0cb"
+source = "source/k3_mxfp8.cu"
+
+[kernels."k3_kda_rec+K12_LD=49408"]
+sha256 = "663253f41bd8eaaa4d586ddcedf826d7b3d06defc77f3b95c4cf235a830e81ad"
+source = "source/k3_kda_rec.cu"
+defines = { K12_LD = 49408 }
+
+[kernels."k3_kda_core+CONV_TAP_MAJOR=1+HEADS=12+KDA_CONV=1+LDS=6400+LINE_GUARD=1+WSM_FA=12+WSM_LDS=6400"]
+sha256 = "4e48ace9c94857819045c632cfb66bd041d4810313b74a55b3bbf1e6fd75fe14"
+source = "source/k3_kda_core.cu"
+defines = { CONV_TAP_MAJOR = 1, HEADS = 12, KDA_CONV = 1, LDS = 6400, LINE_GUARD = 1, WSM_FA = 12, WSM_LDS = 6400 }
+
+[kernels."k3_gemm_f32+BN=8+CTA_KB=73+SPLITS=3"]
+sha256 = "73ce25a87d9544fe2af8b3d7c2e9c2490ad524c1e3fb0bc6e68d894e8f07430a"
+source = "source/k3_gemm_f32.cu"
+defines = { BN = 8, CTA_KB = 73, SPLITS = 3 }
+
+[kernels."k3_gemm_f32+BN=16+CTA_KB=73+SPLITS=3"]
+sha256 = "4f38e86b05d7af96c14e778141a22912d192590b7ec897f60b29125c6173c9b8"
+source = "source/k3_gemm_f32.cu"
+defines = { BN = 16, CTA_KB = 73, SPLITS = 3 }
+
+[kernels."k3_gemm_f32+BN=24+CTA_KB=73+SPLITS=3"]
+sha256 = "ff58500db604d492bf61d20a5c761270b52d1aa6b259e2a4a9d939f010254298"
+source = "source/k3_gemm_f32.cu"
+defines = { BN = 24, CTA_KB = 73, SPLITS = 3 }
+
+[kernels."k3_gemm_f32+BN=8+CTA_KB=100+SPLITS=3"]
+sha256 = "a7bd1d008d298951fa7610ccfc9fd7185a521ca553ae0e28f11ee91b603ec675"
+source = "source/k3_gemm_f32.cu"
+defines = { BN = 8, CTA_KB = 100, SPLITS = 3 }
+
+[kernels."k3_gemm_f32+BN=16+CTA_KB=100+SPLITS=3"]
+sha256 = "7fe5fc1bb8b101f1d7ae2cb85eb3439f7ce1916e8ddabf7285dd378c014ffce6"
+source = "source/k3_gemm_f32.cu"
+defines = { BN = 16, CTA_KB = 100, SPLITS = 3 }
+
+[kernels."k3_gemm_f32+BN=24+CTA_KB=100+SPLITS=3"]
+sha256 = "0d03c2f3836fee80be244483c2cb11ae61fef22f7827f68408ba0cb1c0190dd2"
+source = "source/k3_gemm_f32.cu"
+defines = { BN = 24, CTA_KB = 100, SPLITS = 3 }
+
+[kernels."k3_gemm_f32+BN=32+CTA_KB=73+SPLITS=3"]
+sha256 = "083df9d941fdb43b691fb73695685262673a8e8bc9cd4ff05d50ea839ea5e5d9"
+source = "source/k3_gemm_f32.cu"
+defines = { BN = 32, CTA_KB = 73, SPLITS = 3 }
+
+[kernels."k3_gemm_f32+BN=32+CTA_KB=100+SPLITS=3"]
+sha256 = "928627f27ea4e05d04f4821042bb1cbbb9624867691fc6ca37f4d015f767599c"
+source = "source/k3_gemm_f32.cu"
+defines = { BN = 32, CTA_KB = 100, SPLITS = 3 }
+
+[kernels."k3_mla_glue+KV_FP8=1"]
+sha256 = "a16d706fed7ef7b1ef9d801a2907092fbcc5fb61b92f38c6c2b505259d4d3bb2"
+source = "source/k3_mla_glue.cu"
+defines = { KV_FP8 = 1 }
+
+[kernels."k3_kda_rec+K12_LD=49408+KDA_STATE_BF16=1"]
+sha256 = "cb802ae088c58b76fdcd5e3062dda6993a4903ba3b17ba5498a2ac55cd7439da"
+source = "source/k3_kda_rec.cu"
+defines = { K12_LD = 49408, KDA_STATE_BF16 = 1 }
+
+[kernels."k3_kda_core+KDA_CONV=1+KDA_PDL=1+KDA_SMEM_STATE=1+KDA_STATE_BF16=1+ROWS_PER_ITER=1"]
+sha256 = "405a797e35940174f4e9a63b2ec0373a1cd3d2a19bccd6927968241914aa2f12"
+source = "source/k3_kda_core.cu"
+defines = { KDA_CONV = 1, KDA_PDL = 1, KDA_SMEM_STATE = 1, KDA_STATE_BF16 = 1, ROWS_PER_ITER = 1 }
+
+[kernels."k3_kda_core+KDA_CONV=1+KDA_MINB=4+KDA_STATE_BF16=1+ROWS_PER_ITER=2"]
+sha256 = "b4c808e752c2fdee134b65b4defb5f0d540aceaa5bf8a8644ed0c8c874018ccb"
+source = "source/k3_kda_core.cu"
+defines = { KDA_CONV = 1, KDA_MINB = 4, KDA_STATE_BF16 = 1, ROWS_PER_ITER = 2 }
+
+[kernels."k3_kda_core+HEADS=12+KDA_CONV=1+KDA_PDL=1+KDA_SMEM_STATE=1+KDA_STATE_BF16=1+LDS=6400+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400"]
+sha256 = "bd270918c8c0a345c09c955dbb06a7c122cec7be30b93bc550ca972bb233c64f"
+source = "source/k3_kda_core.cu"
+defines = { HEADS = 12, KDA_CONV = 1, KDA_PDL = 1, KDA_SMEM_STATE = 1, KDA_STATE_BF16 = 1, LDS = 6400, ROWS_PER_ITER = 1, WSM_FA = 12, WSM_LDS = 6400 }
+
+[kernels."k3_kda_core+HEADS=12+KDA_CONV=1+KDA_MINB=4+KDA_STATE_BF16=1+LDS=6400+ROWS_PER_ITER=2+WSM_FA=12+WSM_LDS=6400"]
+sha256 = "a5760df1ac0f2d7d9efc605d80a3e4f4f92a4fa140aed8a5e1b5b50b8ff04d46"
+source = "source/k3_kda_core.cu"
+defines = { HEADS = 12, KDA_CONV = 1, KDA_MINB = 4, KDA_STATE_BF16 = 1, LDS = 6400, ROWS_PER_ITER = 2, WSM_FA = 12, WSM_LDS = 6400 }

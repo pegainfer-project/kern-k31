@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# loop/d/ranks OUT K3_STEP_ARGS...: one k3_step process per GPU of the lease
+# withgpu -H handed over (WITHGPU_LEASE="host:g,.. host:g,.."), ranks in
+# lease order, meeting through an NCCL id file in OUT. Waits for all;
+# exit 1 if any rank failed (its log is OUT/rank<r>.log).
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
+out=$1; shift
+mkdir -p "$out" && rm -f "$out"/ncclid*
+world=0
+for h in $WITHGPU_LEASE; do IFS=, read -ra g <<<"${h#*:}"; world=$((world + ${#g[@]})); done
+host_name() { printf "${WITHGPU_HOST_FORMAT:-%s}\n" "$1"; }
+envs="LD_LIBRARY_PATH=$K3_NCCL_LIB NCCL_SOCKET_IFNAME=$K3_NCCL_IFNAME NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1 \
+TMPDIR=$TMPDIR KERN_CACHE_DIR=$KERN_CACHE_DIR"
+args=$(printf '%q ' "$@")
+r=0 pids=()
+for h in $WITHGPU_LEASE; do
+  IFS=, read -ra g <<<"${h#*:}"
+  for gpu in "${g[@]}"; do
+    ssh -o BatchMode=yes -o ConnectTimeout=20 "$(host_name "${h%%:*}")" \
+      "mkdir -p $TMPDIR && env $envs timeout ${D_TIMEOUT:-900} $K3_STEP_BIN --weights $K3_WEIGHTS --gpu $gpu \
+       --rank $r --world $world --nccl-id $out/ncclid --out $out $args" > "$out/rank$r.log" 2>&1 < /dev/null &
+    pids+=($!) r=$((r + 1))
+  done
+done
+rc=0
+for p in "${pids[@]}"; do wait "$p" || rc=1; done
+exit $rc

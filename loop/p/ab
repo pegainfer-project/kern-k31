@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# loop/p/ab A B OUT [N]: A/B of two P stage manifests on one leased GPU,
+# A B B A A B ... N pairs (default 2), so both sides see the same GPU, clocks
+# and power cap, and a drift over the lease (the GPU warming up) falls on
+# both sides alike. Writes OUT/{a,b}-<i>.{json,log}; prints each run's weighted
+# cost and the per-scenario medians of both sides.
+#
+# Separate loop/p/bench calls lease separately and can land on GPUs that
+# differ by a few percent, which is larger than most changes they compare.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
+a=$(realpath "$1") b=$(realpath "$2") out=$(realpath -m "$3") n=${4:-2}
+mkdir -p "$out"
+cd "$LOOP_DIR"  # kern reads a kern.toml in the cwd
+bench="env KERN_CACHE_DIR=$KERN_CACHE_DIR LD_LIBRARY_PATH=$LD_LIBRARY_PATH $K3_KERN_BIN bench --kernels $REPO/build \
+--weights $K3_WEIGHTS --tokenizer $K3_TOKENIZER --gpu 0 --workload $LOOP_DIR/p/workload.toml"
+runs=""
+for i in $(seq 1 "$n"); do
+  ra="$bench --manifest $a --out $out/a-$i.json > $out/a-$i.log 2>&1 && "
+  rb="$bench --manifest $b --out $out/b-$i.json > $out/b-$i.log 2>&1 && "
+  ((i % 2)) && runs+="$ra$rb" || runs+="$rb$ra"
+done
+"$LOOP_DIR/withgpu" -n 1 bash -c "${runs}true" || { echo "FAIL run (logs in $out)"; exit 1; }
+for i in $(seq 1 "$n"); do
+  echo "pair $i: A $("$LOOP_DIR/score" "$out/a-$i.json" | awk '{print $2}')  B $("$LOOP_DIR/score" "$out/b-$i.json" | awk '{print $2}') ms/item"
+done
+python3 - "$out" "$n" <<'PY'
+import json, statistics, sys
+out, n = sys.argv[1], int(sys.argv[2])
+def times(side):
+    t = {}
+    for i in range(1, n + 1):
+        for s in json.load(open(f"{out}/{side}-{i}.json"))["scenarios"]:
+            t.setdefault(s["scenario"]["id"], []).append(s["graph"]["stats"]["p50"] / 1e3)
+    return t
+a, b = times("a"), times("b")
+for k in a:
+    ma, mb = statistics.median(a[k]), statistics.median(b[k])
+    print(f"{k:30s} A {ma:9.3f}  B {mb:9.3f}  {100 * (mb / ma - 1):+6.2f}%")
+PY

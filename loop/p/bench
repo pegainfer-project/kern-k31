@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# loop/p/bench MANIFEST OUT [--ablate]: kern bench of a P stage on one leased
+# GPU over loop/p/workload.toml; OUT.json (portable report) and OUT.log.
+# Prints each scenario's program time and the weighted cost (loop/score).
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
+m=$(realpath "$1") out=$(realpath -m "$2"); shift 2
+mkdir -p "$(dirname "$out")"
+cd "$LOOP_DIR"  # kern reads a kern.toml in the cwd
+"$LOOP_DIR/withgpu" -n 1 env KERN_CACHE_DIR="$KERN_CACHE_DIR" LD_LIBRARY_PATH="$LD_LIBRARY_PATH" "$K3_KERN_BIN" bench --manifest "$m" --kernels "$REPO/build" --weights "$K3_WEIGHTS" \
+  --tokenizer "$K3_TOKENIZER" --gpu 0 --workload "$LOOP_DIR/p/workload.toml" --out "$out.json" "$@" > "$out.log" 2>&1
+rc=$?
+grep -E "^(scenario|program)" "$out.log" | paste - - | awk '{printf "%-28s %s ms  %s calls\n", $2, $4, $(NF-2)}'
+((rc == 0)) && "$LOOP_DIR/score" "$out.json"
+exit $rc

@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""loop/count MANIFEST...: the first metric of the loop, how many kernels a
+step launches. Per manifest: the main program's calls and launches (a call
+of an op with several launches counts each; a `when`-gated launch counts
+once), and launches per layer."""
+import json
+import re
+import sys
+
+for path in sys.argv[1:]:
+    m = json.load(open(path))
+    prog = "decode" if "decode" in m["programs"] else "prefill"
+    calls = m["programs"][prog]["calls"]
+    launches = sum(len(m["ops"][c["op"]]["impl"]["launches"]) for c in calls)
+    layers = {int(x) for c in calls for x in re.findall(r"^l(\d+)\.", c.get("label", ""))}
+    per = f"{launches / len(layers):.1f}/layer over {len(layers)}" if layers else ""
+    print(f"{path.rsplit('/', 1)[-1]:<18} {prog:<8} calls {len(calls):>5}  launches {launches:>5}  {per}")

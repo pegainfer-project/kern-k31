@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""loop/score REPORT: one number per bench, the traffic-weighted step time.
+
+A P report (kern bench JSON) is weighted by how often the 1P2D AgentX run
+(c64) fed a stage each item shape; a D directory (k3_step bench.r0.json) by
+how often the decode ran each row count. Lower is better. The weights are
+the recorded traffic's, so a shape the service rarely sees cannot buy the
+score."""
+import json
+import pathlib
+import sys
+
+# P items by rows (4304 recorded): 8192-row chunks 1834, 10-row tails 856,
+# 4096-row snapshots 185, the rest 20-700 rows (354 stands for them); the
+# 8192-row weight is split evenly over the four prefix lengths.
+P = {("8192", c): 1834 / 4 for c in ("0", "65536", "131072", "196608")} | {
+    ("4096", "65536"): 185, ("10", "131072"): 856, ("354", "131072"): 1429}
+# D steps by rows (recorded histogram, 48 at most), bucketed to the benched counts.
+D = {8: 2730, 16: 7460, 24: 7680, 36: 6130, 48: 2125}
+
+
+def p_score(r):
+    total = weight = 0.0
+    for s in r["scenarios"]:
+        rows, ctx = s["scenario"]["id"].split("-r")[1].split("-kv")
+        w = P.get((rows, ctx), 0)
+        total += w * s["graph"]["stats"]["p50"] / 1e3
+        weight += w
+    return total / weight
+
+
+def d_score(rows):
+    by = {}
+    for r in rows:
+        by.setdefault(r["rows"], []).append(r["p50"])
+    return sum(D[k] * sum(v) / len(v) for k, v in by.items() if k in D) / sum(D[k] for k in by if k in D)
+
+
+for arg in sys.argv[1:]:
+    p = pathlib.Path(arg)
+    if p.is_dir():
+        print(f"cost {d_score(json.load(open(p / 'bench.r0.json'))):.3f} ms/step (D, weighted)  {p}")
+    else:
+        print(f"cost {p_score(json.load(open(p))):.3f} ms/item (P, weighted)  {p}")

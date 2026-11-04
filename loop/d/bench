@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# loop/d/bench MANIFEST OUT: the D step on a real TP8 group (4 GPUs on each of
+# 2 leased hosts), random tokens over fake contexts of 64k and 128k, CUDA
+# graphs replayed per row count. OUT/bench.r<rank>.json; prints rank 0's
+# p50 per shape and the traffic-weighted cost (loop/score).
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
+m=$(realpath "$1") out=$(realpath -m "$2")
+"$LOOP_DIR/withgpu" -n 4 -H 2 "$LOOP_DIR/d/ranks" "$out" --manifest "$m" --tokens /dev/null \
+  --ctx 65536,131072 --bench 8,16,24,36,48 --warmup 10 --iters 50
+rc=$?
+grep -h "step p10" "$out/rank0.log" | sed 's/^rank 0 //'
+((rc == 0)) && "$LOOP_DIR/score" "$out"
+exit $rc

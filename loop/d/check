@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# loop/d/check CANDIDATE OUT: the 4-layer TP8 decode (loop/gen's
+# d-l4-tp8.json) teacher-forced over 4 rows x 640 steps of real text, every
+# 64th step's logits kept, judged against main's band.
+#
+# main's own TP8 run is not the oracle's: TP8 sums bf16 partials across
+# ranks and merges DCP attention by LSE, the one-GPU oracle does neither, so
+# main sits at top-1 0.918, relRMS median 1.77% / max 8.3%, one confident
+# flip. A candidate passes when it is no worse than that band (top-1 within
+# 1 point, median relRMS within 25%, max within 2 points, at most one more
+# confident flip, all ranks identical). Its distance from main itself is
+# printed too: that is the error the change introduced, to be explained.
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
+m=$(realpath "$1") out=$(realpath -m "$2") base=$K3_LOOP_DATA/base
+"$LOOP_DIR/withgpu" -n 4 -H 2 "$LOOP_DIR/d/ranks" "$out" --manifest "$m" --tokens "$K3_LOOP_DATA/ids-r4.i64" \
+  --rows 4 --every 64 --graph || { echo "FAIL run (logs in $out)"; exit 1; }
+cmp="python3 $REPO/scripts/compare_steps.py"
+$cmp "$base/g4-tp1" "$out" --rows 4 > "$out/vs-oracle.compare"
+$cmp "$base/g4-tp8" "$out" --rows 4 --tie 0 > "$out/vs-main.compare"
+python3 - "$base/g4-tp8.compare" "$out/vs-oracle.compare" "$out/vs-main.compare" <<'PY'
+import re, sys
+def read(p):
+    s = open(p).read()
+    top, med, mx = map(float, re.search(r"top-1 agrees ([\d.]+), .* median ([\d.]+) max ([\d.]+)", s).groups())
+    return dict(top=top, med=med, max=mx, confident=s.count("FAIL confident"), ranks="differs from rank 0" not in s, flips=s.count("\nflip") + s.startswith("flip"))
+main, cand, vs = (read(p) for p in sys.argv[1:])
+fmt = lambda r: f"top-1 {r['top']:.4f} · relRMS median {r['med']:.4f} max {r['max']:.4f} · confident flips {r['confident']}"
+print(f"main  vs oracle: {fmt(main)}")
+print(f"cand  vs oracle: {fmt(cand)}")
+print(f"cand  vs main:   top-1 {vs['top']:.4f} ({vs['flips']} flips) · relRMS median {vs['med']:.5f} max {vs['max']:.5f}"
+      + (" · bit-identical" if vs["max"] == 0 and vs["flips"] == 0 else ""))
+bad = [w for w, ok in [
+    ("ranks disagree", cand["ranks"]),
+    ("top-1 more than 1 point below main", cand["top"] >= main["top"] - 0.01),
+    ("median relRMS more than 25% above main", cand["med"] <= main["med"] * 1.25),
+    ("max relRMS more than 2 points above main", cand["max"] <= main["max"] + 0.02),
+    ("more than one extra confident flip", cand["confident"] <= main["confident"] + 1)] if not ok]
+for b in bad:
+    print("FAIL", b)
+print("PASS" if not bad else "FAIL")
+sys.exit(1 if bad else 0)
+PY

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# loop/d/oracle MANIFEST OUT: the one-GPU oracle run of loop/gen's
+# d-l4-tp1.json over the check's tokens (main's, once per base).
+set -uo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../env.sh"
+m=$(realpath "$1") out=$(realpath -m "$2")
+mkdir -p "$out"
+cd "$LOOP_DIR"  # kern reads a kern.toml in the cwd
+"$LOOP_DIR/withgpu" -n 1 env KERN_CACHE_DIR="$KERN_CACHE_DIR" "$K3_STEP_BIN" --manifest "$m" --weights "$K3_WEIGHTS" \
+  --gpu 0 --tokens "$K3_LOOP_DATA/ids-r4.i64" --rows 4 --every 64 --out "$out" > "$out/rank0.log" 2>&1

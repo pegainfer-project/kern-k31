@@ -1,0 +1,303 @@
+diff --git a/kernels.toml b/kernels.toml
+index 59c6d9d..18d3280 100644
+--- a/kernels.toml
++++ b/kernels.toml
+@@ -219,3 +219,13 @@ source = "source/k3_ar_fused.cu"
+ sha256 = "2e2faf55285df2762a45442710d88c22ccce26b490719069edd592f7bceb7a4b"
+ source = "source/k3_head.cu"
+ defines = { NRANKS = 8 }
++
++[kernels."k3_dcp+DCP_HILO=1"]
++sha256 = "de22b33f980aeed446b8b5ec945a62232097e9f6aafbcf487f292a85d89ff848"
++source = "source/k3_dcp.cu"
++defines = { DCP_HILO = 1 }
++
++[kernels."k3_moe_prefill+FIN_F32=1"]
++sha256 = "e481806741f9b54067bef27fb29f5553f622e356e128031fe78b0a2ad3783761"
++source = "source/k3_moe_prefill.cu"
++defines = { FIN_F32 = 1 }
+diff --git a/scripts/gen_stage.py b/scripts/gen_stage.py
+index a178375..12c3fef 100755
+--- a/scripts/gen_stage.py
++++ b/scripts/gen_stage.py
+@@ -356,6 +356,7 @@ def build(layers, ranks, max_ctx, seqs_max, tp=1, mla_split_max=16, span_max=0,
+     # holding every expert, with nothing to exchange or sum.
+     xchg = dcp and tp > 1
+     fused_ar = xchg and peer_ar
++    F32 = bool(os.environ.get('EB_F32')) and xchg and not peer_ar
+     tray = tp > 1 and decode and not dcp
+     coll = tp > 1 and chunk
+     # The prefill glue's kernels (bf16 partials, any rows) carry the residual
+@@ -870,7 +871,7 @@ def build(layers, ranks, max_ctx, seqs_max, tp=1, mla_split_max=16, span_max=0,
+             "params": ["in buffer<f32>", "in buffer<f32>", "in buffer<i32>", "in buffer<i32>", "i32", "in buffer<bf16>",
+                        "in buffer<bf16>", "out buffer<bf16>", "inout buffer<u8>", "in buffer<u64>", "inout buffer<i32>", "out buffer<i32>", "i32", "i32", "i64",
+                        "i64"],
+-            "impl": {"launches": [launch("k3_dcp", "kern_k3_dcp_exchange", grid=[DCP_GRID, 1, 1],
++            "impl": {"launches": [launch("k3_dcp", "kern_k3_dcp_exchange", grid=[DCP_GRID, 1, 1], defines={"DCP_HILO": 1} if os.environ.get('EB_HILO') else None,
+                                          block=[256, 1, 1], smem=HEAD_DIM // 2 * KV_LORA * 2)]},
+         }
+         ops["dcp_init"] = {
+@@ -880,6 +881,8 @@ def build(layers, ranks, max_ctx, seqs_max, tp=1, mla_split_max=16, span_max=0,
+         }
+     if dcp:
+         ops["nccl_allreduce_bf16"] = nccl("allreduce", "bf16")
++    if F32:
++        ops["nccl_allreduce_f32"] = nccl("allreduce", "f32")
+     if xchg and peer_ar:
+         # The layer's two sums with their neighbours (source/k3_ar_fused.cu): the attention's with the
+         # landing, mix and norm after it; the MoE's with the combine before it and the latent norm after.
+@@ -1001,7 +1004,7 @@ def build(layers, ranks, max_ctx, seqs_max, tp=1, mla_split_max=16, span_max=0,
+     # bytes: one Lamport stage, `tp` slots of f32 [rows, H], or of a DCP step's widest bf16 sum: a MoE
+     # layer's, the routed latent's `seqs_max` rows, then the shared expert's
+     ar_stage = tp * seqs_max * (LATENT + H) * 2 if dcp else tp * min(rows_max, ONESHOT_MAX_ROWS) * H * 4
+-    dcp_stage = tp * seqs_max * hl * (KV_LORA // 8 + 1) * 16
++    dcp_stage = tp * seqs_max * hl * ((2 if os.environ.get('EB_HILO') else 1) * KV_LORA // 8 + 1) * 16
+     if tray:
+         buffers.update({
+             "tp_sym": {"dtype": "u8", "shape": [2 * tp * ag_region * 16], "kind": "carry", "export": True},
+@@ -1130,9 +1133,14 @@ def build(layers, ranks, max_ctx, seqs_max, tp=1, mla_split_max=16, span_max=0,
+         for n in ["hidden", "blocks"]:
+             buffers[n]["kind"] = "output"
+     if decode:
+-        work("hidden_partial", H, part)
++        work("hidden_partial", H, "f32" if F32 else part)
+     if xchg:
+-        work("o_partial", H)
++        work("o_partial", H, "f32" if F32 else "bf16")
++    if F32:
++        work("dense_down", H, "f32")
++        work("mlp_bf16", H)
++        work("moe_lat_bf16", LATENT)
++        work("moe_sh_bf16", H)
+     if xchg and mla:
+         # the exchange's Lamport stages: a slot per member, a record of 65 vectors per (row, head) in it
+         buffers.update({
+@@ -1144,7 +1152,7 @@ def build(layers, ranks, max_ctx, seqs_max, tp=1, mla_split_max=16, span_max=0,
+     if dcp:
+         # the flat MoE all-reduce: the routed latent's rows at the bound, then the shared expert's
+         for n in ["moe_flat", "moe_sum"] if xchg else ["moe_flat"]:
+-            buffers[n] = {"dtype": "bf16", "shape": [seqs_max * (LATENT + H)], "kind": "workspace"}
++            buffers[n] = {"dtype": "f32" if F32 else "bf16", "shape": [seqs_max * (LATENT + H)], "kind": "workspace"}
+     if tray:
+         work("hidden_partial_all", H, "f32", var=R)
+         work("routed_latent_all", LATENT, var=R)
+@@ -1256,7 +1264,7 @@ def build(layers, ranks, max_ctx, seqs_max, tp=1, mla_split_max=16, span_max=0,
+         work("dense_partial", 2 * dn_l, part, var=RW)
+         work("dense_act", dn_l, var=RW)
+     if tray or (xchg and 0 in layers):
+-        work("mlp_all", H, part, var=R)
++        work("mlp_all", H, "f32" if F32 else part, var=R)
+     # A decode step's logits are its sequences' (the tray's, in a tray batch);
+     # a chunk's are its last row's, live for the one sequence.
+     if head:
+@@ -1343,7 +1351,7 @@ def build(layers, ranks, max_ctx, seqs_max, tp=1, mla_split_max=16, span_max=0,
+                  b("tp_ar_state"), b("tp_err"), {"rank": "tp"}, {"expr": count}, i64(at2), {"expr": n2} if second else i64(0),
+                  i64(ar_stage), i64(TP_TIMEOUT_NS))
+         else:
+-            step(label, "nccl_allreduce_bf16", partial, whole, {"expr": {"add": [at2, n2]} if second else count})
++            step(label, "nccl_allreduce_f32" if F32 else "nccl_allreduce_bf16", partial, whole, {"expr": {"add": [at2, n2]} if second else count})
+         return whole
+ 
+     def span_kda(L, w, line, KB, S, kda="kda"):
+@@ -1590,7 +1598,7 @@ def build(layers, ranks, max_ctx, seqs_max, tp=1, mla_split_max=16, span_max=0,
+                 # this member's heads' o_proj, summed over the group in bf16
+                 attn_in, attn_k = (b("gated"), gate_l) if is_mla(i) else (gated_kda, inner_l)
+                 o = b("o_partial" if xchg else "hidden_partial")
+-                proj(L + "o_proj", attn_in, w("w_o"), o, H, attn_k)
++                proj(L + "o_proj", attn_in, w("w_o"), o, H, attn_k, dt="f32" if F32 else part)
+                 if fused_ar:
+                     attn_out = None
+                     step(L + "res_mlp", "ar_attnres_rms", o, *lamport(), b("hidden"), b("blocks"), w("sw_mlp"),
+@@ -1598,7 +1606,7 @@ def build(layers, ranks, max_ctx, seqs_max, tp=1, mla_split_max=16, span_max=0,
+                          i64(ar_stage), i64(TP_TIMEOUT_NS))
+                 else:
+                     attn_out = summed(L + "reduce_attn", o, b("hidden_partial"), {"mul": [T, H]})
+-                landing = "land_add_attnres_rms_bf16"
++                landing = "land_add_attnres_rms" if F32 else "land_add_attnres_rms_bf16"
+             elif is_mla(i) or tp == 1:
+                 gemm(L + "o_proj", b("gated"), w("w_o"), b("hidden_partial"), H, INNER)
+                 attn_out = gathered(L + "gather_attn", b("hidden_partial"), b("hidden_partial_all"), "f32", H * 4)
+@@ -1621,8 +1629,16 @@ def build(layers, ranks, max_ctx, seqs_max, tp=1, mla_split_max=16, span_max=0,
+             if i == 0:
+                 proj(L + "wgu", b("normed"), w("wgu"), b("dense_partial"), 2 * dn_l, H, m=RB)
+                 land_situ(L + "situ", b("dense_partial"), b("dense_act"), dn_l, RB)
+-                proj(L + "w_dn", b("dense_act"), w("w_dn"), b("routed_partial"), H, dn_l, m=RB)
+-                if fused_ar:
++                if F32:
++                    proj(L + "w_dn", b("dense_act"), w("w_dn"), b("dense_down"), H, dn_l, m=RB, dt="f32")
++                    mlp = summed(L + "reduce_mlp", b("dense_down"), b("mlp_all"), {"mul": [T, H]})
++                    land(L + "land_mlp", mlp, b("mlp_bf16"), H, 0, H)
++                    closing = (L + "hidden", b("mlp_bf16"), b("mlp_bf16"), 0)
++                else:
++                  proj(L + "w_dn", b("dense_act"), w("w_dn"), b("routed_partial"), H, dn_l, m=RB)
++                if F32:
++                    pass
++                elif fused_ar:
+                     closing = ("ar", L + "hidden", b("routed_partial"))
+                 else:
+                     mlp = (reduced(L + "reduce_mlp", b("routed_partial"), b("mlp_all")) if tray else
+@@ -1668,11 +1684,20 @@ def build(layers, ranks, max_ctx, seqs_max, tp=1, mla_split_max=16, span_max=0,
+                                             w("moe.w13s"), w("moe.w13_sfs"), w("moe.w2s"), w("moe.w2_sfs"),
+                                             w("moe.alpha"), w("moe.beta"), b("moe_flat"), {"rank": "tp"}, label=L,
+                                             routed=bool(front), combined=not fused_ar))
+-                    shared_at = seqs_max * LATENT * 2
++                    if F32:
++                        fin = next(c for c in prog if c.get("label") == L + "finalize")
++                        fin["op"] = "moe_finalize_f32"
++                        if "moe_finalize_f32" not in ops:
++                            op = json.loads(json.dumps(ops["moe_finalize"]))
++                            op["params"][3] = "out buffer<f32>"
++                            op["impl"]["launches"][0].update(module("k3_moe_prefill", FIN_F32=1))
++                            ops["moe_finalize_f32"] = op
++                    shared_at = seqs_max * LATENT * (4 if F32 else 2)
+                     if not front:
+                         proj(L + "wsh", b("normed"), w("wsh"), b("shared_partial"), 2 * sh_l, H, m=RB)
+                         land_situ(L + "shared_situ", b("shared_partial"), b("shared_act"), sh_l, RB)
+-                    proj(L + "sh_down", b("shared_act"), w("sh_down"), b("moe_flat", shared_at), H, sh_l, m=RB)
++                    proj(L + "sh_down", b("shared_act"), w("sh_down"), b("moe_flat", shared_at), H, sh_l, m=RB,
++                         dt="f32" if F32 else part)
+                     if fused_ar:
+                         # the combine, the sum of both and the latent norm in one launch
+                         step(L + "reduce_mlp", "ar_finalize_rms", b("moe.fc2_out"), b("moe.exp2perm"),
+@@ -1683,9 +1708,12 @@ def build(layers, ranks, max_ctx, seqs_max, tp=1, mla_split_max=16, span_max=0,
+                         # the routed latent's `tokens` rows, then the shared expert's
+                         moe = summed(L + "reduce_mlp", b("moe_flat"), b("moe_sum"), {"mul": [T, LATENT]},
+                                      (seqs_max * LATENT, {"mul": [T, H]}))["buf"]
+-                        step(L + "lat_norm", "rms", b(moe), w("gamma_lat"), b("routed_latent_norm"), i32(LATENT), RB)
++                        if F32:
++                            land(L + "land_lat", b(moe), b("moe_lat_bf16"), LATENT, 0, LATENT)
++                            land(L + "land_sh", b(moe, shared_at), b("moe_sh_bf16"), H, 0, H)
++                        step(L + "lat_norm", "rms", b("moe_lat_bf16") if F32 else b(moe), w("gamma_lat"), b("routed_latent_norm"), i32(LATENT), RB)
+                     proj(L + "lat_up", b("routed_latent_norm"), w("w_lat_up"), b("routed_partial"), H, LATENT, m=RB)
+-                    closing = (L + "hidden", b("routed_partial"), b(moe, shared_at), 1)
++                    closing = (L + "hidden", b("routed_partial"), b("moe_sh_bf16") if F32 else b(moe, shared_at), 1)
+                 elif bmm:
+                     # the top-k, the latent's mxfp8, the routing tables and the shared activation in one call;
+                     # the combine lands its
+diff --git a/source/k3_dcp.cu b/source/k3_dcp.cu
+index 1f7da38..bb9474b 100644
+--- a/source/k3_dcp.cu
++++ b/source/k3_dcp.cu
+@@ -175,7 +175,14 @@ extern "C" __global__ void __launch_bounds__(256) kern_k3_dcp_combine(const bf16
+   reinterpret_cast<uint4*>(o + ((long long)b * HL + j) * LAT)[v] = out;
+ }
+ 
++#ifdef DCP_HILO
++// error-budget variant: a member's partial o travels as bf16 hi + bf16 lo (hi + lo carries ~16 mantissa bits)
++#define REC (2 * LANES + 1)
++#define LSE_AT (2 * LANES)
++#else
+ #define REC (LANES + 1)
++#define LSE_AT LANES
++#endif
+ #define SPLITS_AT_ONCE 8
+ #define NOPE 128
+ #define RB (256 / LANES)   // rows of a merge item
+@@ -304,7 +311,7 @@ extern "C" __global__ void __launch_bounds__(256, 1) kern_k3_dcp_exchange(
+ #pragma unroll
+     for (int i = 0; i < SPLITS_AT_ONCE; ++i) lv[i] = i == 0 || i < asked ? ls[i] : 0.f;
+     float l = -CUDART_INF_F;
+-    uint4 v = make_uint4(0, 0, 0, 0);
++    uint4 v = make_uint4(0, 0, 0, 0), vlo = make_uint4(0, 0, 0, 0);
+     if (n != 0) {
+       const int tiles = (n + M_TILE - 1) / M_TILE, per = (tiles + asked - 1) / asked, splits = (tiles + per - 1) / per;
+       float m = lv[0];
+@@ -351,13 +358,25 @@ extern "C" __global__ void __launch_bounds__(256, 1) kern_k3_dcp_exchange(
+       __nv_bfloat162* v2 = reinterpret_cast<__nv_bfloat162*>(&v);
+ #pragma unroll
+       for (int k = 0; k < VEC / 2; ++k) v2[k] = __floats2bfloat162_rn(a[2 * k], a[2 * k + 1]);
++#ifdef DCP_HILO
++      __nv_bfloat162* lo2 = reinterpret_cast<__nv_bfloat162*>(&vlo);
++#pragma unroll
++      for (int k = 0; k < VEC / 2; ++k) {
++        const float2 h = __bfloat1622float2(v2[k]);
++        lo2[k] = __floats2bfloat162_rn(a[2 * k] - h.x, a[2 * k + 1] - h.y);
++      }
++      vlo = make_uint4(unpoison(vlo.x), unpoison(vlo.y), unpoison(vlo.z), unpoison(vlo.w));
++#endif
+       v = make_uint4(unpoison(v.x), unpoison(v.y), unpoison(v.z), unpoison(v.w));
+       l *= 1.0f / LOG2E;
+     }
+     uint4* dst = reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(peers[h / HL]) + stage) + rank * slot +
+                  ((long long)b * HL + h % HL) * REC;
+     dst[lane] = v;
+-    if (lane == 0) dst[LANES] = lse_word(l != l || l == CUDART_INF_F ? -CUDART_INF_F : l);
++#ifdef DCP_HILO
++    dst[LANES + lane] = vlo;
++#endif
++    if (lane == 0) dst[LSE_AT] = lse_word(l != l || l == CUDART_INF_F ? -CUDART_INF_F : l);
+   }
+   const uint4 poison = make_uint4(0x80008000u, 0x80008000u, 0x80008000u, 0x80008000u);
+   for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < clear_count; i += (long long)gridDim.x * blockDim.x)
+@@ -378,7 +397,7 @@ extern "C" __global__ void __launch_bounds__(256, 1) kern_k3_dcp_exchange(
+     } else {
+     const uint4* rec = mine + ((long long)b * HL + j) * REC;
+     uint4 v[NRANKS];
+-    await_all(v, rec + LANES, slot, timeout_ns, fail);
++    await_all(v, rec + LSE_AT, slot, timeout_ns, fail);
+     float l[NRANKS];
+     float m = -CUDART_INF_F;
+ #pragma unroll
+@@ -387,6 +406,10 @@ extern "C" __global__ void __launch_bounds__(256, 1) kern_k3_dcp_exchange(
+       m = fmaxf(m, l[q]);
+     }
+     await_all(v, rec + lane, slot, timeout_ns, fail);
++#ifdef DCP_HILO
++    uint4 vl[NRANKS];
++    await_all(vl, rec + LANES + lane, slot, timeout_ns, fail);
++#endif
+     float acc[VEC] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+     float den = 0.f;
+ #pragma unroll
+@@ -396,9 +419,16 @@ extern "C" __global__ void __launch_bounds__(256, 1) kern_k3_dcp_exchange(
+       if (w == 0.f) continue;
+       den += w;
+       const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(&x);
++#ifdef DCP_HILO
++      const __nv_bfloat162* l2 = reinterpret_cast<const __nv_bfloat162*>(&vl[q]);
++#endif
+ #pragma unroll
+       for (int k = 0; k < VEC / 2; ++k) {
+-        const float2 f = __bfloat1622float2(x2[k]);
++        float2 f = __bfloat1622float2(x2[k]);
++#ifdef DCP_HILO
++        const float2 g = __bfloat1622float2(l2[k]);
++        f.x += g.x, f.y += g.y;
++#endif
+         acc[2 * k] = fmaf(w, f.x, acc[2 * k]);
+         acc[2 * k + 1] = fmaf(w, f.y, acc[2 * k + 1]);
+       }
+diff --git a/source/k3_moe_prefill.cu b/source/k3_moe_prefill.cu
+index a00f84f..4949c5a 100644
+--- a/source/k3_moe_prefill.cu
++++ b/source/k3_moe_prefill.cu
+@@ -204,7 +204,11 @@ extern "C" __global__ void kern_k3_moe_route_scatter(const int* __restrict__ ids
+ }
+ 
+ extern "C" __global__ void kern_k3_moe_finalize(const __nv_bfloat16* __restrict__ fc2, const int* __restrict__ exp2perm,
++#ifdef FIN_F32
++                                                const float* __restrict__ wts, float* __restrict__ out, int T,
++#else
+                                                 const float* __restrict__ wts, __nv_bfloat16* __restrict__ out, int T,
++#endif
+                                                 int cols) {
+   const int t = blockIdx.x;
+   for (int h = threadIdx.x; h < cols / 8; h += blockDim.x) {
+@@ -225,11 +229,17 @@ extern "C" __global__ void kern_k3_moe_finalize(const __nv_bfloat16* __restrict_
+         }
+       }
+     }
++#ifdef FIN_F32
++    float4* of = reinterpret_cast<float4*>(out + (long long)t * cols) + 2 * h;
++    of[0] = make_float4(acc[0], acc[1], acc[2], acc[3]);
++    of[1] = make_float4(acc[4], acc[5], acc[6], acc[7]);
++#else
+     uint4 o;
+     __nv_bfloat162* ov = reinterpret_cast<__nv_bfloat162*>(&o);
+ #pragma unroll
+     for (int l = 0; l < 4; ++l) ov[l] = __floats2bfloat162_rn(acc[2 * l], acc[2 * l + 1]);
+     reinterpret_cast<uint4*>(out + (long long)t * cols)[h] = o;
++#endif
+   }
+ }
+ 

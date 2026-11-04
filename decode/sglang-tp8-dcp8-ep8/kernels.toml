@@ -1,0 +1,672 @@
+# Every module SGLang's TP8 / DCP8 / EP8 decode graphs launch (bs 1, 8, 48), as captured; see README.md.
+
+[kernels."RMSNormKernel"]
+sha256 = "28c0e35006d8ebb00b9255b29a8f27c6f727f650e758e297d37b9a3cdf6222c3"
+bytes = 20752
+origin = "FlashInfer (CuTe DSL JIT)"
+upstream = "flashinfer-python 0.7.0.post1:flashinfer/norm/kernels/rmsnorm.py"
+prebuilt = "prebuilt/RMSNormKernel.cubin"
+license = "licenses/LICENSE.flashinfer"
+symbols = [
+  { name = "kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64358435841_tensorptrbf16gmemalign16o35841_tensorptrbf16gmemalign128oi64358435841___T_0", launches = { bs1 = 92, bs8 = 92, bs48 = 92 } },
+]
+
+[kernels."RMSNormKernel_08164dfe"]
+sha256 = "08164dfe2245cc23eaa78ab6cd574c2df875f1f746789f29e282d1262bc8dc59"
+bytes = 19600
+origin = "FlashInfer (CuTe DSL JIT)"
+upstream = "flashinfer-python 0.7.0.post1:flashinfer/norm/kernels/rmsnorm.py"
+prebuilt = "prebuilt/RMSNormKernel_08164dfe.cubin"
+license = "licenses/LICENSE.flashinfer"
+symbols = [
+  { name = "kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel_object_at__tensorptrbf16gmemalign16oi641536i64div81_tensorptrbf16gmemalign16o15361_tensorptrbf16gmemalign16oi641536i64div81_0", launches = { bs1 = 0, bs8 = 24, bs48 = 24 } },
+]
+
+[kernels."RMSNormKernel_6e1a988f"]
+sha256 = "6e1a988f8c12bd6831b3f8c850c88bfa7ba3b641287cd7121c29807747036cbb"
+bytes = 12432
+origin = "FlashInfer (CuTe DSL JIT)"
+upstream = "flashinfer-python 0.7.0.post1:flashinfer/norm/kernels/rmsnorm.py"
+prebuilt = "prebuilt/RMSNormKernel_6e1a988f.cubin"
+license = "licenses/LICENSE.flashinfer"
+symbols = [
+  { name = "kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel_object_at__tensorptrbf16gmemalign16oi64512i64div81_tensorptrbf16gmemalign16o5121_tensorptrbf16gmemalign16oi64512i64div81____0", launches = { bs1 = 0, bs8 = 24, bs48 = 24 } },
+]
+
+[kernels."RMSNormKernel_32cc1a03"]
+sha256 = "32cc1a0317534e1f07009f5de28363eb8f86018d8d640a945cbf54a5aca73849"
+bytes = 19728
+origin = "FlashInfer (CuTe DSL JIT)"
+upstream = "flashinfer-python 0.7.0.post1:flashinfer/norm/kernels/rmsnorm.py"
+prebuilt = "prebuilt/RMSNormKernel_32cc1a03.cubin"
+license = "licenses/LICENSE.flashinfer"
+symbols = [
+  { name = "kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64716871681_tensorptrbf16gmemalign16o71681_tensorptrbf16gmemalign128oi64716871681___T_0", launches = { bs1 = 1, bs8 = 1, bs48 = 1 } },
+]
+
+[kernels."RMSNormKernel_10947e4d"]
+sha256 = "10947e4d7ea89737c11a8b575884110600ce2523f7bed64b00a1bde780c1fe58"
+bytes = 18528
+origin = "FlashInfer (CuTe DSL JIT)"
+upstream = "flashinfer-python 0.7.0.post1:flashinfer/norm/kernels/rmsnorm.py"
+prebuilt = "prebuilt/RMSNormKernel_10947e4d.cubin"
+license = "licenses/LICENSE.flashinfer"
+symbols = [
+  { name = "kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64153615361_tensorptrbf16gmemalign16o15361_tensorptrbf16gmemalign128oi64153615361___T_0", launches = { bs1 = 24, bs8 = 0, bs48 = 0 } },
+]
+
+[kernels."RMSNormKernel_f79e99a8"]
+sha256 = "f79e99a8d84edf632a3701be85358e6894bfcda94ba48132beb757efdf6a5667"
+bytes = 12408
+origin = "FlashInfer (CuTe DSL JIT)"
+upstream = "flashinfer-python 0.7.0.post1:flashinfer/norm/kernels/rmsnorm.py"
+prebuilt = "prebuilt/RMSNormKernel_f79e99a8.cubin"
+license = "licenses/LICENSE.flashinfer"
+symbols = [
+  { name = "kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel_object_at__tensorptrbf16gmemalign128oi645125121_tensorptrbf16gmemalign16o5121_tensorptrbf16gmemalign128oi645125121___True_4_0", launches = { bs1 = 24, bs8 = 0, bs48 = 0 } },
+]
+
+[kernels."split_kv_kernel"]
+sha256 = "5ab8f836a63cd6e70fb85ed8e4638c7a609313dd81d6327f2899bbd59e2fbf4a"
+bytes = 112008
+origin = "FlashInfer (CuTe DSL JIT)"
+upstream = "flashinfer-python 0.7.0.post1:flashinfer/cute_dsl/attention/mla_decode_fp8.py"
+prebuilt = "prebuilt/split_kv_kernel.cubin"
+license = "licenses/LICENSE.flashinfer"
+symbols = [
+  { name = "kernel_cutlass_split_kv_kernel_flashinfercute_dslattentionmonolithicmla_decode_fp8BlackwellMultiHeadLatentAttentionForwardFP8_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____M_0", launches = { bs1 = 24, bs8 = 24, bs48 = 24 } },
+]
+
+[kernels."split_kv_kernel_945e8663"]
+sha256 = "945e866326fe602c413ca487868102365de0092fd8401762efb7f944dee598bf"
+bytes = 121832
+origin = "FlashInfer (CuTe DSL JIT)"
+upstream = "flashinfer-python 0.7.0.post1:flashinfer/cute_dsl/attention/mla_decode_fp8.py"
+prebuilt = "prebuilt/split_kv_kernel_945e8663.cubin"
+license = "licenses/LICENSE.flashinfer"
+symbols = [
+  { name = "kernel_cutlass_split_kv_kernel_flashinfercute_dslattentionmonolithicmla_decode_fp8BlackwellMultiHeadLatentAttentionForwardFP8_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____M_0", launches = { bs1 = 24, bs8 = 24, bs48 = 24 } },
+  { name = "kernel_cutlass_reduction_kernel_flashinfercute_dslattentionmonolithicmla_decode_fp8BlackwellMultiHeadLatentAttentionForwardFP8_object_at__tensorptrbf16gmemalign16odiv16i64div161i64div16i6_1", launches = { bs1 = 24, bs8 = 24, bs48 = 0 } },
+]
+
+[kernels."split_kv_kernel_beb420be"]
+sha256 = "beb420be316970cb4f397b36a36a3be60b1637a3f2cc4739190a6805c99816f2"
+bytes = 122808
+origin = "FlashInfer (CuTe DSL JIT)"
+upstream = "flashinfer-python 0.7.0.post1:flashinfer/cute_dsl/attention/mla_decode_fp8.py"
+prebuilt = "prebuilt/split_kv_kernel_beb420be.cubin"
+license = "licenses/LICENSE.flashinfer"
+symbols = [
+  { name = "kernel_cutlass_split_kv_kernel_flashinfercute_dslattentionmonolithicmla_decode_fp8BlackwellMultiHeadLatentAttentionForwardFP8_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____M_0", launches = { bs1 = 24, bs8 = 24, bs48 = 24 } },
+  { name = "kernel_cutlass_reduction_kernel_flashinfercute_dslattentionmonolithicmla_decode_fp8BlackwellMultiHeadLatentAttentionForwardFP8_object_at__tensorptrbf16gmemalign16odiv16i64div161i64div16i6_1", launches = { bs1 = 24, bs8 = 24, bs48 = 0 } },
+]
+
+[kernels."finalizeKernel"]
+sha256 = "5dfa0ab742547eceb830c3f5b73c4f298f758cd42a0a971c03951c36dbdcb4f8"
+bytes = 2609080
+origin = "FlashInfer / TRT-LLM gen MoE (routing, finalize)"
+upstream = "flashinfer-python 0.7.0.post1:flashinfer/data/csrc/fused_moe/trtllm_backend/trtllm_fused_moe_dev_kernel.cu (flashinfer-jit-cache 0.7.0.post1 fused_moe_trtllm_sm100)"
+not_included = "fat JIT-cache modules of 2.6-36 MB (Apache-2.0); the routing kernels build from ../../source/flashinfer-moe-routing"
+symbols = [
+  { name = "_ZN3moe3dev8finalize14finalizeKernelINS1_12KernelParamsIN7cutlass10bfloat16_tES5_Li4ELb1EEEEEvT_", launches = { bs1 = 92, bs8 = 92, bs48 = 92 } },
+]
+
+[kernels."routingIndicesBlockKernel"]
+sha256 = "476258aeb567fc38cd62d925ba1b5276bb863d0a8afdd1a73ce269f4f6dde94b"
+bytes = 12384320
+origin = "FlashInfer / TRT-LLM gen MoE (routing, finalize)"
+upstream = "flashinfer-python 0.7.0.post1:flashinfer/data/csrc/fused_moe/trtllm_backend/ (flashinfer-jit-cache 0.7.0.post1 trtllm_gen_routing)"
+not_included = "fat JIT-cache modules of 2.6-36 MB (Apache-2.0); the routing kernels build from ../../source/flashinfer-moe-routing"
+symbols = [
+  { name = "_ZN3moe3dev7routing13routingCustom25routingIndicesBlockKernelINS2_12KernelParamsI13__nv_bfloat16S5_Li896ELi16ENS1_16TopKExpertSelectINS1_14NoOpPreprocessENS1_18SoftmaxPostprocessEEEEEEEvT_", launches = { bs1 = 92, bs8 = 0, bs48 = 0 } },
+]
+
+[kernels."routingIndicesClusterKernel"]
+sha256 = "1d92efd229ab4e8ea6ae86e4c7badd84c94c9a9171b05f96b71521a3001e8083"
+bytes = 36510752
+origin = "FlashInfer / TRT-LLM gen MoE (routing, finalize)"
+upstream = "flashinfer-python 0.7.0.post1:flashinfer/data/csrc/fused_moe/trtllm_backend/ (flashinfer-jit-cache 0.7.0.post1 trtllm_gen_routing)"
+not_included = "fat JIT-cache modules of 2.6-36 MB (Apache-2.0); the routing kernels build from ../../source/flashinfer-moe-routing"
+symbols = [
+  { name = "_ZN3moe3dev7routing13routingCustom27routingIndicesClusterKernelINS2_12KernelParamsI13__nv_bfloat16S5_Li896ELi16ENS1_16TopKExpertSelectINS1_14NoOpPreprocessENS1_18SoftmaxPostprocessEEEEELi512EEEvT_", launches = { bs1 = 0, bs8 = 0, bs48 = 92 } },
+  { name = "_ZN3moe3dev7routing13routingCustom27routingIndicesClusterKernelINS2_12KernelParamsI13__nv_bfloat16S5_Li896ELi16ENS1_16TopKExpertSelectINS1_14NoOpPreprocessENS1_18SoftmaxPostprocessEEEEELi256EEEvT_", launches = { bs1 = 0, bs8 = 92, bs48 = 0 } },
+]
+
+[kernels."TgvGemmCuteExtKernel"]
+sha256 = "8ae95d4a44d282ad55fa2c033bf1ad67c100443be22afc33c66974b3fac8c934"
+bytes = 32512
+origin = "FlashInfer TGV GEMM (CuTe DSL JIT)"
+upstream = "flashinfer-python 0.7.0.post1:flashinfer/gemm/kernels/tgv_gemm_cute_ext.py"
+prebuilt = "prebuilt/TgvGemmCuteExtKernel.cubin"
+license = "licenses/LICENSE.flashinfer"
+symbols = [
+  { name = "kernel_cutlass_kernel_TgvGemmCuteExtKernel_cta64x64x128_2cta1_pdl1_bias0_outbfloat16_tensorptrbf16gmemalign32oi641i64_tensorptrbf16gmemalign32oi641i64_tensorptrbf16gmemalign32o1i64i64_ten_0", launches = { bs1 = 0, bs8 = 0, bs48 = 1 } },
+]
+
+[kernels."TgvGemmCuteExtKernel_717483e3"]
+sha256 = "717483e3df51ca1c3b4155d73964113c812dcbbe49d9c21bf528cd1cc0b312e2"
+bytes = 29936
+origin = "FlashInfer TGV GEMM (CuTe DSL JIT)"
+upstream = "flashinfer-python 0.7.0.post1:flashinfer/gemm/kernels/tgv_gemm_cute_ext.py"
+prebuilt = "prebuilt/TgvGemmCuteExtKernel_717483e3.cubin"
+license = "licenses/LICENSE.flashinfer"
+symbols = [
+  { name = "kernel_cutlass_kernel_TgvGemmCuteExtKernel_cta64x16x128_2cta1_pdl1_bias0_outbfloat16_tensorptrbf16gmemalign32oi641i64_tensorptrbf16gmemalign32oi641i64_tensorptrbf16gmemalign32o1i64i64_ten_0", launches = { bs1 = 371, bs8 = 371, bs48 = 0 } },
+]
+
+[kernels."TgvGemmCuteExtKernel_941d03c8"]
+sha256 = "941d03c83426a0b4feddc99406932bfd93d6a54968861129b30b676817ec4398"
+bytes = 29928
+origin = "FlashInfer TGV GEMM (CuTe DSL JIT)"
+upstream = "flashinfer-python 0.7.0.post1:flashinfer/gemm/kernels/tgv_gemm_cute_ext.py"
+prebuilt = "prebuilt/TgvGemmCuteExtKernel_941d03c8.cubin"
+license = "licenses/LICENSE.flashinfer"
+symbols = [
+  { name = "kernel_cutlass_kernel_TgvGemmCuteExtKernel_cta64x16x128_2cta1_pdl1_bias0_outfloat32_tensorptrbf16gmemalign32oi641i64_tensorptrbf16gmemalign32oi641i64_tensorptrf32gmemalign32o1i64i64_tenso_0", launches = { bs1 = 92, bs8 = 92, bs48 = 0 } },
+]
+
+[kernels."ncclDevKernel_AllReduce_Sum_bf16_RING_LL"]
+sha256 = "6e97c0cb731ebacc6271eefbe56c8c486fea6e4826b7f7fe73ca3d53d98dc57d"
+bytes = 135748112
+origin = "NCCL 2.x (via torch)"
+upstream = "NCCL 2.29.7 as linked by torch 2.13.0+cu130"
+not_included = "one 136 MB module (BSD-3-Clause); install NCCL instead"
+symbols = [
+  { name = "_Z40ncclDevKernel_AllReduce_Sum_bf16_RING_LL24ncclDevKernelArgsStorageILm4096EE", launches = { bs1 = 187, bs8 = 187, bs48 = 187 } },
+  { name = "_Z31ncclDevKernel_AllGather_RING_LL24ncclDevKernelArgsStorageILm4096EE", launches = { bs1 = 1, bs8 = 1, bs48 = 1 } },
+]
+
+[kernels."elementwise_kernel"]
+sha256 = "e4e8e648f7197681b793021197ef710fd79968e0dd9952b321703e2ab02394c6"
+bytes = 7202344
+origin = "PyTorch ATen"
+upstream = "PyTorch 2.13.0+cu130"
+not_included = "fat modules of 3-8 MB each (BSD-3-Clause) holding generic elementwise kernels"
+symbols = [
+  { name = "_ZN2at6native18elementwise_kernelILi128ELi4EZNS0_22gpu_kernel_impl_nocastIZZZNS0_23direct_copy_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE1_clEvENKUlvE10_clEvEUlN3c108BFloat16EE_EEvS4_RKT_EUliE_EEviT1_", launches = { bs1 = 0, bs8 = 26, bs48 = 26 } },
+  { name = "_ZN2at6native27unrolled_elementwise_kernelIZZZNS0_23direct_copy_kernel_cudaERNS_18TensorIteratorBaseEENKUlvE1_clEvENKUlvE5_clEvEUlfE_St5arrayIPcLm2EELi4E23TrivialOffsetCalculatorILi1EjESB_NS0_6memory12LoadWithCastILi1EEENSC_13StoreWithCastILi1EEEEEviT_T0_T2_T3_T4_T5_", launches = { bs1 = 1, bs8 = 1, bs48 = 1 } },
+]
+
+[kernels."vectorized_elementwise_kernel"]
+sha256 = "f7f463799643bacffec1cd1add8502a8de65f440e11f9bc51a0217e3a4b3137e"
+bytes = 7792176
+origin = "PyTorch ATen"
+upstream = "PyTorch 2.13.0+cu130"
+not_included = "fat modules of 3-8 MB each (BSD-3-Clause) holding generic elementwise kernels"
+symbols = [
+  { name = "_ZN2at6native29vectorized_elementwise_kernelILi8ENS0_15CUDAFunctor_addIN3c108BFloat16EEESt5arrayIPcLm3EEEEviT0_T1_", launches = { bs1 = 86, bs8 = 86, bs48 = 86 } },
+]
+
+[kernels."vectorized_elementwise_kernel_c7ad9017"]
+sha256 = "c7ad901798b5038b303986cd6e689f311fed5b80d710af99e4e068e4c85de9fb"
+bytes = 3057392
+origin = "PyTorch ATen"
+upstream = "PyTorch 2.13.0+cu130"
+not_included = "fat modules of 3-8 MB each (BSD-3-Clause) holding generic elementwise kernels"
+symbols = [
+  { name = "_ZN2at6native29vectorized_elementwise_kernelILi4ENS0_11FillFunctorIfEESt5arrayIPcLm1EEEEviT0_T1_", launches = { bs1 = 1, bs8 = 1, bs48 = 1 } },
+]
+
+[kernels."vectorized_elementwise_kernel_b801e11c"]
+sha256 = "b801e11cafcab0af8305521780bf645cc3a16d5a77c19fcd1e6bcf79735957ee"
+bytes = 5032344
+origin = "PyTorch ATen"
+upstream = "PyTorch 2.13.0+cu130"
+not_included = "fat modules of 3-8 MB each (BSD-3-Clause) holding generic elementwise kernels"
+symbols = [
+  { name = "_ZN2at6native29vectorized_elementwise_kernelILi8ENS0_13AUnaryFunctorIN3c108BFloat16ES4_S4_NS0_15binary_internal10MulFunctorIfEEEESt5arrayIPcLm2EEEEviT0_T1_", launches = { bs1 = 1, bs8 = 1, bs48 = 1 } },
+]
+
+[kernels."add3_kernel"]
+sha256 = "25781e547119ae46c178b1576df9be8a2f8bf38b043e4d49b36732e1e2414fbe"
+bytes = 10496
+origin = "SGLang (sgl-kernel / sglang.kernels JIT)"
+upstream = "sglang@295a53c90ea4adb2588084dc0e3004cd3145e414:python/sglang/kernels/jit/csrc/elementwise/add3.cuh"
+prebuilt = "prebuilt/add3_kernel.cubin"
+license = "licenses/LICENSE.sglang"
+symbols = [
+  { name = "_ZN6sglang11add3_kernelILb1ELb1EEEvNS_10Add3ParamsE", launches = { bs1 = 92, bs8 = 92, bs48 = 92 } },
+]
+
+[kernels."attn_res_fused_tma_kernel"]
+sha256 = "178210414401f674dc28d1e73660cac1877df97e165019099eb9fad7e467ccb5"
+bytes = 1163864
+origin = "SGLang (sgl-kernel / sglang.kernels JIT)"
+upstream = "sglang@295a53c90ea4adb2588084dc0e3004cd3145e414:python/sglang/kernels/jit/csrc/kimi_k3/attn_res/fused_tma.cuh"
+prebuilt = "prebuilt/attn_res_fused_tma_kernel.cubin"
+license = "licenses/LICENSE.sglang"
+symbols = [
+  { name = "_ZN6sglang25attn_res_fused_tma_kernelINS_18KimiK3AttnResTraitILl7168ELj1ELj4ELj200EEELj1EEEvNS_16AttnResTMAParamsE", launches = { bs1 = 24, bs8 = 24, bs48 = 24 } },
+  { name = "_ZN6sglang25attn_res_fused_tma_kernelINS_18KimiK3AttnResTraitILl7168ELj2ELj4ELj200EEELj1EEEvNS_16AttnResTMAParamsE", launches = { bs1 = 24, bs8 = 24, bs48 = 24 } },
+  { name = "_ZN6sglang25attn_res_fused_tma_kernelINS_18KimiK3AttnResTraitILl7168ELj3ELj4ELj200EEELj1EEEvNS_16AttnResTMAParamsE", launches = { bs1 = 24, bs8 = 24, bs48 = 24 } },
+  { name = "_ZN6sglang25attn_res_fused_tma_kernelINS_18KimiK3AttnResTraitILl7168ELj6ELj4ELj200EEELj1EEEvNS_16AttnResTMAParamsE", launches = { bs1 = 24, bs8 = 24, bs48 = 24 } },
+  { name = "_ZN6sglang25attn_res_fused_tma_kernelINS_18KimiK3AttnResTraitILl7168ELj7ELj4ELj200EEELj1EEEvNS_16AttnResTMAParamsE", launches = { bs1 = 24, bs8 = 24, bs48 = 24 } },
+]
+
+[kernels."attn_res_fused_tma_kernel_aa484abe"]
+sha256 = "aa484abed5662ba94f55e17e4200df55619a02956ee98ea110358f9ead09781a"
+bytes = 1153112
+origin = "SGLang (sgl-kernel / sglang.kernels JIT)"
+upstream = "sglang@295a53c90ea4adb2588084dc0e3004cd3145e414:python/sglang/kernels/jit/csrc/kimi_k3/attn_res/fused_tma.cuh"
+prebuilt = "prebuilt/attn_res_fused_tma_kernel_aa484abe.cubin"
+license = "licenses/LICENSE.sglang"
+symbols = [
+  { name = "_ZN6sglang25attn_res_fused_tma_kernelINS_18KimiK3AttnResTraitILl7168ELj4ELj5ELj200EEELj1EEEvNS_16AttnResTMAParamsE", launches = { bs1 = 24, bs8 = 24, bs48 = 24 } },
+  { name = "_ZN6sglang25attn_res_fused_tma_kernelINS_18KimiK3AttnResTraitILl7168ELj8ELj5ELj200EEELj1EEEvNS_16AttnResTMAParamsE", launches = { bs1 = 18, bs8 = 18, bs48 = 18 } },
+]
+
+[kernels."attn_res_fused_tma_kernel_83fc1466"]
+sha256 = "83fc14665c7b7ca3e2683e9b397d9bfecf100eb3c690b7100e14002b3135f96e"
+bytes = 1185344
+origin = "SGLang (sgl-kernel / sglang.kernels JIT)"
+upstream = "sglang@295a53c90ea4adb2588084dc0e3004cd3145e414:python/sglang/kernels/jit/csrc/kimi_k3/attn_res/fused_tma.cuh"
+prebuilt = "prebuilt/attn_res_fused_tma_kernel_83fc1466.cubin"
+license = "licenses/LICENSE.sglang"
+symbols = [
+  { name = "_ZN6sglang25attn_res_fused_tma_kernelINS_18KimiK3AttnResTraitILl7168ELj5ELj3ELj200EEELj1EEEvNS_16AttnResTMAParamsE", launches = { bs1 = 24, bs8 = 24, bs48 = 24 } },
+]
+
+[kernels."fixup_zero_kv_rows_kernel"]
+sha256 = "a14a1b7a1a9addfcd1cb2835a07668bfb739a4c72f7b37adacd3bb3e1e47714b"
+bytes = 10560
+origin = "SGLang (sgl-kernel / sglang.kernels JIT)"
+upstream = "sglang@295a53c90ea4adb2588084dc0e3004cd3145e414:python/sglang/kernels/jit/csrc/attention/fixup_zero_kv.cuh"
+prebuilt = "prebuilt/fixup_zero_kv_rows_kernel.cubin"
+license = "licenses/LICENSE.sglang"
+symbols = [
+  { name = "_ZN6sglang25fixup_zero_kv_rows_kernelI13__nv_bfloat16EEvPT_PfPKiS6_ii", launches = { bs1 = 24, bs8 = 24, bs48 = 24 } },
+]
+
+[kernels."fused_a_gemm_kernel"]
+sha256 = "bf5a29a7d3b5135c0541bf4b8ab7ea654c0436b11c3555b64d875af43e0cccd6"
+bytes = 37392
+origin = "SGLang (sgl-kernel / sglang.kernels JIT)"
+upstream = "sglang@295a53c90ea4adb2588084dc0e3004cd3145e414:python/sglang/kernels/jit/csrc/gemm/dsv3_fused_a_gemm.cuh"
+prebuilt = "prebuilt/fused_a_gemm_kernel.cubin"
+license = "licenses/LICENSE.sglang"
+symbols = [
+  { name = "_ZN6sglang19fused_a_gemm_kernelILi1ELi2112ELi7168ELi16ELi8ELi256ELi16EEEvP13__nv_bfloat16PKS1_S4_i", launches = { bs1 = 24, bs8 = 24, bs48 = 0 } },
+]
+
+[kernels."kda_decode_fusion_many_heads_kernel"]
+sha256 = "df5118406561bd3547280615f8f90dc10e1856a34a675cf23be6dcdc5cc035af"
+bytes = 688888
+origin = "SGLang (sgl-kernel / sglang.kernels JIT)"
+upstream = "sglang@295a53c90ea4adb2588084dc0e3004cd3145e414:python/sglang/kernels/jit/csrc/attention/kda_fused_decode.cuh"
+prebuilt = "prebuilt/kda_decode_fusion_many_heads_kernel.cubin"
+license = "licenses/LICENSE.sglang"
+symbols = [
+  { name = "_ZN6sglang35kda_decode_fusion_many_heads_kernelILb1ELb1ELi12ELi12ELb1ELb0ELb0ELb0ELb0ELb0ELb1ELb1ELb1ELb1ELb1ELb1ELb1ELi3ELb1EEEvPK13__nv_bfloat16S3_S3_PKfS5_S5_S5_S5_S5_PS1_S6_S6_S5_S3_S5_S3_S3_S5_PKiS8_PfS6_iiiffflllllll", launches = { bs1 = 0, bs8 = 0, bs48 = 69 } },
+  { name = "_ZN6sglang35kda_decode_fusion_many_heads_kernelILb1ELb1ELi12ELi12ELb1ELb0ELb0ELb0ELb0ELb0ELb1ELb1ELb1ELb1ELb1ELb1ELb1ELi4ELb1EEEvPK13__nv_bfloat16S3_S3_PKfS5_S5_S5_S5_S5_PS1_S6_S6_S5_S3_S5_S3_S3_S5_PKiS8_PfS6_iiiffflllllll", launches = { bs1 = 69, bs8 = 69, bs48 = 0 } },
+]
+
+[kernels."mla_output_gate_kernel"]
+sha256 = "9c01424826744d0d8cc0284f476c511cababd067e46815a36acba15a9d1dfff8"
+bytes = 12304
+origin = "SGLang (sgl-kernel / sglang.kernels JIT)"
+upstream = "sglang@295a53c90ea4adb2588084dc0e3004cd3145e414:python/sglang/kernels/jit/csrc/kimi_k3/mla_output_gate.cuh"
+prebuilt = "prebuilt/mla_output_gate_kernel.cubin"
+license = "licenses/LICENSE.sglang"
+symbols = [
+  { name = "_ZN6sglang22mla_output_gate_kernelILi256ELb1EEEvNS_19MlaOutputGateParamsE", launches = { bs1 = 24, bs8 = 24, bs48 = 24 } },
+]
+
+[kernels."route_quant_fused_kernel"]
+sha256 = "d7908fec20229e970c03d60aec9e972b9d981b66644c8480be8ccd545df45d41"
+bytes = 113984
+origin = "SGLang (sgl-kernel / sglang.kernels JIT)"
+upstream = "sglang@295a53c90ea4adb2588084dc0e3004cd3145e414:python/sglang/kernels/jit/csrc/moe/route_quant_fused.cuh"
+prebuilt = "prebuilt/route_quant_fused_kernel.cubin"
+license = "licenses/LICENSE.sglang"
+symbols = [
+  { name = "_ZN6sglang24route_quant_fused_kernelILb1EffEEvNS_21RouteQuantFusedParamsE", launches = { bs1 = 92, bs8 = 92, bs48 = 92 } },
+]
+
+[kernels."set_mla_kv_concat_q_fp8_kernel"]
+sha256 = "3310f9cbda88eb21e5c714d1607cc543ada97aea1b9fb6b52b3c5ef3c2d21f6b"
+bytes = 409360
+origin = "SGLang (sgl-kernel / sglang.kernels JIT)"
+upstream = "sglang@295a53c90ea4adb2588084dc0e3004cd3145e414:python/sglang/kernels/jit/csrc/elementwise/set_mla_kv_concat_q.cuh"
+prebuilt = "prebuilt/set_mla_kv_concat_q_fp8_kernel.cubin"
+license = "licenses/LICENSE.sglang"
+symbols = [
+  { name = "_ZN6sglang30set_mla_kv_concat_q_fp8_kernelILi8ELb1ElEEvNS_24SetMlaKVConcatQFp8ParamsE", launches = { bs1 = 0, bs8 = 24, bs48 = 24 } },
+  { name = "_ZN6sglang30set_mla_kv_concat_q_fp8_kernelILi4ELb1ElEEvNS_24SetMlaKVConcatQFp8ParamsE", launches = { bs1 = 24, bs8 = 0, bs48 = 0 } },
+]
+
+[kernels."situ_and_mul_kernel"]
+sha256 = "491c9451acf92cf4158ebd6d25858dc26f4ec40e23b4f4b844ca708175d98b94"
+bytes = 29104
+origin = "SGLang (sgl-kernel / sglang.kernels JIT)"
+upstream = "sglang@295a53c90ea4adb2588084dc0e3004cd3145e414:python/sglang/kernels/jit/csrc/kimi_k3/situ_and_mul.cuh"
+prebuilt = "prebuilt/situ_and_mul_kernel.cubin"
+license = "licenses/LICENSE.sglang"
+symbols = [
+  { name = "_ZN6sglang19situ_and_mul_kernelIf13__nv_bfloat16Lb1ELb1EEEvNS_16SituAndMulParamsE", launches = { bs1 = 92, bs8 = 92, bs48 = 92 } },
+]
+
+[kernels."situ_and_mul_kernel_c262666f"]
+sha256 = "c262666f4507963f333d667c0a3f24247975fcce8ede942e4453ba6e2c3a5318"
+bytes = 44976
+origin = "SGLang (sgl-kernel / sglang.kernels JIT)"
+upstream = "sglang@295a53c90ea4adb2588084dc0e3004cd3145e414:python/sglang/kernels/jit/csrc/kimi_k3/situ_and_mul.cuh"
+prebuilt = "prebuilt/situ_and_mul_kernel_c262666f.cubin"
+license = "licenses/LICENSE.sglang"
+symbols = [
+  { name = "_ZN6sglang19situ_and_mul_kernelI13__nv_bfloat16S1_Lb1ELb1EEEvNS_16SituAndMulParamsE", launches = { bs1 = 1, bs8 = 1, bs48 = 1 } },
+]
+
+[kernels."tiny_k_gemm_kernel"]
+sha256 = "b561f6f0744e6342dea2c674dc998d19e9529f0b7a2ada9da634b0584a25a9b6"
+bytes = 91520
+origin = "SGLang (sgl-kernel / sglang.kernels JIT)"
+upstream = "sglang@295a53c90ea4adb2588084dc0e3004cd3145e414:python/sglang/kernels/jit/csrc/gemm/tiny_gemm.cuh"
+prebuilt = "prebuilt/tiny_k_gemm_kernel.cubin"
+license = "licenses/LICENSE.sglang"
+symbols = [
+  { name = "_ZN6sglang18tiny_k_gemm_kernelINS_10GEMMTraitKILj1536ELj128ELj12ELj16EEELj1E13__nv_bfloat16Lb1EEEvNS_14TinyGEMMParamsE", launches = { bs1 = 69, bs8 = 0, bs48 = 0 } },
+  { name = "_ZN6sglang18tiny_k_gemm_kernelINS_10GEMMTraitKILj1536ELj128ELj12ELj16EEELj8E13__nv_bfloat16Lb1EEEvNS_14TinyGEMMParamsE", launches = { bs1 = 0, bs8 = 69, bs48 = 0 } },
+]
+
+[kernels."tiny_n_gemm_kernel"]
+sha256 = "345ffc8279de11f27acbf00d1279119b77b8401bd8f8df428ad71f2602656491"
+bytes = 178832
+origin = "SGLang (sgl-kernel / sglang.kernels JIT)"
+upstream = "sglang@295a53c90ea4adb2588084dc0e3004cd3145e414:python/sglang/kernels/jit/csrc/gemm/tiny_gemm.cuh"
+prebuilt = "prebuilt/tiny_n_gemm_kernel.cubin"
+license = "licenses/LICENSE.sglang"
+symbols = [
+  { name = "_ZN6sglang18tiny_n_gemm_kernelINS_10GEMMTraitNILj144ELj7168ELj1ELj32EEELj1E13__nv_bfloat16Lb1EEEvNS_14TinyGEMMParamsE", launches = { bs1 = 69, bs8 = 0, bs48 = 0 } },
+  { name = "_ZN6sglang18tiny_n_gemm_kernelINS_10GEMMTraitNILj144ELj7168ELj1ELj32EEELj8E13__nv_bfloat16Lb1EEEvNS_14TinyGEMMParamsE", launches = { bs1 = 0, bs8 = 69, bs48 = 0 } },
+]
+
+[kernels."helixAllToAllKernel"]
+sha256 = "5e49f88e93c2ad0f4beadd950b223405e4ed06dacaedfe8a1c628059df2b1e0b"
+bytes = 48544
+origin = "TRT-LLM Helix all-to-all (via FlashInfer comm)"
+upstream = "flashinfer-python 0.7.0.post1:flashinfer/data/csrc/nv_internal/tensorrt_llm/kernels/helixAllToAll.cu (built by flashinfer/jit/comm.py)"
+prebuilt = "prebuilt/helixAllToAllKernel.cubin"
+license = "licenses/LICENSE.flashinfer"
+symbols = [
+  { name = "_ZN12tensorrt_llm3_v17kernels49_GLOBAL__N__f1a69f44_16_helixAllToAll_cu_dbf793d519helixAllToAllKernelILb0EEEvNS1_19HelixAllToAllParamsE", launches = { bs1 = 24, bs8 = 24, bs48 = 24 } },
+]
+
+[kernels."bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x16x256u2_s6_et128x16_m256x16x32_c2"]
+sha256 = "249e75da0a3de111c915ca5e8dd108884bc80eacae5ca50a0e27116cdd78ecb2"
+bytes = 345952
+origin = "TRT-LLM gen (flashinfer-cubin)"
+upstream = "flashinfer-cubin 0.7.0.post1 (TRT-LLM gen batched GEMM bundle)"
+prebuilt = "prebuilt/bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x16x256u2_s6_et128x16_m256x16x32_c2.cubin"
+license = "../../prebuilt/LICENSE.trtllm-gen.txt"
+symbols = [
+  { name = "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x16x256u2_s6_et128x16_m256x16x32_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f", launches = { bs1 = 0, bs8 = 0, bs48 = 92 } },
+]
+
+[kernels."bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x8x256u2_s6_et128x8_m128x8x32_c1x1x"]
+sha256 = "739061093f325a90658e36c1f3f1060765a5c51932bce4bdffc3be700ff683ee"
+bytes = 311144
+origin = "TRT-LLM gen (flashinfer-cubin)"
+upstream = "flashinfer-cubin 0.7.0.post1 (TRT-LLM gen batched GEMM bundle)"
+prebuilt = "prebuilt/bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x8x256u2_s6_et128x8_m128x8x32_c1x1x.cubin"
+license = "../../prebuilt/LICENSE.trtllm-gen.txt"
+symbols = [
+  { name = "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x8x256u2_s6_et128x8_m128x8x32_c1x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f", launches = { bs1 = 0, bs8 = 92, bs48 = 0 } },
+]
+
+[kernels."bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x8x512_s3_et128x8_m128x8x32_c1x1x1_"]
+sha256 = "670e5bc12ffeea9ee4930dabbdda42b8877c4e327eb7700383ac27d0b9679ed5"
+bytes = 216784
+origin = "TRT-LLM gen (flashinfer-cubin)"
+upstream = "flashinfer-cubin 0.7.0.post1 (TRT-LLM gen batched GEMM bundle)"
+prebuilt = "prebuilt/bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x8x512_s3_et128x8_m128x8x32_c1x1x1_.cubin"
+license = "../../prebuilt/LICENSE.trtllm-gen.txt"
+symbols = [
+  { name = "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x8x512_s3_et128x8_m128x8x32_c1x1x1_rM_TN_transOut_schedS_biasFp32M_bN_rgTma_clmp_dynB_sm100f", launches = { bs1 = 92, bs8 = 0, bs48 = 0 } },
+]
+
+[kernels."bmm_MxE4m3_MxE2m1MxE4m3_Fp32_Ab32_Bb32_Cb32_t128x16x256_s6_et128x16_m256x16x32_c"]
+sha256 = "9255d88ff05ac8d6cb4301dd20107672318afa64172864aaed26bd6f1f92728d"
+bytes = 377120
+origin = "TRT-LLM gen (flashinfer-cubin)"
+upstream = "flashinfer-cubin 0.7.0.post1 (TRT-LLM gen batched GEMM bundle)"
+prebuilt = "prebuilt/bmm_MxE4m3_MxE2m1MxE4m3_Fp32_Ab32_Bb32_Cb32_t128x16x256_s6_et128x16_m256x16x32_c.cubin"
+license = "../../prebuilt/LICENSE.trtllm-gen.txt"
+symbols = [
+  { name = "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_Ab32_Bb32_Cb32_t128x16x256_s6_et128x16_m256x16x32_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_tma_ldgstsSf_rgTma_clmp_siTuGlu_dynB_sm100f", launches = { bs1 = 0, bs8 = 0, bs48 = 92 } },
+]
+
+[kernels."bmm_MxE4m3_MxE2m1MxE4m3_Fp32_Ab32_Bb32_Cb32_t128x8x256_s6_et128x8_m128x8x32_c1x1"]
+sha256 = "ec68123883a25d05bf5f5f81267b5841a06a2a9df01a620996e256d3b996618f"
+bytes = 312520
+origin = "TRT-LLM gen (flashinfer-cubin)"
+upstream = "flashinfer-cubin 0.7.0.post1 (TRT-LLM gen batched GEMM bundle)"
+prebuilt = "prebuilt/bmm_MxE4m3_MxE2m1MxE4m3_Fp32_Ab32_Bb32_Cb32_t128x8x256_s6_et128x8_m128x8x32_c1x1.cubin"
+license = "../../prebuilt/LICENSE.trtllm-gen.txt"
+symbols = [
+  { name = "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_Ab32_Bb32_Cb32_t128x8x256_s6_et128x8_m128x8x32_c1x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_tma_ldgstsSf_rgTma_clmp_siTuGlu_dynB_sm100f", launches = { bs1 = 92, bs8 = 0, bs48 = 0 } },
+]
+
+[kernels."bmm_MxE4m3_MxE2m1MxE4m3_Fp32_Ab32_Bb32_Cb32_t128x8x512_s3_et128x8_m128x8x32_c1x1"]
+sha256 = "14742434778b9c1c11643662add35ab196b8877fe4b2d834afa820b5417dda69"
+bytes = 322000
+origin = "TRT-LLM gen (flashinfer-cubin)"
+upstream = "flashinfer-cubin 0.7.0.post1 (TRT-LLM gen batched GEMM bundle)"
+prebuilt = "prebuilt/bmm_MxE4m3_MxE2m1MxE4m3_Fp32_Ab32_Bb32_Cb32_t128x8x512_s3_et128x8_m128x8x32_c1x1.cubin"
+license = "../../prebuilt/LICENSE.trtllm-gen.txt"
+symbols = [
+  { name = "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_Ab32_Bb32_Cb32_t128x8x512_s3_et128x8_m128x8x32_c1x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_tma_ldgstsSf_rgTma_clmp_siTuGlu_dynB_sm100f", launches = { bs1 = 0, bs8 = 92, bs48 = 0 } },
+]
+
+[kernels."_dcp_lse_combine_kernel"]
+sha256 = "f6310da83ebc870064f21644fba314dd1268d99340076a3c375f64400a7c16eb"
+bytes = 24992
+origin = "Triton JIT (SGLang Python source)"
+upstream = "sglang@295a53c90ea4adb2588084dc0e3004cd3145e414:python/sglang/kernels/ops/attention/dcp_kernels.py"
+prebuilt = "prebuilt/_dcp_lse_combine_kernel.cubin"
+license = "licenses/LICENSE.sglang, licenses/LICENSE.triton"
+symbols = [
+  { name = "_dcp_lse_combine_kernel", launches = { bs1 = 24, bs8 = 24, bs48 = 24 } },
+]
+
+[kernels."_dcp_pack_a2a_send_kernel"]
+sha256 = "a7bf3c1b46d4815c2a55cefbfbb9503025afed911fcf7dadf8bde075d01515e3"
+bytes = 14304
+origin = "Triton JIT (SGLang Python source)"
+upstream = "sglang@295a53c90ea4adb2588084dc0e3004cd3145e414:python/sglang/kernels/ops/attention/dcp_kernels.py"
+prebuilt = "prebuilt/_dcp_pack_a2a_send_kernel.cubin"
+license = "licenses/LICENSE.sglang, licenses/LICENSE.triton"
+symbols = [
+  { name = "_dcp_pack_a2a_send_kernel", launches = { bs1 = 24, bs8 = 24, bs48 = 24 } },
+]
+
+[kernels."_vocab_parallel_embedding_kernel"]
+sha256 = "cc38f5b3166ef2089e0664ceff177fcce587ee46dd3a4b917fd6b5f8852c5af6"
+bytes = 10136
+origin = "Triton JIT (SGLang Python source)"
+upstream = "sglang@295a53c90ea4adb2588084dc0e3004cd3145e414:python/sglang/kernels/ops/embeddings/vocab_parallel_embedding.py"
+prebuilt = "prebuilt/_vocab_parallel_embedding_kernel.cubin"
+license = "licenses/LICENSE.sglang, licenses/LICENSE.triton"
+symbols = [
+  { name = "_vocab_parallel_embedding_kernel", launches = { bs1 = 1, bs8 = 1, bs48 = 1 } },
+]
+
+[kernels."nvjet_sm103_tss_128x48_64x9_4x1_v_bz_splitK_TNT"]
+sha256 = "fec2c739800b1d87d27939f75412d5c518281744efc5fbda94fc592be58f621f"
+bytes = 19648
+origin = "cuBLASLt (CUDA 13 toolkit, via torch)"
+upstream = "cuBLASLt 13.1.1.3 (nvidia-cublas wheel)"
+not_included = "NVIDIA proprietary library; extracted cubins are not redistributed"
+symbols = [
+  { name = "nvjet_sm103_tss_128x48_64x9_4x1_v_bz_splitK_TNT", launches = { bs1 = 0, bs8 = 0, bs48 = 92 } },
+]
+
+[kernels."nvjet_sm103_tst_128x24_64x11_4x2_h_bz_TNT"]
+sha256 = "2dff30cc7d7de5d0df0c2ec948e15e46c475350883c47b95f505376eace910f1"
+bytes = 17940
+origin = "cuBLASLt (CUDA 13 toolkit, via torch)"
+upstream = "cuBLASLt 13.1.1.3 (nvidia-cublas wheel)"
+not_included = "NVIDIA proprietary library; extracted cubins are not redistributed"
+symbols = [
+  { name = "nvjet_sm103_tst_128x24_64x11_4x2_h_bz_TNT", launches = { bs1 = 0, bs8 = 0, bs48 = 185 } },
+]
+
+[kernels."nvjet_sm103_tst_128x48_64x9_4x1_v_bz_NNT"]
+sha256 = "f3323421743fa91eb097f4743a1d88fc1735285e0752841dc22ddca2b5f29c19"
+bytes = 18188
+origin = "cuBLASLt (CUDA 13 toolkit, via torch)"
+upstream = "cuBLASLt 13.1.1.3 (nvidia-cublas wheel)"
+not_included = "NVIDIA proprietary library; extracted cubins are not redistributed"
+symbols = [
+  { name = "nvjet_sm103_tst_128x48_64x9_4x1_v_bz_NNT", launches = { bs1 = 0, bs8 = 0, bs48 = 24 } },
+]
+
+[kernels."nvjet_sm103_tst_128x48_64x9_4x1_v_bz_TNT"]
+sha256 = "5cdf9f62582f656937eda6b46aa7121b7fe0b7c61b3869d51ffb5c2dca902bd1"
+bytes = 18060
+origin = "cuBLASLt (CUDA 13 toolkit, via torch)"
+upstream = "cuBLASLt 13.1.1.3 (nvidia-cublas wheel)"
+not_included = "NVIDIA proprietary library; extracted cubins are not redistributed"
+symbols = [
+  { name = "nvjet_sm103_tst_128x48_64x9_4x1_v_bz_TNT", launches = { bs1 = 0, bs8 = 0, bs48 = 24 } },
+]
+
+[kernels."nvjet_sm103_tst_128x8_64x12_4x1_v_bz_NNT"]
+sha256 = "78a17d28ec28a6005cad778e9e220037fde3619b61655b7590e7fdcb4185c247"
+bytes = 17156
+origin = "cuBLASLt (CUDA 13 toolkit, via torch)"
+upstream = "cuBLASLt 13.1.1.3 (nvidia-cublas wheel)"
+not_included = "NVIDIA proprietary library; extracted cubins are not redistributed"
+symbols = [
+  { name = "nvjet_sm103_tst_128x8_64x12_4x1_v_bz_NNT", launches = { bs1 = 24, bs8 = 24, bs48 = 0 } },
+]
+
+[kernels."nvjet_sm103_tst_128x8_64x12_4x1_v_bz_TNT"]
+sha256 = "f06d35e5584823d7e3efab19ee36ebf8bd98b14d994364b06749a0b4a6c2d936"
+bytes = 17028
+origin = "cuBLASLt (CUDA 13 toolkit, via torch)"
+upstream = "cuBLASLt 13.1.1.3 (nvidia-cublas wheel)"
+not_included = "NVIDIA proprietary library; extracted cubins are not redistributed"
+symbols = [
+  { name = "nvjet_sm103_tst_128x8_64x12_4x1_v_bz_TNT", launches = { bs1 = 24, bs8 = 24, bs48 = 0 } },
+]
+
+[kernels."nvjet_sm103_tst_144x64_64x8_4x1_v_bz_TNN"]
+sha256 = "c18a84994de2ecf922bae506e4a373165a5b368b792e794e8b4f11e18b70a5a9"
+bytes = 18948
+origin = "cuBLASLt (CUDA 13 toolkit, via torch)"
+upstream = "cuBLASLt 13.1.1.3 (nvidia-cublas wheel)"
+not_included = "NVIDIA proprietary library; extracted cubins are not redistributed"
+symbols = [
+  { name = "nvjet_sm103_tst_144x64_64x8_4x1_v_bz_TNN", launches = { bs1 = 0, bs8 = 0, bs48 = 1 } },
+]
+
+[kernels."nvjet_sm103_tst_16x64_64x16_4x1_v_bz_TNN"]
+sha256 = "e6290d1b1c62e4bf710c8aa1df803e761f40a55ce7fc518b2836ff590327b9a0"
+bytes = 17060
+origin = "cuBLASLt (CUDA 13 toolkit, via torch)"
+upstream = "cuBLASLt 13.1.1.3 (nvidia-cublas wheel)"
+not_included = "NVIDIA proprietary library; extracted cubins are not redistributed"
+symbols = [
+  { name = "nvjet_sm103_tst_16x64_64x16_4x1_v_bz_TNN", launches = { bs1 = 24, bs8 = 24, bs48 = 0 } },
+]
+
+[kernels."nvjet_sm103_tst_192x8_64x8_2x1_v_bz_splitK_TNT"]
+sha256 = "029373494f3c7f8bba31ccad00b84e7a94e6f8374c8e6c53255a4ff004dd9d38"
+bytes = 18432
+origin = "cuBLASLt (CUDA 13 toolkit, via torch)"
+upstream = "cuBLASLt 13.1.1.3 (nvidia-cublas wheel)"
+not_included = "NVIDIA proprietary library; extracted cubins are not redistributed"
+symbols = [
+  { name = "nvjet_sm103_tst_192x8_64x8_2x1_v_bz_splitK_TNT", launches = { bs1 = 1, bs8 = 1, bs48 = 0 } },
+]
+
+[kernels."nvjet_sm103_tst_64x16_64x16_2x1_2cta_v_bz_splitK_TNT"]
+sha256 = "6a1550d43cda7c58b95287e58d77c1e69db065ea833ba89a2ac083c8764f821a"
+bytes = 17736
+origin = "cuBLASLt (CUDA 13 toolkit, via torch)"
+upstream = "cuBLASLt 13.1.1.3 (nvidia-cublas wheel)"
+not_included = "NVIDIA proprietary library; extracted cubins are not redistributed"
+symbols = [
+  { name = "nvjet_sm103_tst_64x16_64x16_2x1_2cta_v_bz_splitK_TNT", launches = { bs1 = 0, bs8 = 0, bs48 = 24 } },
+]
+
+[kernels."nvjet_sm103_tst_64x16_64x16_2x4_2cta_h_bz_splitK_TNT"]
+sha256 = "5e3af2308c88a137c1671ca07f61bdb5c8e69149965b03b2a769d14f91972feb"
+bytes = 17864
+origin = "cuBLASLt (CUDA 13 toolkit, via torch)"
+upstream = "cuBLASLt 13.1.1.3 (nvidia-cublas wheel)"
+not_included = "NVIDIA proprietary library; extracted cubins are not redistributed"
+symbols = [
+  { name = "nvjet_sm103_tst_64x16_64x16_2x4_2cta_h_bz_splitK_TNT", launches = { bs1 = 0, bs8 = 0, bs48 = 69 } },
+]
+
+[kernels."nvjet_sm103_tst_64x32_64x16_2x2_2cta_h_bz_splitK_TNT"]
+sha256 = "c3230cec8245d4b9c29cfb82e083fe7ce48cfec4ee1bdcc1943c7893e8c884bf"
+bytes = 18256
+origin = "cuBLASLt (CUDA 13 toolkit, via torch)"
+upstream = "cuBLASLt 13.1.1.3 (nvidia-cublas wheel)"
+not_included = "NVIDIA proprietary library; extracted cubins are not redistributed"
+symbols = [
+  { name = "nvjet_sm103_tst_64x32_64x16_2x2_2cta_h_bz_splitK_TNT", launches = { bs1 = 0, bs8 = 0, bs48 = 24 } },
+]
+
+[kernels."nvjet_sm103_tst_64x48_64x15_4x1_v_bz_TNT"]
+sha256 = "47cce848fa31afa231f46369fbfba48cf0bdb6d1fb07d0b2cd32215e3de9a574"
+bytes = 17580
+origin = "cuBLASLt (CUDA 13 toolkit, via torch)"
+upstream = "cuBLASLt 13.1.1.3 (nvidia-cublas wheel)"
+not_included = "NVIDIA proprietary library; extracted cubins are not redistributed"
+symbols = [
+  { name = "nvjet_sm103_tst_64x48_64x15_4x1_v_bz_TNT", launches = { bs1 = 0, bs8 = 0, bs48 = 92 } },
+]
+
+[kernels."nvjet_sm103_tst_64x48_64x16_2x1_2cta_v_bz_TNT"]
+sha256 = "59be4af905d44bbf90c2ad96aa735958b0694098f438ff932e8c57cb16650be6"
+bytes = 17984
+origin = "cuBLASLt (CUDA 13 toolkit, via torch)"
+upstream = "cuBLASLt 13.1.1.3 (nvidia-cublas wheel)"
+not_included = "NVIDIA proprietary library; extracted cubins are not redistributed"
+symbols = [
+  { name = "nvjet_sm103_tst_64x48_64x16_2x1_2cta_v_bz_TNT", launches = { bs1 = 0, bs8 = 0, bs48 = 1 } },
+]
+
+[kernels."nvjet_sm103_tst_64x48_64x16_2x1_2cta_v_bz_splitK_TNT"]
+sha256 = "ecf516751c5dd5ad30c10d477b290bd77b1b48a80c5f049ee34b1d66c0e75401"
+bytes = 18648
+origin = "cuBLASLt (CUDA 13 toolkit, via torch)"
+upstream = "cuBLASLt 13.1.1.3 (nvidia-cublas wheel)"
+not_included = "NVIDIA proprietary library; extracted cubins are not redistributed"
+symbols = [
+  { name = "nvjet_sm103_tst_64x48_64x16_2x1_2cta_v_bz_splitK_TNT", launches = { bs1 = 0, bs8 = 0, bs48 = 69 } },
+]
+
+[kernels."nvjet_sm103_tst_64x8_64x16_2x2_h_bz_TNT"]
+sha256 = "d6798bc8229e02b77eb4a52d396ee91dfa9d508587b47dacb55aeeb870a90cad"
+bytes = 17056
+origin = "cuBLASLt (CUDA 13 toolkit, via torch)"
+upstream = "cuBLASLt 13.1.1.3 (nvidia-cublas wheel)"
+not_included = "NVIDIA proprietary library; extracted cubins are not redistributed"
+symbols = [
+  { name = "nvjet_sm103_tst_64x8_64x16_2x2_h_bz_TNT", launches = { bs1 = 0, bs8 = 0, bs48 = 93 } },
+]
+
+[kernels."nvjet_sm103_tst_64x8_64x16_4x1_v_bz_TNT"]
+sha256 = "204455414ffa3e2adb5af42b42d7e8eeed93380750f92558d36bb34ed5e3dc73"
+bytes = 17056
+origin = "cuBLASLt (CUDA 13 toolkit, via torch)"
+upstream = "cuBLASLt 13.1.1.3 (nvidia-cublas wheel)"
+not_included = "NVIDIA proprietary library; extracted cubins are not redistributed"
+symbols = [
+  { name = "nvjet_sm103_tst_64x8_64x16_4x1_v_bz_TNT", launches = { bs1 = 1, bs8 = 1, bs48 = 0 } },
+]
+
+[kernels."splitKreduce_kernel"]
+sha256 = "7b83cd3a364a6363a21c97e633549a10f2ef1b3daaa657799b420d4e5f980f3c"
+bytes = 8297816
+origin = "cuBLASLt (CUDA 13 toolkit, via torch)"
+upstream = "cuBLASLt 13.1.1.3 (nvidia-cublas wheel)"
+not_included = "NVIDIA proprietary library; extracted cubins are not redistributed"
+symbols = [
+  { name = "_ZN8cublasLt19splitKreduce_kernelILi32ELi16Eif13__nv_bfloat16fS1_Lb0EfS1_S1_Lb1ELb0ELb0ELb0EEEvNS_18cublasSplitKParamsIT4_EEPKT2_PKT8_PT7_PT3_PKS3_SG_PKT9_S7_PSH_PvlPS3_PiSM_SM_SG_SG_SG_SG_SG_", launches = { bs1 = 1, bs8 = 1, bs48 = 186 } },
+  { name = "_ZN8cublasLt19splitKreduce_kernelILi32ELi16EiffffLb0EfffLb1ELb0ELb0ELb0EEEvNS_18cublasSplitKParamsIT4_EEPKT2_PKT8_PT7_PT3_PKS2_SF_PKT9_S6_PSG_PvlPS2_PiSL_SL_SF_SF_SF_SF_SF_", launches = { bs1 = 0, bs8 = 0, bs48 = 92 } },
+]

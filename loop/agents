@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# loop/agents: the orchestrator's side of the overnight loop.
+#
+#   loop/agents up NAME POOL HOURS ROUNDFILE   start (or restart) agent NAME
+#   loop/agents tell NAME MESSAGE              append a message to its ROUND.md
+#   loop/agents down [NAME]                    stop one agent, or all
+#   loop/agents sync                           move the clone's main to this checkout's
+#   loop/agents status                         branches, last commits, windows
+#
+# Agents work in worktrees of a private clone ($K3_LOOP_DATA/../repo), one
+# branch `agent/NAME` each, never in this checkout; they cannot push. Each
+# runs `hmz exec -f ralph_loop` (fresh sessions until HOURS pass) inside one
+# shared container, its GPUs leased by loop/withgpu from POOL (hosts). The
+# prompt is loop/TASK.md followed by the run's ROUND.md, built from
+# ROUNDFILE (first line: the target) plus a deadline and a message section.
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+root=$(dirname "$K3_LOOP_DATA")
+clone=$root/repo runs=$root/runs home=$root/.home
+container=k3loop-agents session=k3loop
+image=${K3_AGENT_IMAGE:-flashkda-dev:cu13.3}
+hmz_py=/opt/uv/tools/hmz/bin/python
+spec=${K3_AGENT_SPEC:-claude/claude-opus-5-5:high}
+
+container_up() {
+  docker ps --format '{{.Names}}' | grep -qx $container && return
+  docker rm -f $container >/dev/null 2>&1 || true
+  mkdir -p "$home/.claude/skills" /dev/shm/withgpu
+  local sk
+  for sk in "$root"/skills-src/*/; do rsync -a --exclude .git "$sk" "$home/.claude/skills/$(basename "$sk")/"; done
+  docker run -d --name $container --gpus all --network host --ipc host --cap-add SYS_ADMIN \
+    -u "$(id -u):$(id -g)" -e HOME="$home" \
+    -v "$K3_SHARED:$K3_SHARED:ro" -v "$root:$root" -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
+    -v "$HOME/.claude/.credentials.json:$home/.claude/.credentials.json" \
+    "$image" sleep infinity >/dev/null
+  docker exec -u root $container bash -c 'command -v ssh >/dev/null || { apt-get update -qq && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-client; } >/dev/null 2>&1'
+  # ralph_loop left the official flowverse after 6ae2d72; the image's hmz is pinned to match that.
+  [[ -d $home/.humanize/flowverses/official ]] || {
+    git clone -q https://github.com/humanfia/flowverse.git "$home/.humanize/flowverses/official" 2>/dev/null &&
+      git -C "$home/.humanize/flowverses/official" checkout -q 6ae2d72; }
+}
+
+window() {
+  tmux has-session -t $session 2>/dev/null || tmux new-session -d -s $session -n main
+  tmux kill-window -t "$session:$1" 2>/dev/null || true
+  tmux new-window -d -t $session -n "$1" "$2"
+}
+
+up() {
+  local name=$1 pool=$2 hours=$3 roundfile=$4 dir=$runs/$1
+  container_up
+  [[ -d $clone ]] || { git clone -q "$REPO" "$clone" && git -C "$clone" checkout -q --detach; }
+  git -C "$clone" fetch -q "$REPO" main:main
+  git -C "$clone" config user.name "$(git -C "$REPO" config user.name)" && git -C "$clone" config user.email "$(git -C "$REPO" config user.email)"
+  [[ -d $dir ]] || git -C "$clone" worktree add -q -b "agent/$name" "$dir" main
+  cp "$LOOP_DIR/local.env" "$dir/loop/local.env"
+  local deadline
+  deadline=$(date -u -d "+$hours hours" +%FT%T)
+  { head -n 1 "$roundfile"
+    printf '\n**Deadline: %s UTC** (`date -u` to compare); the session is killed then.\n' "$deadline"
+    printf '\nGPU pool: `%s` (`loop/withgpu` leases from it).\n' "$pool"
+    printf '\n## Messages from the orchestrator\n\nRe-read this section at the start of every session; new ones are added here.\n'
+    tail -n +2 "$roundfile"; } > "$dir/ROUND.md"
+  printf 'budget:\n  hours: %s\n' "$hours" > "$dir/.budget.yaml"
+  local ex; ex=$(git -C "$dir" rev-parse --git-path info/exclude)
+  grep -qx ROUND.md "$ex" 2>/dev/null || printf 'ROUND.md\n.budget.yaml\nloop/local.env\nloop/out/\nwork/\nprofile/\n' >> "$ex"
+  docker exec -w "$dir" $container $hmz_py -c 'from hmz.runtime.settings import Settings; Settings().profiles(on=True)'
+  window "$name" "docker exec -it -w $dir -e WITHGPU_HOSTS='$pool' $container \
+    hmz exec -f ralph_loop -c $dir/.budget.yaml -a $spec \"\$(cat $dir/loop/TASK.md $dir/ROUND.md)\"; exec bash"
+}
+
+tell() {
+  python3 - "$runs/$1/ROUND.md" "$(date -u +%H:%M) UTC: $2" <<'PY'
+import sys
+p, msg = sys.argv[1], sys.argv[2]
+s = open(p).read()
+anchor = "Re-read this section at the start of every session; new ones are added here.\n"
+open(p, "w").write(s.replace(anchor, anchor + "\n- " + msg + "\n", 1))
+PY
+}
+
+down() {
+  local w
+  for w in $(tmux list-windows -t $session -F '#W' 2>/dev/null | grep -vx main); do
+    [[ -z ${1:-} || $w == "$1" ]] && tmux kill-window -t "$session:$w"
+  done
+  # Killing a window leaves its docker exec child running, so the agent is stopped in the container too.
+  if [[ -n ${1:-} ]]; then
+    docker exec $container pkill -u "$(id -u)" -f "runs/$1/.budget" 2>/dev/null || true
+  else
+    docker exec $container pkill -u "$(id -u)" -f 'hmz exec|claude' 2>/dev/null || true
+  fi
+}
+
+status() {
+  for d in "$runs"/*/; do
+    local n; n=$(basename "$d")
+    echo "== $n  $(git -C "$d" log --oneline main..HEAD | wc -l) commits ahead of main"
+    git -C "$d" log --format='   %h %cr  %s' -3 main..HEAD
+  done
+  tmux list-windows -t $session -F '#W #{pane_dead}' 2>/dev/null | grep -vx 'main 0' || true
+}
+
+cmd=${1:-status}; shift || true
+case $cmd in
+  up) up "$@" ;;
+  tell) tell "$@" ;;
+  sync) git -C "$clone" fetch -q "$REPO" main:main ;;
+  down) down "$@" ;;
+  status) status ;;
+  *) sed -n '2,15s/^# \{0,1\}//p' "$0" >&2; exit 2 ;;
+esac

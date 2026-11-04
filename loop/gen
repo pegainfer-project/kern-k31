@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# loop/gen [OUT]: the bench and check manifests from this tree's generator and
+# kernels.toml, verified, into OUT (default loop/out/):
+#   p-stage0.json   PP8 stage 0 (embedding, layers 0-11) of the packed full-K3 prefill, cut from the
+#                   93-layer manifest: the P bench. Stage 0 builds the MLA attention tables
+#                   (`fmha_lens`) the later stages read; a later stage benched alone gets them
+#                   zeroed and its attention attends to nothing.
+#   p-stage1.json   stage 1 (layers 12-23): kept for comparison, not for timing attention
+#   p-l12.json      layers 0-11 with embedding and head: the P numerics check (kern test)
+#   d-l16-tp8.json  16 layers of the TP8/EP8/DCP8 decode step: the D bench
+#   d-l4-tp8.json   4 layers of the same: the D numerics check
+#   d-l4-tp1.json   its one-GPU oracle (every expert, every head, bf16 pages and an f32 KDA state)
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
+out=$(realpath -m "${1:-$LOOP_DIR/out}")
+mkdir -p "$out"
+cd "$REPO"
+export KERN=$K3_KERN
+gen() { python3 scripts/gen_stage.py "$@"; }
+P="--chunk 8192 --pack 16"
+FC1=bmm_MxE4m3_MxE2m1MxE4m3_Fp32_Ab32_Bb32_Cb32_t128x16x256_s6_et128x16_m256x16x32_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_tma_ldgstsSf_rgTma_clmp_siTuGlu_dynB_sm100f
+FC2=bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x16x256u2_s6_et128x16_m256x16x32_c2x1x1_rM_TN_transOut_schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f
+D="--seqs 64 --moe-variants $FC1,$FC2"
+
+gen --layers 93 $P > "$out/p-93.json"
+at=$(python3 -c "
+import json, sys
+calls = json.load(open(sys.argv[1]))['programs']['prefill']['calls']
+print(','.join(str(next(i for i, c in enumerate(calls) if c['label'] == f'l{l}.res_in')) for l in range(12, 93, 12)))
+" "$out/p-93.json")
+rm -rf "$out/cut" && "$K3_KERN_BIN" cut "$out/p-93.json" --at "$at" --out "$out/cut" >/dev/null 2>&1
+mv "$out/cut/stage0.json" "$out/p-stage0.json" && mv "$out/cut/stage1.json" "$out/p-stage1.json" && rm -rf "$out/cut" "$out/p-93.json"
+gen --layers 12 $P --max-ctx 65536 > "$out/p-l12.json"
+gen --layers 16 --tp 8 $D --peer-ar > "$out/d-l16-tp8.json"
+gen --layers 4 --tp 8 $D --peer-ar > "$out/d-l4-tp8.json"
+gen --layers 4 --tp 1 $D --kv bf16 --kda-state f32 > "$out/d-l4-tp1.json"
+for f in p-l12 d-l16-tp8 d-l4-tp8 d-l4-tp1; do
+  "$K3_KERN_BIN" verify "$out/$f.json" >/dev/null 2>&1 || { "$K3_KERN_BIN" verify "$out/$f.json"; exit 1; }
+done
+"$LOOP_DIR/count" "$out"/{p-stage0,p-stage1,p-l12,d-l16-tp8,d-l4-tp8,d-l4-tp1}.json
