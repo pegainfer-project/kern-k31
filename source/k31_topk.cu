@@ -1,10 +1,10 @@
-// K3.1's indexer top-k: each row's 2048 largest logits among its first `lens[r]`, as positions in
+// K3.1's indexer top-k: each row's 2048 largest bf16 logits among its first `lens[r]`, as positions in
 // ascending order, -1 past min(lens, 2048). The set is the exact top 2048 that vLLM's
 // top_k_per_row_prefill selects; where equal logits straddle the cut, the smaller positions are taken.
 // Unlike vLLM's kernel, whose output order follows its shared-memory atomics, the result is the same
 // bytes on every run.
 //
-//   extern "C" __global__ void k31_topk(const float* logits, int stride, const int* lens, int* out);
+//   extern "C" __global__ void k31_topk(const bf16* logits, int stride, const int* lens, int* out);
 //   extern "C" __global__ void k31_topk_held(...the same...);
 //   grid (rows), block NT, dynamic smem k31_topk_smem (a __device__ int of the module)
 //
@@ -12,7 +12,7 @@
 // rows, each latency-bound: a row of at most HELD_MAX is read once into registers and every digit
 // below is counted and collected from there.
 //
-// A logit is ranked by its key, the float's bits ordered as the float is, and the key is read in
+// A logit is ranked by its key, the bits of the float it widens to ordered as the float is, read in
 // digits: bits 31..20, 19..8, 7..0. A digit's 4096-bin histogram over the keys that share the digits
 // above it finds the bin holding the cut. Once that bin holds at most CAP keys, one read takes every
 // position above it and keeps the bin's (key, position) pairs in shared memory, where a radix select
@@ -28,6 +28,18 @@
 // The 2048 positions leave in ascending order: through a bitmap of the row for a row of at most
 // BITMAP_MAX, a radix sort past it.
 #include <cub/cub.cuh>
+#include <cuda_bf16.h>
+
+typedef __nv_bfloat16 bf16;
+
+__device__ __forceinline__ float4 widen(uint2 v) {
+  return make_float4(__uint_as_float(v.x << 16), __uint_as_float(v.x & 0xffff0000u), __uint_as_float(v.y << 16),
+                     __uint_as_float(v.y & 0xffff0000u));
+}
+// four logits at p (8-byte aligned) widened, through the read-only path or plainly
+__device__ __forceinline__ float4 ld4v(const bf16* p) { return widen(__ldg(reinterpret_cast<const uint2*>(p))); }
+__device__ __forceinline__ float4 ld4(const bf16* p) { return widen(*reinterpret_cast<const uint2*>(p)); }
+__device__ __forceinline__ float lv(const bf16* row, unsigned i) { return __bfloat162float(row[i]); }
 
 #define TK 2048
 #define NT 512
@@ -35,7 +47,7 @@
 #define CAP 6144
 #define BPT (BINS / NT)
 #define UNROLL 4
-#define SAMPLE_CHUNK 1024  // floats a sample chunk
+#define SAMPLE_CHUNK 1024  // logits a sample chunk
 #define SAMPLE_FRAC 8      // the sample is about 1 / SAMPLE_FRAC of the row
 #define HEAD 1024
 #define TAIL 8192
@@ -123,28 +135,28 @@ __device__ __forceinline__ void select_smem(Smem& s, const unsigned* v, unsigned
   thr = prefix;
 }
 
-// The four floats at i (fewer at the row's end, the rest -inf).
-__device__ __forceinline__ void load4(const float* row, unsigned i, unsigned n, float x[4]) {
+// The four logits at i (fewer at the row's end, the rest -inf).
+__device__ __forceinline__ void load4(const bf16* row, unsigned i, unsigned n, float x[4]) {
   if (i + 3 < n) {
-    const float4 v = *reinterpret_cast<const float4*>(row + i);
+    const float4 v = ld4(row + i);
     x[0] = v.x, x[1] = v.y, x[2] = v.z, x[3] = v.w;
   } else {
 #pragma unroll
-    for (int j = 0; j < 4; ++j) x[j] = i + j < n ? row[i + j] : -INFINITY;
+    for (int j = 0; j < 4; ++j) x[j] = i + j < n ? lv(row, i + j) : -INFINITY;
   }
 }
 
-// f(x[4], i) for the four floats at i. Whole tiles issue UNROLL unguarded loads of each thread before
-// any is used (a guard between them would serialize them); the tail goes four floats a thread.
+// f(x[4], i) for the four logits at i. Whole tiles issue UNROLL unguarded loads of each thread before
+// any is used (a guard between them would serialize them); the tail goes four logits a thread.
 template <class F>
-__device__ __forceinline__ void each4(const float* row, unsigned n, F f) {
+__device__ __forceinline__ void each4(const bf16* row, unsigned n, F f) {
   constexpr unsigned TILE = NT * 4 * UNROLL;
   const unsigned full = n / TILE * TILE;
   for (unsigned base = 0; base < full; base += TILE) {
     float4 v[UNROLL];
 #pragma unroll
     for (int u = 0; u < UNROLL; ++u)
-      v[u] = __ldg(reinterpret_cast<const float4*>(row + base + (u * NT + threadIdx.x) * 4));
+      v[u] = ld4v(row + base + (u * NT + threadIdx.x) * 4);
 #pragma unroll
     for (int u = 0; u < UNROLL; ++u) {
       const float x[4] = {v[u].x, v[u].y, v[u].z, v[u].w};
@@ -158,7 +170,7 @@ __device__ __forceinline__ void each4(const float* row, unsigned n, F f) {
   }
 }
 
-// The sample: the head (HEAD floats) and the tail (TAIL) whole, weight 1, and the interior's chunks
+// The sample: the head (HEAD logits) and the tail (TAIL) whole, weight 1, and the interior's chunks
 // spread evenly at 1 / SAMPLE_FRAC, weighted up to the interior's length; weights in 1/16ths. Indexer
 // logits crowd the ends (the first tokens, the recent window), so an unweighted sample overcounts.
 struct Sample {
@@ -173,7 +185,7 @@ __device__ __forceinline__ Sample sample_of(unsigned n) {
 
 // f(x[4], i, weight) over the sample, a thread's loads issued four at a time.
 template <class F>
-__device__ __forceinline__ void each_sample(const float* row, unsigned n, Sample m, F f) {
+__device__ __forceinline__ void each_sample(const bf16* row, unsigned n, Sample m, F f) {
   constexpr unsigned PER = SAMPLE_CHUNK / 4, ENDS = (HEAD + TAIL) / SAMPLE_CHUNK, STEP = NT / PER;
   const auto at = [&](unsigned c) {
     return c == 0     ? 0
@@ -232,7 +244,7 @@ __device__ __forceinline__ void cut_bin(Smem& s, unsigned want) {
 
 // Positions whose key >> sh is above `hi` into s.sel, those in [lo, hi] into the candidates; s.ncand
 // counts every candidate, CAP or not. Hits are a few percent of a row, so each takes its own atomic.
-__device__ __forceinline__ void collect(Smem& s, const float* row, unsigned n, int sh, unsigned lo, unsigned hi) {
+__device__ __forceinline__ void collect(Smem& s, const bf16* row, unsigned n, int sh, unsigned lo, unsigned hi) {
   if (threadIdx.x == 0) s.nsel = 0, s.ncand = 0;
   __syncthreads();
   each4(row, n, [&](const float* x, unsigned i) {
@@ -274,7 +286,7 @@ __device__ __forceinline__ void finish(Smem& s, unsigned rem, unsigned n, int lo
 }
 
 // Every key above `key` and the first `rem` positions holding it, in one in-order read.
-__device__ void ties_in_order(Smem& s, const float* row, unsigned n, unsigned key, unsigned rem) {
+__device__ void ties_in_order(Smem& s, const bf16* row, unsigned n, unsigned key, unsigned rem) {
   const int t = threadIdx.x;
   if (t == 0) s.nsel = 0;
   __syncthreads();
@@ -301,7 +313,7 @@ __device__ void ties_in_order(Smem& s, const float* row, unsigned n, unsigned ke
 }
 
 // The sampled route: true when s.sel holds the row's 2048.
-__device__ __forceinline__ bool sampled(Smem& s, const float* row, unsigned n) {
+__device__ __forceinline__ bool sampled(Smem& s, const bf16* row, unsigned n) {
   const Sample m = sample_of(n);
   const auto over = [&](auto f) { each_sample(row, n, m, f); };
   const unsigned want = 16 * TK * 3 / 2;
@@ -323,20 +335,20 @@ __device__ __forceinline__ bool sampled(Smem& s, const float* row, unsigned n) {
 // The exact route over a row held in registers, one read for every level; a cut inside one key held
 // by more than CAP positions takes the ties in position order on one more read. A key of 0 (a negative NaN's) marks a slot past n: it
 // sits in the lowest bin, under the 2049 real keys, so no cut reaches it.
-__device__ __forceinline__ void held(Smem& s, const float* row, unsigned n) {
+__device__ __forceinline__ void held(Smem& s, const bf16* row, unsigned n) {
   constexpr int Q = 4 * HELD_U;
   const unsigned t = threadIdx.x, lane = t & 31, last = n >= 4 ? (n - 4) & ~3u : 0;
   const auto at = [&](int u) { return (u * NT + t) * 4; };
   float4 v[HELD_U];
 #pragma unroll
-  for (int u = 0; u < HELD_U; ++u) v[u] = __ldg(reinterpret_cast<const float4*>(row + min((unsigned)at(u), last)));
+  for (int u = 0; u < HELD_U; ++u) v[u] = ld4v(row + min((unsigned)at(u), last));
   unsigned k[Q];
 #pragma unroll
   for (int u = 0; u < HELD_U; ++u) {
     float x[4] = {v[u].x, v[u].y, v[u].z, v[u].w};
     if (at(u) < n && at(u) + 3 >= n)
 #pragma unroll
-      for (int j = 0; j < 4; ++j) x[j] = at(u) + j < n ? row[at(u) + j] : 0.0f;
+      for (int j = 0; j < 4; ++j) x[j] = at(u) + j < n ? lv(row, at(u) + j) : 0.0f;
 #pragma unroll
     for (int j = 0; j < 4; ++j) k[4 * u + j] = at(u) + j < n ? okey(x[j]) : 0u;
   }
@@ -378,7 +390,7 @@ __device__ __forceinline__ void held(Smem& s, const float* row, unsigned n) {
       for (; ma; ma &= ma - 1) s.sel[a++] = pos(__ffsll(ma) - 1);
       for (; mc; mc &= mc - 1, ++b) {
         const unsigned i = pos(__ffsll(mc) - 1);
-        s.ckey[b] = okey(row[i]), s.cpos[b] = i;
+        s.ckey[b] = okey(lv(row, i)), s.cpos[b] = i;
       }
       __syncthreads();
       finish(s, TK - s.nsel, n, sh, p << sh);
@@ -391,7 +403,7 @@ __device__ __forceinline__ void held(Smem& s, const float* row, unsigned n) {
 }
 
 // The exact route: a level a read until the cut's bin fits CAP.
-__device__ __forceinline__ void exact(Smem& s, const float* row, unsigned n) {
+__device__ __forceinline__ void exact(Smem& s, const bf16* row, unsigned n) {
   const auto over = [&](auto f) { each4(row, n, [&](const float* x, unsigned i) { f(x, i, 1u); }); };
   unsigned rem = TK, fpre = 0;
   for (int level = 0; level < 3; ++level) {
@@ -409,13 +421,13 @@ __device__ __forceinline__ void exact(Smem& s, const float* row, unsigned n) {
 }
 
 template <bool HELD>
-__device__ __forceinline__ void topk(const float* __restrict__ logits, int stride, const int* __restrict__ lens,
+__device__ __forceinline__ void topk(const bf16* __restrict__ logits, int stride, const int* __restrict__ lens,
                                      int* __restrict__ out) {
   extern __shared__ __align__(16) unsigned char raw[];
   Smem& s = *reinterpret_cast<Smem*>(raw);
   const int t = threadIdx.x;
   const unsigned n = (unsigned)max(lens[blockIdx.x], 0);
-  const float* row = logits + (size_t)blockIdx.x * stride;
+  const bf16* row = logits + (size_t)blockIdx.x * stride;
   int* o = out + (size_t)blockIdx.x * TK;
   if (n <= TK) {
     for (int i = t; i < TK; i += NT) o[i] = i < (int)n ? i : -1;
@@ -446,13 +458,13 @@ __device__ __forceinline__ void topk(const float* __restrict__ logits, int strid
   for (int j = 0; j < TK / NT; ++j) o[t * (TK / NT) + j] = k[j];
 }
 
-extern "C" __global__ void __launch_bounds__(NT, 2) k31_topk(const float* __restrict__ logits, int stride,
+extern "C" __global__ void __launch_bounds__(NT, 2) k31_topk(const bf16* __restrict__ logits, int stride,
                                                             const int* __restrict__ lens, int* __restrict__ out) {
   topk<false>(logits, stride, lens, out);
 }
 
 // One block an SM, a row of at most HELD_MAX read once into registers: few rows, each as soon as can be.
-extern "C" __global__ void __launch_bounds__(NT, 1) k31_topk_held(const float* __restrict__ logits, int stride,
+extern "C" __global__ void __launch_bounds__(NT, 1) k31_topk_held(const bf16* __restrict__ logits, int stride,
                                                                  const int* __restrict__ lens, int* __restrict__ out) {
   topk<true>(logits, stride, lens, out);
 }

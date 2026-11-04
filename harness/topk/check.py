@@ -61,6 +61,8 @@ def main():
         lens[13] = 5000
         logits[13, :5000] = 1 + 1e-3 * torch.randn(5000, device=dev)
         logits[5, : lens[5]] = torch.randn(int(lens[5]), device=dev).half().float()  # fp16-exact: bins hold ties
+    mine_in = logits.bfloat16()
+    logits = mine_in.float()  # the references see the bf16 rows widened
     zero = torch.zeros(R, dtype=torch.int32, device=dev)
     mod = ok(cu.cuModuleLoadData(Path(a.cubin).read_bytes())) if a.cubin else module("k31_topk")
     mine = ok(cu.cuModuleGetFunction(mod, a.entry.encode()))
@@ -73,7 +75,7 @@ def main():
     ok(cu.cuFuncSetAttribute(vllm, cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, TOPK * 4))
     L = Launcher()
     out, again, ref_out = (torch.empty(R, TOPK, dtype=torch.int32, device=dev) for _ in range(3))
-    run = lambda o: L(mine, (R, 1, 1), (a.nt, 1, 1), [logits, ctypes.c_int(stride), lens, o], smem)
+    run = lambda o: L(mine, (R, 1, 1), (a.nt, 1, 1), [mine_in, ctypes.c_int(stride), lens, o], smem)
     runv = lambda: L(vllm, (R, 1, 1), (512, 1, 1),
                      [logits, zero, lens, ref_out, ctypes.c_int(stride), ctypes.c_int(1), ctypes.c_int(TOPK),
                       ctypes.c_int(0)], TOPK * 4)
@@ -88,14 +90,15 @@ def main():
         if got != want:
             bad.append((r, n, len(set(got) ^ set(want))))
         if (a.plain or r not in (0, 1, 2, 5, 9, 11, 12, 13)) and n > TOPK:
-            v = set(ref_out[r][ref_out[r] >= 0].tolist())
-            if v != set(want):
-                bad.append(("vllm", r, len(v ^ set(want))))
+            v = ref_out[r][ref_out[r] >= 0].long()
+            w = torch.tensor(want, dtype=torch.long, device=dev)
+            if not torch.equal(logits[r][v].sort().values, logits[r][w].sort().values):
+                bad.append(("vllm", r, len(set(v.tolist()) ^ set(want))))
     print(f"rows checked {len(rows)}, mismatches {bad[:8]} ({len(bad)})")
     print(f"deterministic: {torch.equal(out, again)}")
     t_mine = L.time(a.iters, lambda: run(out))
     t_vllm = L.time(a.iters, runv)
-    gb = (lens.double().sum() * 4 / 1e9).item()
+    gb = (lens.double().sum() * mine_in.element_size() / 1e9).item()
     print(f"smem {smem}; rows {R} ctx {a.ctx}: k31_topk {t_mine:.1f} us ({gb / t_mine * 1e6:.0f} GB/s of one read), "
           f"vllm {t_vllm:.1f} us ({gb / t_vllm * 1e6:.0f} GB/s)")
     return 0 if not bad else 1

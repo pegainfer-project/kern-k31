@@ -5,11 +5,14 @@
 //   - the key: LayerNorm in f32 (eps 1e-5, the model's rms_norm_eps), rounded to bf16, then e4m3
 //     with one UE8M0 scale 2^ceil(log2(max(amax, 1e-4) / 448)) (indexer_k_norm_quant_insert);
 //   - the query: e4m3 per (row, head) with a UE8M0 scale over eps 1e-10, clamped to +-448, and the
-//     head weight w = f32(weights_proj) * scale * 128^-0.5 * 32^-0.5 (indexer_q_quant_fold_weights).
+//     head weight bf16(weights_proj * 128^-0.5 * 32^-0.5). vLLM folds the scale into the weight and
+//     hands DeepGEMM unit scales; a power of two commutes with every rounding after it, so passing
+//     it as the query's UE8M0 scale gives the same logits.
 // Neither has a position encoding (dsa_config.index_rope_dim 0).
 //
-// The key cache is token-major, 144 bytes a token: 128 e4m3, the f32 scale, 12 bytes of padding, so
-// a row is a multiple of 16 bytes as kern's P -> D push and TMA require. A page is 64 tokens.
+// A UE8M0 scale travels as DeepGEMM's packed word: four equal exponent bytes, one a 32-element block.
+// The key cache is token-major, 144 bytes a token: 128 e4m3, the scale's word, 12 bytes of padding,
+// so a row is a multiple of 16 bytes as kern's P -> D push and TMA require. A page is 64 tokens.
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
@@ -44,6 +47,8 @@ __device__ __forceinline__ float ue8m0(float amax, float eps) {
   const unsigned x = ((b >> 23) & 0xff) + ((b & 0x7fffff) != 0);
   return __uint_as_float(x << 23);
 }
+
+__device__ __forceinline__ unsigned ue8m0x4(float sc) { return (__float_as_uint(sc) >> 23) * 0x01010101u; }
 
 __device__ __forceinline__ unsigned fp8x4(float a, float b, float c, float d) {
   const __nv_fp8x4_e4m3 q(make_float4(a, b, c, d));
@@ -82,15 +87,16 @@ extern "C" __global__ void __launch_bounds__(128) k31_idx_key(
   const float sc = ue8m0(warp_max(fmaxf(fmaxf(fabsf(y[0]), fabsf(y[1])), fmaxf(fabsf(y[2]), fabsf(y[3])))), 1e-4f);
   u8* row = cache + s * IDX_ROW;
   *reinterpret_cast<unsigned*>(row + l * 4) = fp8x4(y[0] / sc, y[1] / sc, y[2] / sc, y[3] / sc);
-  if (l == 0) *reinterpret_cast<float*>(row + ID) = sc;
+  if (l == 0) *reinterpret_cast<unsigned*>(row + ID) = ue8m0x4(sc);
 }
 
-// The indexer query of row r (q [T, 32 x 128] bf16, ldq apart) as e4m3 per head into iq [T, 32, 128],
-// and each head's weight (iw [T, 32] bf16, ldw apart) folded with its scale into wout [T, 32] f32.
+// The indexer query of row r (q [T, 32 x 128] bf16, ldq apart) as e4m3 per head into iq [T, 32, 128]
+// with its scales into sfq [T, 32], each head's weight (iw [T, 32] bf16, ldw apart) into wout [T, 32],
+// and, when rid is given, the row's request id r (DeepGEMM's paged scheduler: one token a request).
 //   grid (T), block 256: warp w owns heads 4w .. 4w + 3
 extern "C" __global__ void __launch_bounds__(256) k31_idx_q(
     const bf16* __restrict__ q, int ldq, const bf16* __restrict__ iw, int ldw, u8* __restrict__ iq,
-    float* __restrict__ wout, int T) {
+    unsigned* __restrict__ sfq, bf16* __restrict__ wout, unsigned* __restrict__ rid, int T) {
   const int r = blockIdx.x, w = threadIdx.x >> 5, l = threadIdx.x & 31;
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
@@ -101,8 +107,10 @@ extern "C" __global__ void __launch_bounds__(256) k31_idx_q(
 #pragma unroll
     for (int j = 0; j < 4; ++j) v[j] = fminf(fmaxf(v[j] / sc, -448.f), 448.f);
     *reinterpret_cast<unsigned*>(iq + ((size_t)r * IH + h) * ID + l * 4) = fp8x4(v[0], v[1], v[2], v[3]);
-    if (l == 0) wout[(size_t)r * IH + h] = bf(iw[(size_t)r * ldw + h]) * sc * 0.015625f;
+    if (l == 0)
+      sfq[(size_t)r * IH + h] = ue8m0x4(sc), wout[(size_t)r * IH + h] = __float2bfloat16(bf(iw[(size_t)r * ldw + h]) * 0.015625f);
   }
+  if (rid && threadIdx.x == 0) rid[r] = r;
 }
 
 // A row's position and its keys in the gathered stream: seq_lens are the sequences' lengths with
@@ -126,12 +134,12 @@ extern "C" __global__ void k31_idx_plan(const long long* __restrict__ cu, const 
 
 // The keys of every sequence, back to back: page j of sequence s (its tokens
 // [64 j, min(64 j + 64, len))) lands at stream rows goff(s) + 64 j, values in kg [., 128] and
-// scales in ksf, the contiguous layout the MQA logits read. A block a page; blocks past the last
+// scale words in ksf, the contiguous layout the MQA logits read. A block a page; blocks past the last
 // page return.
 //   grid (ceil(ctx / 64) + seqs), block 256
 extern "C" __global__ void k31_idx_gather(const u8* __restrict__ cache, const int* __restrict__ block_table,
                                           int max_pages, const int* __restrict__ seq_lens, int nseq,
-                                          u8* __restrict__ kg, float* __restrict__ ksf) {
+                                          u8* __restrict__ kg, unsigned* __restrict__ ksf) {
   int b = blockIdx.x, s = 0;
   unsigned goff = 0;
   for (; s < nseq; ++s) {
@@ -147,7 +155,7 @@ extern "C" __global__ void k31_idx_gather(const u8* __restrict__ cache, const in
   uint4* dv = reinterpret_cast<uint4*>(kg + d * ID);
   for (int i = threadIdx.x; i < n * (ID / 16); i += blockDim.x)
     dv[i] = reinterpret_cast<const uint4*>(src + (i / (ID / 16)) * IDX_ROW)[i % (ID / 16)];
-  if (threadIdx.x < n) ksf[d + threadIdx.x] = *reinterpret_cast<const float*>(src + threadIdx.x * IDX_ROW + ID);
+  if (threadIdx.x < n) ksf[d + threadIdx.x] = *reinterpret_cast<const unsigned*>(src + threadIdx.x * IDX_ROW + ID);
 }
 
 // The top-k's sequence-relative key indices (-1 past a short row's keys) as cache slots through the
@@ -168,17 +176,17 @@ extern "C" __global__ void k31_topk_slots(int* __restrict__ ind, const int* __re
 }
 
 // D, under DCP: a member's local top-k (local positions, -1 past its count) as candidates for the
-// group's merge, (score, global position) per slot as two f32 words, the position's bits as an int;
+// group's merge, (score, global position) per slot as two words: the bf16 score widened, the position;
 // local position l of member `rank` is global position l * W + rank (dealt one position a member).
 // An empty slot is (-inf, -1).
 //   grid (R), block 256
-extern "C" __global__ void k31_dcp_pack(const float* __restrict__ logits, int stride, const int* __restrict__ ind,
+extern "C" __global__ void k31_dcp_pack(const bf16* __restrict__ logits, int stride, const int* __restrict__ ind,
                                         int rank, int W, float2* __restrict__ cand) {
   const int r = blockIdx.x;
   for (int i = threadIdx.x; i < TOPK; i += blockDim.x) {
     const int l = ind[(size_t)r * TOPK + i];
     cand[(size_t)r * TOPK + i] = l < 0 ? make_float2(-INFINITY, __int_as_float(-1))
-                                       : make_float2(logits[(size_t)r * stride + l], __int_as_float(l * W + rank));
+                                       : make_float2(bf(logits[(size_t)r * stride + l]), __int_as_float(l * W + rank));
   }
 }
 
