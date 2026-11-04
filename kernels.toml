@@ -430,10 +430,26 @@ sha256 = "ceccbb2da670cbebdbe92746e2db851a327406ccf4642de8d2f09919f683d71f"
 source = "source/k3_head.cu"
 defines = { NRANKS = 4 }
 
+[kernels."k3_mla_prep+INNER=3072+KV_FP8=1+MLA_FUSED=5184"]
+sha256 = "72c380da55d885a93616b51422e10f51b1092a74cc76e3b8f4fd82131e159c2a"
+source = "source/k3_mla_prep.cu"
+defines = { INNER = 3072, KV_FP8 = 1, MLA_FUSED = 5184 }
+
+[kernels."k3_dcp+NRANKS=4+SPARSE=1"]
+sha256 = "c9aed559ffafc7135cba0f3e6c7f85ead3bf28b3f305f25a3fb4392012dce908"
+source = "source/k3_dcp.cu"
+defines = { NRANKS = 4, SPARSE = 1 }
+
 [kernels."peer_allreduce_bf16+NRANKS=4"]
 sha256 = "5fb47f29682fe7b5e3811506239e371b312ec595dcb33c95da29e4b793de7bd5"
 source = "source/peer_allreduce_bf16.cu"
 defines = { NRANKS = 4 }
+
+[kernels."k31_dsa+DCP_W=4"]
+sha256 = "597090675cfd98a99970e2ffc0f3a688a17295b794498178979aa69a0eb2ac10"
+source = "source/k31_dsa.cu"
+flags = "plain"
+defines = { DCP_W = 4 }
 
 [kernels."k3_dcp+NRANKS=4"]
 sha256 = "4a7edfe9722c2cd95d1c90edc788aebb33034773c5fec023b45c721f51b56e2c"

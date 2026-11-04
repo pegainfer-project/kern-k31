@@ -48,7 +48,8 @@ the group is checked against (step/, scripts/compare_steps.py). `--layers 2`
 
 K3.1's MLA layers are DSA layers (scripts/k31_dsa.py): over the fp8 cache, P and a one-GPU D score the
 keys with the indexer and attend each row's top 2048 through TRT-LLM gen's sparse MLA in place of the
-dense passes above; D under DCP is not wired yet.
+dense passes above; under DCP each member scores its own positions, the members' top-k merge by an
+all-gather, and the sparse partials meet in k3_dcp's SPARSE exchange.
 
 `--kv` picks the MLA cache: SGLang's fp8 (scripts/k3_kv_fp8.py, the default)
 or bf16 (scripts/k3_kv_bf16.py). A flavor owns its page bytes, D's absorb,
@@ -163,7 +164,6 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     assert kda_state in ("bf16", "f32")
     # K3.1's MLA layers attend sparsely over the fp8 pages (k31_dsa.py); the bf16 flavor is K3's dense path
     dsa = kv == "fp8"
-    assert not (dsa and decode and tp > 1), "D's DSA under DCP is not wired yet"
     flavor.check(decode, xchg, seqs_max, dsa)
     if chunk:
         mla_short = flavor.p_short(mla_short)
@@ -525,7 +525,11 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         xg = lambda defines=None, **extra: launch("k3_dcp", "kern_k3_dcp_exchange", grid=[DCP_GRID, 1, 1],
                                                   block=[256, 1, 1], smem=HEAD_DIM // 2 * KV_LORA * 2,
                                                   defines={**(defines or {}), **ranks}, **extra)
-        ops["dcp_exchange"] = flavor.d_exchange_op(g, xg, tail)
+        ops["dcp_exchange"] = ({
+            # K3.1's sparse partials: one a row, (max, sum) a head, the row's live count on this member
+            "params": ["in buffer<bf16>", "in buffer<f32>", "in buffer<i32>", *tail],
+            "impl": {"launches": [xg(defines={"SPARSE": 1})]},
+        } if dsa else flavor.d_exchange_op(g, xg, tail))
         ops["dcp_init"] = {
             "params": ["inout buffer<u8>", "i64"],
             "impl": {"launches": [launch("peer_allreduce_bf16", "kern_peer_lamport_init_bf16", defines={"NRANKS": tp},
@@ -612,7 +616,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
 
     ops.update(bp["ops"])
     if dsa and mla:
-        ops.update(k31_dsa.ops(chunk, t_max, seqs_max, max_ctx // tp, max_pages, mla_fused_l if chunk else inner_l))
+        ops.update(k31_dsa.ops(chunk, t_max, seqs_max, max_ctx // tp, max_pages, mla_fused_l if chunk else inner_l,
+                               tp))
     if chunk and not mx:
         ops["k3_concat_cols"] = {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
@@ -773,7 +778,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     if mla:
         work("mla_fused_partial", mla_fused_l, kpart)
         if dsa:
-            k31_dsa.buffers(work, buffers, chunk, max_ctx // tp, seqs_max)
+            k31_dsa.buffers(work, buffers, chunk, max_ctx // tp, seqs_max, tp)
         work("q_norm", Q_LORA)
     if decode and mla:
         work("q_partial", Q_B, "f32")
@@ -1060,7 +1065,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                     gemm(L + "q_b", b("q_norm"), w("w_q_b"), b("q_partial"), Q_B, Q_LORA)
                     if dsa:
                         k31_dsa.steps(step, w, L, kv, f"idx.{i}", False, b("mla_gate"), max_pages, max_ctx // tp,
-                                      b("q_partial"))
+                                      b("q_partial"), exchange=(
+                                          b("dcp_lamport"), b("dcp_lamport_peers"), b("dcp_state"), b("tp_err"),
+                                          {"rank": "tp"}, B, i64(dcp_stage), i64(TP_TIMEOUT_NS)) if xchg else None)
                     else:
                         step(L + "absorb", "mla_absorb", b("q_partial"), w("w_kv_b"), b("q_abs"), B)
                         flavor.d_attn_steps(step, w, L, kv, g)
