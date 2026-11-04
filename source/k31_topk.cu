@@ -19,8 +19,10 @@
 // by key and then by position settles the cut.
 //
 // A row of at least SAMPLE_MIN is first tried on a sample: its ends whole and an eighth of the rest in
-// chunks spread evenly, weighted to the row, two digits deep, puts a threshold where 1.5x 2048 keys
-// are expected above it, and one read keeps every key at or above it. When the kept count lands in
+// chunks spread evenly, weighted to the row, puts a threshold where 1.5x 2048 keys are expected above
+// it, and one read keeps every key at or above it. The threshold is the bottom of the first digit's
+// bin when the bin and all above it are expected to fit 3/4 of CAP (a bf16 key has 16 bits, so that
+// bin is 16 values wide), the second digit's cut otherwise. When the kept count lands in
 // [2048, CAP], that is the row: one read and an eighth. Otherwise (a sample that misleads) the row
 // takes the exact route above, a read a digit plus the one that collects; a cut inside one exact key
 // held by more than CAP positions takes the ties in position order on one more read.
@@ -56,6 +58,11 @@ __device__ __forceinline__ float lv(const bf16* row, unsigned i) { return __bflo
 __device__ __forceinline__ unsigned okey(float x) {
   const unsigned b = __float_as_uint(x + 0.0f);  // -0 taken as +0
   return b ^ ((b & 0x80000000u) ? 0xffffffffu : 0x80000000u);
+}
+
+// The float whose key k is.
+__device__ __forceinline__ float unkey(unsigned k) {
+  return __uint_as_float(k ^ ((k & 0x80000000u) ? 0x80000000u : 0xffffffffu));
 }
 
 using Scan = cub::BlockScan<unsigned, NT>;
@@ -242,24 +249,52 @@ __device__ __forceinline__ void cut_bin(Smem& s, unsigned want) {
   __syncthreads();
 }
 
+#define CU 2  // 16-byte loads a thread a collect tile
+
 // Positions whose key >> sh is above `hi` into s.sel, those in [lo, hi] into the candidates; s.ncand
 // counts every candidate, CAP or not. Hits are a few percent of a row, so each takes its own atomic.
+// Keying every logit made the read bound by issue: eight logits at a time are ruled out by four pair
+// compares against `lo` as a bf16 rounded down, and only a group with a logit at or above it (or a
+// NaN) is keyed. The next tile's loads leave before this tile is looked at. A row starts 16-byte
+// aligned (`stride` a multiple of 8).
 __device__ __forceinline__ void collect(Smem& s, const bf16* row, unsigned n, int sh, unsigned lo, unsigned hi) {
   if (threadIdx.x == 0) s.nsel = 0, s.ncand = 0;
   __syncthreads();
-  each4(row, n, [&](const float* x, unsigned i) {
+  const __nv_bfloat162 thr = __bfloat162bfloat162(__float2bfloat16_rd(unkey(lo << sh)));
+  constexpr unsigned TILE = NT * 8 * CU;
+  const auto load = [&](unsigned base, uint4* v) {
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const unsigned k = okey(x[j]), d = k >> sh;
-      if (i + j >= n || d < lo) continue;
-      if (d > hi) {
-        s.sel[atomicAdd(&s.nsel, 1u)] = i + j;
-      } else {
-        const unsigned c = atomicAdd(&s.ncand, 1u);
-        if (c < CAP) s.ckey[c] = k, s.cpos[c] = i + j;
+    for (int u = 0; u < CU; ++u) {
+      const unsigned i = base + (u * NT + threadIdx.x) * 8;
+      v[u] = i < n ? __ldg(reinterpret_cast<const uint4*>(row + i)) : make_uint4(0, 0, 0, 0);
+    }
+  };
+  uint4 cur[CU], nxt[CU];
+  load(0, cur);
+  for (unsigned base = 0; base < n; base += TILE) {
+    if (base + TILE < n) load(base + TILE, nxt);
+#pragma unroll
+    for (int u = 0; u < CU; ++u) {
+      const unsigned i = base + (u * NT + threadIdx.x) * 8, w[4] = {cur[u].x, cur[u].y, cur[u].z, cur[u].w};
+      unsigned below = ~0u;
+#pragma unroll
+      for (int q = 0; q < 4; ++q) below &= __hlt2_mask(*reinterpret_cast<const __nv_bfloat162*>(&w[q]), thr);
+      if (below == ~0u) continue;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const unsigned k = okey(__uint_as_float(j & 1 ? w[j / 2] & 0xffff0000u : w[j / 2] << 16)), d = k >> sh;
+        if (i + j >= n || d < lo) continue;
+        if (d > hi) {
+          s.sel[atomicAdd(&s.nsel, 1u)] = i + j;
+        } else {
+          const unsigned c = atomicAdd(&s.ncand, 1u);
+          if (c < CAP) s.ckey[c] = k, s.cpos[c] = i + j;
+        }
       }
     }
-  });
+#pragma unroll
+    for (int u = 0; u < CU; ++u) cur[u] = nxt[u];
+  }
   __syncthreads();
 }
 
@@ -320,9 +355,13 @@ __device__ __forceinline__ bool sampled(Smem& s, const bf16* row, unsigned n) {
   histogram(s, over, n, 0, 0);
   cut_bin(s, want);
   const unsigned b1 = s.cut, left = want - s.above;
-  histogram(s, over, n, 1, b1);
-  cut_bin(s, left);
-  collect(s, row, n, 8, prefix_of(1, b1, s.cut), 0xffffffu);
+  if (s.above + s.count <= 16 * (CAP * 3 / 4)) {
+    collect(s, row, n, 20, b1, 0xfffu);
+  } else {
+    histogram(s, over, n, 1, b1);
+    cut_bin(s, left);
+    collect(s, row, n, 8, prefix_of(1, b1, s.cut), 0xffffffu);
+  }
   const unsigned kept = s.ncand;
   if (kept < TK || kept > CAP) return false;
   finish(s, TK, n);
