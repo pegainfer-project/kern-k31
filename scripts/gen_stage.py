@@ -769,8 +769,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     if mla:
         work("mla_fused_partial", mla_fused_l, kpart)
         if dsa:
-            k31_dsa.buffers(work, buffers, chunk, t_max, max_ctx // tp, seqs_max)
-            once.call("fill_i32", [buf("idx_zero"), i32(t_max), i32(0)], t_max)
+            k31_dsa.buffers(work, buffers, chunk, max_ctx // tp, seqs_max)
         work("q_norm", Q_LORA)
     if decode and mla:
         work("q_partial", Q_B, "f32")

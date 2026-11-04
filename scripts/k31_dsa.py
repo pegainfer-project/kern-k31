@@ -33,6 +33,7 @@ PAGED_SMEM = 198656
 META = "_ZN9deep_gemm5sched31sm100_paged_mqa_logits_metadataILj1ELb1ELb0ELj256ELj152EEEvjjPKjS3_Pj"
 ABSORB_GRID_X = 3  # k31_absorb's row walkers a (head, column block): 8192 rows at 389 us, flat from 3 on
 VUP_SMEM = 3 * (64 + 128) * 72 * 2
+TOPK_SMEM = 83008  # k31_topk_smem
 TMAP = "bytes<128>"
 HEADC_BYTES = (Q_LORA + KV_LORA + 64) * 2  # the gate's columns in P's fused projection (q_a | kv_a | rope | gate)
 
@@ -60,14 +61,13 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages):
             "params": ["in buffer<bf16>", "i32", "in buffer<bf16>", "i32", "out buffer<u8>", "out buffer<f32>", "i32"],
             "impl": {"launches": [dsa("k31_idx_q", [T, 1, 1], [256, 1, 1])]},
         },
-        # vLLM's prefill top-k over [0, end) of a row: (logits, starts, ends, out, stride)
+        # each row's top TOPK over [0, len) as ascending positions (k31_topk, vLLM's set, deterministic)
         "idx_topk": {
-            "params": ["in buffer<f32>", "in buffer<i32>", "in buffer<i32>", "out buffer<i32>", "i32"],
+            "params": ["in buffer<f32>", "in buffer<i32>", "out buffer<i32>", "i32"],
             "impl": {"launches": [launch(
-                "vllm_topk", "glm_topk_prefill", grid=[T, 1, 1], block=[512, 1, 1], smem=TOPK * 4,
-                params=["in buffer<f32>", "in buffer<i32>", "in buffer<i32>", "out buffer<i32>", "i32", "i32", "i32",
-                        "i32"],
-                args=[*({"param": i} for i in range(5)), i32(1), i32(TOPK), i32(0)])]},
+                "k31_topk", "k31_topk", grid=[T, 1, 1], block=[512, 1, 1], smem=TOPK_SMEM,
+                params=["in buffer<f32>", "i32", "in buffer<i32>", "out buffer<i32>"],
+                args=[{"param": 0}, {"param": 3}, {"param": 1}, {"param": 2}])]},
         },
         "absorb": {
             "params": ["in buffer<bf16>" if chunk else "in buffer<f32>", "in buffer<bf16>", "out buffer<fp8e4m3>",
@@ -180,7 +180,7 @@ def weights(weight, seg, a, n):
     weight(n + "idx_kn_b", [ID], [seg(a + "indexer.k_norm.bias")])
 
 
-def buffers(work, bufs, chunk, rows_max, max_ctx, seqs_max):
+def buffers(work, bufs, chunk, max_ctx, seqs_max):
     work("idx_kwo", IDX_KW)
     work("idx_qb", IDX_Q)
     work("idx_iq", IDX_Q, "u8")
@@ -191,8 +191,6 @@ def buffers(work, bufs, chunk, rows_max, max_ctx, seqs_max):
     work("mla_o", sparse.HEADS * sparse.D_V)
     work("mla_md", sparse.HEADS * 2, "f32")
     work("idx_logits", stride(max_ctx), "f32")
-    # vLLM's top-k scores [start, end) of a row: start 0, filled once
-    bufs["idx_zero"] = {"dtype": "i32", "shape": [rows_max], "kind": "carry"}
     if chunk:
         for x in ("idx_ks", "idx_ke"):
             work(x, 1, "u32")
@@ -225,7 +223,7 @@ def steps(step, w, L, kv, idx, chunk, gate, gate_stride, max_pages, max_ctx, q):
         step(L + "idx_logits", "idx_logits", b("idx_iq"), b("idx_w"), {"state": idx}, {"state": idx, "offset": ID},
              b("seq_lens"), b("block_table"), b("idx_sched"), b("idx_logits"), B)
         ends = b("seq_lens")
-    step(L + "idx_topk", "idx_topk", b("idx_logits"), b("idx_zero"), ends, b("idx_ind"), i32(stride(max_ctx)))
+    step(L + "idx_topk", "idx_topk", b("idx_logits"), ends, b("idx_ind"), i32(stride(max_ctx)))
     if chunk:
         step(L + "idx_slots", "idx_slots", b("idx_ind"), b("block_table"), i32(max_pages), b("idx_row_seq"),
              b("idx_klen"), b("idx_tlen"), B)
