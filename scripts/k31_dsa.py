@@ -31,7 +31,8 @@ PAGED = ("_ZN9deep_gemm22sm100_paged_mqa_logitsILj1ELj32ELj128ELj64ELb0ELb1ELb0E
          "N7cutlass12float_e4m3_tEffLj2EEEvjjjPKjPT13_S4_S4_S4_14CUtensorMap_stS7_S7_S7_S7_")
 PAGED_SMEM = 198656
 META = "_ZN9deep_gemm5sched31sm100_paged_mqa_logits_metadataILj1ELb1ELb0ELj256ELj152EEEvjjPKjS3_Pj"
-ABSORB_GRID_X = 3  # k31_absorb's row walkers a (head, column block): 8192 rows at 389 us, flat from 3 on
+# k31_absorb_tc's grid is odd so a block's items alternate halves (the rope rides on the first)
+ABSORB_TC_SMEM = 1024 + 3 * (16384 + 4 * 8192) + 32768 + 16384 + 8192 + 256  # its SMEM_BYTES
 VUP_SMEM = 3 * (64 + 128) * 72 * 2
 VUP_TC_SMEM = 1024 + 6 * 2 * 128 * 64 * 2 + 256  # k31_vup_gate_tc SMEM_BYTES
 TOPK_SMEM = 83008  # k31_topk_smem
@@ -75,7 +76,15 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride):
             "params": ["in buffer<bf16>" if chunk else "in buffer<f32>", "in buffer<bf16>", "out buffer<fp8e4m3>",
                        "i32"],
             "impl": {"launches": [
-                launch("k31_absorb", "kern_k31_absorb", grid=[ABSORB_GRID_X, HEADS, 4], block=[256, 1, 1])
+                launch("k31_absorb_tc", "kern_k31_absorb_tc", grid=[SMS - 1, 1, 1], block=[384, 1, 1],
+                       smem=ABSORB_TC_SMEM, params=[*[TMAP] * 4, "i32"],
+                       args=[tmap(0, "bf16", [192, HEADS, 0], [192 * 2, HEADS * 192 * 2], [64, 1, 128], 128),
+                             tmap(1, "bf16", [KV_LORA, 0], [KV_LORA * 2], [64, 64], 128),
+                             tmap(2, "u8", [sparse.D_QK, sparse.HEADS, 0], [sparse.D_QK, sparse.HEADS * sparse.D_QK],
+                                  [128, 1, 128], 128),
+                             tmap(2, "u8", [sparse.D_QK, sparse.HEADS, 0], [sparse.D_QK, sparse.HEADS * sparse.D_QK],
+                                  [64, 1, 128], 0),
+                             {"param": 3}])
                 if chunk else
                 launch("k3_mla_absorb_mma", "kern_k3_mla_absorb_mma", grid=[1, HEADS, 4], block=[256, 1, 1],
                        defines={"Q_FP8": 1, "OUT_HEADS": sparse.HEADS})]},
