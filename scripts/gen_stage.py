@@ -8,7 +8,7 @@ imported from the kern checkout KERN names:
 
     KERN=<kern checkout> KERN_INDEX_DIR=<kern master>/kernel_index \
       python3 scripts/gen_stage.py --chunk 8192 > p.json
-    ... --tp 8 --moe-variants FC1,FC2 --peer-ar > d.json
+    ... --tp 8 --moe-variants FC1,FC2 > d.json
 
 Both run layers [0, --layers) with the embedding and the head, and keep one
 state per layer (`kv.<i>`, `kda.<i>`), so `kern cut` can drop the layers a
@@ -33,8 +33,9 @@ replicated; the append writes through the owner's slot only, the others'
 slots point at a pad page), and the members' partials change hands by heads
 (source/k3_dcp.cu). From there a member holds HEADS / R heads of every row,
 as it does in a KDA layer (`kda.<l>` shards `by: heads`): v-up, gate and
-o_proj over its heads, the o_proj partial summed over the group (NCCL, or the
-Lamport one-shot with --peer-ar).
+o_proj over its heads, the o_proj partial summed over the group by the
+Lamport one-shot (source/peer_allreduce_bf16.cu), each sum fused with its
+neighbours (source/k3_ar_fused.cu).
 The MoE routes every row through the member's experts — every R-th one from
 its index, so the routing's first expert is `{"rank": "tp"}` and the slice a
 stride, no rank arithmetic in the manifest — with FlashInfer's routing and
@@ -144,10 +145,9 @@ def is_mla(i):
 
 
 def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_variants=None, pack=16,
-          peer_ar=False, mla_short=128, kv="fp8", mla_ours_from=None, window=65536, kda_state="bf16"):
+          mla_short=128, kv="fp8", mla_ours_from=None, window=65536, kda_state="bf16"):
     """P with `chunk_max`, else D over a `tp` group (see the module doc), of layers [0, `end`). `pack`: P's sequences a call; `window`: the cached keys a
-    P's MLA layer expands and attends at once; `peer_ar`: D's sums by the group's Lamport one-shot
-    (source/peer_allreduce_bf16.cu) instead of NCCL; `kv`: the MLA cache, SGLang's fp8 (e4m3, scale 1; D
+    P's MLA layer expands and attends at once; `kv`: the MLA cache, SGLang's fp8 (e4m3, scale 1; D
     attends it with the Cake kernel, P lifts it to bf16 for the expansion) or bf16; `kda_state`: the KDA
     recurrent state's storage, bf16 or f32."""
     chunk = chunk_max > 0
@@ -159,7 +159,6 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     # A D group of one is the step's own oracle: the same ops on one GPU
     # holding every expert, with nothing to exchange or sum.
     xchg = decode and tp > 1
-    fused_ar = xchg and peer_ar
     flavor = KV[kv]
     assert kda_state in ("bf16", "f32")
     # K3.1's MLA layers attend sparsely over the fp8 pages (k31_dsa.py); the bf16 flavor is K3's dense path
@@ -535,14 +534,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             "impl": {"launches": [launch("peer_allreduce_bf16", "kern_peer_lamport_init_bf16", defines={"NRANKS": tp},
                                          grid=[256, 1, 1], block=[256, 1, 1])]},
         }
-    if xchg and not peer_ar:
-        # `count` elements per rank, one NCCL launch
-        io = ["in buffer<bf16>", "out buffer<bf16>", "i64"]
-        ops["nccl_allreduce_bf16"] = {
-            "params": io,
-            "impl": {"launches": [{"entry": "extern:nccl_allreduce_bf16", "params": io + ["i32"],
-                                   "args": [{"param": 0}, {"param": 1}, {"param": 2}, {"rank": "tp"}]}]}}
-    if fused_ar:
+    if xchg:
         # The layer's two sums with their neighbours (source/k3_ar_fused.cu): the attention's with the
         # landing, mix and norm after it; the MoE's with the combine before it and the latent norm after.
         lamport_params = ["inout buffer<u8>", "in buffer<u64>", "inout buffer<i32>", "out buffer<i32>", "i32"]
@@ -553,7 +545,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             "impl": {"launches": [launch("k3_ar_fused", "kern_k3_ar_finalize_rms", defines={"NRANKS": tp},
                                          grid=[TP_AR_GRID, 1, 1], block=[1024, 1, 1], pdl=True)]},
         }
-        # `--peer-ar`: one kernel, every rank's partial pushed into every
+        # a sum on its own: one kernel, every rank's partial pushed into every
         # peer's Lamport stage over NVLink (one hop, no ring), summed in f32.
         ops["tp_allreduce_bf16"] = {
             "params": ["in buffer<bf16>", "out buffer<bf16>", "inout buffer<u8>", "in buffer<u64>",
@@ -649,7 +641,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     # bytes: one Lamport stage, `tp` slots of D's widest bf16 sum: a MoE layer's, the routed latent's
     # `seqs_max` rows, then the shared expert's
     ar_stage = tp * seqs_max * (LATENT + H) * 2
-    if fused_ar:
+    if xchg:
         buffers.update({
             # three stages, then the first call's handshake words (k3_ar_fused.cu), never poisoned
             "tp_ar_lamport": {"dtype": "u8", "shape": [3 * ar_stage + 64], "kind": "carry", "export": True},
@@ -899,18 +891,14 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         return b("tp_ar_lamport"), b("tp_ar_lamport_peers"), b("tp_ar_state"), b("tp_err"), {"rank": "tp"}
 
     def summed(label, partial, whole, count, second=None):
-        """A D group's bf16 sum of `partial` in `whole` by NCCL or the Lamport one-shot; `partial` itself
-        alone. `second` (at, count): a second run of elements, summed by the one-shot in the same
-        exchange; NCCL sums everything up to its end."""
+        """A D group's bf16 sum of `partial` in `whole` by the Lamport one-shot; `partial` itself alone.
+        `second` (at, count): a second run of elements, summed in the same exchange."""
         if not xchg:
             return partial
         at2, n2 = second or (0, 0)
-        if peer_ar:
-            step(label, "tp_allreduce_bf16", partial, whole, b("tp_ar_lamport"), b("tp_ar_lamport_peers"),
-                 b("tp_ar_state"), b("tp_err"), {"rank": "tp"}, {"expr": count}, i64(at2), {"expr": n2} if second else i64(0),
-                 i64(ar_stage), i64(TP_TIMEOUT_NS))
-        else:
-            step(label, "nccl_allreduce_bf16", partial, whole, {"expr": {"add": [at2, n2]} if second else count})
+        step(label, "tp_allreduce_bf16", partial, whole, b("tp_ar_lamport"), b("tp_ar_lamport_peers"),
+             b("tp_ar_state"), b("tp_err"), {"rank": "tp"}, {"expr": count}, i64(at2), {"expr": n2} if second else i64(0),
+             i64(ar_stage), i64(TP_TIMEOUT_NS))
         return whole
 
     def kda_run(L, w, line, kda):
@@ -1091,13 +1079,12 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             o = b("attn_part") if chunk else b("o_partial" if xchg else "hidden_partial")
             proj(L + "o_proj", b("gated"), w("w_o"), o, H, inner_l)
             # attn_out landing + residual (or snapshot replace) + mix + norm → prefix2, normed
-            if fused_ar:
+            if xchg:
                 step(L + "res_mlp", nb_op("ar_attnres_rms", nb_mlp), o, *lamport(), b("hidden"), b("blocks"),
                      w("sw_mlp"), w("gamma_post"), b("prefix2"), b("normed"), i32(int(snapshot)), B,
                      i64(ar_stage), i64(TP_TIMEOUT_NS))
             else:
-                attn_out = summed(L + "reduce_attn", o, b("hidden_partial"), {"mul": [T, H]})
-                step(L + "res_mlp", "land_add_attnres_rms_bf16", attn_out, b("hidden"), b("blocks"), w("sw_mlp"),
+                step(L + "res_mlp", "land_add_attnres_rms_bf16", o, b("hidden"), b("blocks"), w("sw_mlp"),
                      w("gamma_post"), b("prefix2"), b("normed"), i32(nb_mlp), i32(int(snapshot)), B)
 
             if i == 0:
@@ -1106,11 +1093,10 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 proj(L + "wgu", b("normed"), w("wgu"), b("dense_partial"), 2 * dn_l, H)
                 land_situ(L + "situ", b("dense_partial"), b("dense_act"), dn_l)
                 proj(L + "w_dn", b("dense_act"), w("w_dn"), b("routed_partial"), H, dn_l)
-                if fused_ar:
+                if xchg:
                     closing = ("ar", L + "hidden", b("routed_partial"))
                 else:
-                    mlp = summed(L + "reduce_mlp", b("routed_partial"), b("mlp_all"), {"mul": [T, H]})
-                    closing = (L + "hidden", mlp, mlp, 0)
+                    closing = (L + "hidden", b("routed_partial"), b("routed_partial"), 0)
             elif decode:
                 if front:
                     gemm(L + "front", b("normed"), w("w_front"), b("front_partial"), front, H)
@@ -1133,14 +1119,14 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 prog.extend(bp["steps"](b("latent_q"), b("latent_sf"), b("topk_idx"), b("topk_weight"),
                                         w("moe.w13s"), w("moe.w13_sfs"), w("moe.w2s"), w("moe.w2_sfs"),
                                         w("moe.alpha"), w("moe.beta"), b("moe_flat"), {"rank": "tp"}, label=L,
-                                        routed=bool(front), combined=not fused_ar))
+                                        routed=bool(front), combined=not xchg))
                 shared_at = seqs_max * LATENT * 2
                 if not front:
                     proj(L + "wsh", b("normed"), w("wsh"), b("shared_partial"), 2 * sh_l, H)
                     land_situ(L + "shared_situ", b("shared_partial"), b("shared_act"), sh_l)
                 if not front:
                     proj(L + "sh_down", b("shared_act"), w("sh_down"), b("moe_flat", shared_at), H, sh_l)
-                if fused_ar:
+                if xchg:
                     # the combine, the sum of both and the latent norm in one launch; fc2's partial read
                     # before the grid wait unless fc2 is the kernel right before (it lets its dependents
                     # launch before its output is out)
@@ -1151,9 +1137,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                          i64(TP_TIMEOUT_NS))
                     moe = "moe_sum"
                 else:
-                    # the routed latent's `tokens` rows, then the shared expert's
-                    moe = summed(L + "reduce_mlp", b("moe_flat"), b("moe_sum"), {"mul": [T, LATENT]},
-                                 (seqs_max * LATENT, {"mul": [T, H]}))["buf"]
+                    moe = "moe_flat"
                     step(L + "lat_norm", "rms", b(moe), w("gamma_lat"), b("routed_latent_norm"), i32(LATENT), B)
                 proj(L + "lat_up", b("routed_latent_norm"), w("w_lat_up"), b("routed_partial"), H, LATENT)
                 closing = (L + "hidden", b("routed_partial"), b(moe, shared_at), 1)
@@ -1341,7 +1325,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     # Run once after the peers are imported: the Lamport stages must read
     # -0.0 before the first allreduce, and a carry starts at zero.
     init = ([{"label": "tp_init", "op": "tp_lamport_init_bf16", "args": [b("tp_ar_lamport"), i64(3 * ar_stage)]}]
-            if fused_ar else []) + (
+            if xchg else []) + (
         [{"label": "dcp_init", "op": "dcp_init", "args": [b("dcp_lamport"), i64(3 * dcp_stage)]}] if xchg and mla else [])
     if init:
         programs["tp_init"] = kern_manifest.program(init, once=True)
@@ -1391,8 +1375,6 @@ def main():
                     help="D: KV splits a row's attention may run as; the workspace is tokens x this x 256 KiB")
     ap.add_argument("--mla-ours-from", type=int, metavar="ROWS",
                     help="D: batches of at least ROWS rows take k3_mla_decode.cu for the MLA attention (default: the DSL)")
-    ap.add_argument("--peer-ar", action="store_true",
-                    help="D: the sums by the Lamport one-shot over the group's peers instead of NCCL")
     ap.add_argument("--max-ctx", type=int, default=1 << 20, help="the longest context a sequence reaches")
     ap.add_argument("--window", type=int, default=65536,
                     help="P: the cached keys an MLA layer expands and attends in one round")
@@ -1403,13 +1385,13 @@ def main():
     ap.add_argument("--moe-variants", metavar="FC1,FC2",
                     help="the batched-GEMM variants of the MoE by name (default: the index's picks)")
     a = ap.parse_args()
-    if a.chunk and (a.tp > 1 or a.peer_ar):
-        ap.error("--tp and --peer-ar are D's; P runs on one GPU")
+    if a.chunk and a.tp > 1:
+        ap.error("--tp is D's; P runs on one GPU")
     if not a.chunk and a.seqs > 64:
         ap.error("D absorbs on tensor cores for at most 64 rows (k3_mla_absorb_mma BMAX)")
     names = tuple(a.moe_variants.split(",")) if a.moe_variants else None
     json.dump(build(a.layers, a.max_ctx, a.seqs, a.tp, a.mla_split_max, a.chunk, names, a.pack,
-                    a.peer_ar, a.mla_short, a.kv, a.mla_ours_from, a.window, a.kda_state),
+                    a.mla_short, a.kv, a.mla_ours_from, a.window, a.kda_state),
               sys.stdout, indent=1)
     print()
 

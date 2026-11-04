@@ -28,5 +28,5 @@ rm -rf "$out/p"
 rm "$out/p-93.json"
 
 gen --layers 93 --tp 8 --seqs 64 \
-  --moe-variants "$FC1,$FC2" --peer-ar > "$out/d.json"
+  --moe-variants "$FC1,$FC2" > "$out/d.json"
 "$bin" verify "$out/d.json"

@@ -5,7 +5,7 @@ so the D step it drives stops where the model's own forward stops: after
 the final AttnRes mix and norm, at the hidden states. The engine then asks
 for logits through a separate `head` program and gathers the vocab itself.
 
-Rewrites a `gen_stage.py --tp N --peer-ar` decode manifest:
+Rewrites a `gen_stage.py --tp N` decode manifest:
 
 - `decode` becomes `decode_batch`, cut after `out.res`, whose normed rows
   land in the new output `hidden` (the residual stream workspace that held
