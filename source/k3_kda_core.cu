@@ -294,6 +294,22 @@ extern "C" __global__ __launch_bounds__(128, KDA_MINB) void kern_k3_kda_core(
   __shared__ __align__(16) uint4 sh_tile[KD * 16];  // the head's w_f_b tile, 32 KB
   __shared__ float sh_gam[KD], sh_gate[KD];
 
+  const int kl = d & (KLANES - 1);   // 8 lanes over k
+  const int dvl = d >> 3;            // 16 dv rows per pass
+  rec_t* rec = reinterpret_cast<rec_t*>(reinterpret_cast<char*>(kda_base) + (long long)line_index[b] * line_bytes +
+                                        (size_t)h * REC_SLICE);
+  rec_t* recv = rec + kl;   // + dv*32 + 8*j
+#if !KDA_SMEM_STATE
+  // The first pass's rows go out now, packed: their round trip overlaps the whole prologue, and each pass
+  // after issues the next one's before it computes, so one state round trip is exposed at most.
+  constexpr int PASSES = KD / (DVGRP * ROWS_PER_ITER);
+  rec_t cur[ROWS_PER_ITER][KVEC];
+#pragma unroll
+  for (int r = 0; r < ROWS_PER_ITER; ++r)
+#pragma unroll
+    for (int j = 0; j < KVEC; ++j) cur[r][j] = LDST(recv + (size_t)(r * DVGRP + dvl) * 32 + 8 * j);
+#endif
+
   // Every load that depends on nothing but the indices goes out now, in one round trip: the head's
   // w_f_b tile into shared memory (cp.async, no registers), the row's scalars into registers.
   {
@@ -451,11 +467,6 @@ extern "C" __global__ __launch_bounds__(128, KDA_MINB) void kern_k3_kda_core(
   const float ckq = block_sum(knd * qsd, sh_red);
 
   // ---- delta rule over rec ----
-  const int kl = d & (KLANES - 1);   // 8 lanes over k
-  const int dvl = d >> 3;            // 16 dv rows per pass
-  rec_t* rec = reinterpret_cast<rec_t*>(reinterpret_cast<char*>(kda_base) + (long long)line_index[b] * line_bytes +
-                                        (size_t)h * REC_SLICE);
-
   // dv-invariant coefficients for this lane's 16 k values: k = 32*j + 4*kl + i
   float cdec[KPER], ckn[KPER], cqs[KPER];
 #pragma unroll
@@ -468,14 +479,12 @@ extern "C" __global__ __launch_bounds__(128, KDA_MINB) void kern_k3_kda_core(
     cqs[4 * j + 0] = e.x;  cqs[4 * j + 1] = e.y;  cqs[4 * j + 2] = e.z;  cqs[4 * j + 3] = e.w;
   }
 
-  rec_t* recv = rec + kl;   // + dv*32 + 8*j
 #if KDA_SMEM_STATE
   const rec_t* srcv = sh_rec + kl;
   asm volatile("{\n.reg .pred p;\nW: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], 0;\n@!p bra W;\n}" ::"r"(bar) : "memory");
-#else
-  const rec_t* srcv = recv;
 #endif
 
+#if KDA_SMEM_STATE
 #pragma unroll 1
   for (int it = 0; it < KD / (DVGRP * ROWS_PER_ITER); ++it) {
     float4 s[ROWS_PER_ITER][KVEC];
@@ -485,12 +494,28 @@ extern "C" __global__ __launch_bounds__(128, KDA_MINB) void kern_k3_kda_core(
       dv[r] = (it * ROWS_PER_ITER + r) * DVGRP + dvl;
       const rec_t* p = srcv + (size_t)dv[r] * 32;
 #pragma unroll
-#if KDA_SMEM_STATE
       for (int j = 0; j < KVEC; ++j) s[r][j] = rec_unpack(p[8 * j]);
-#else
-      for (int j = 0; j < KVEC; ++j) s[r][j] = rec_unpack(LDST(p + 8 * j));
-#endif
     }
+#else
+#pragma unroll
+  for (int it = 0; it < PASSES; ++it) {
+    rec_t nxt[ROWS_PER_ITER][KVEC];
+    if (it + 1 < PASSES) {
+#pragma unroll
+      for (int r = 0; r < ROWS_PER_ITER; ++r)
+#pragma unroll
+        for (int j = 0; j < KVEC; ++j)
+          nxt[r][j] = LDST(recv + (size_t)(((it + 1) * ROWS_PER_ITER + r) * DVGRP + dvl) * 32 + 8 * j);
+    }
+    float4 s[ROWS_PER_ITER][KVEC];
+    int dv[ROWS_PER_ITER];
+#pragma unroll
+    for (int r = 0; r < ROWS_PER_ITER; ++r) {
+      dv[r] = (it * ROWS_PER_ITER + r) * DVGRP + dvl;
+#pragma unroll
+      for (int j = 0; j < KVEC; ++j) s[r][j] = rec_unpack(cur[r][j]);
+    }
+#endif
 #pragma unroll
     for (int r = 0; r < ROWS_PER_ITER; ++r) {
       float m = 0.0f, aq = 0.0f;
@@ -523,6 +548,14 @@ extern "C" __global__ __launch_bounds__(128, KDA_MINB) void kern_k3_kda_core(
         STST(p + 8 * j, rec_pack(o));
       }
     }
+#if !KDA_SMEM_STATE
+    if (it + 1 < PASSES) {
+#pragma unroll
+      for (int r = 0; r < ROWS_PER_ITER; ++r)
+#pragma unroll
+        for (int j = 0; j < KVEC; ++j) cur[r][j] = nxt[r][j];
+    }
+#endif
   }
   __syncthreads();
 

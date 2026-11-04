@@ -168,6 +168,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         mla_short = flavor.p_short(mla_short)
     state_bytes = 2 if kda_state == "bf16" else 4
     kda_state_defs = {"KDA_STATE_BF16": 1} if kda_state == "bf16" else {}
+    # the register build's state rows a lane holds a pass, packed, twice over (the next pass's in flight):
+    # as many as 128 registers a thread hold without a spill
+    kda_pass_rows = 4 if kda_state == "bf16" else 1
     glue_defs_kv = flavor.P_GLUE
     # P's attention on e4m3 (q and the expanded k | v cast), the FMHA's fp8 builds
     fp8_attn = chunk and flavor.P_FP8_ATTN
@@ -316,7 +319,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                     ({"KDA_SMEM_STATE": 1, "ROWS_PER_ITER": 1, "KDA_PDL": 1}, HEAD_DIM * HEAD_DIM * state_bytes,
                      {"max": kda_smem_rows},
                      {"pdl": True}),
-                    ({"KDA_MINB": 4, "ROWS_PER_ITER": 2}, 0, {"min": kda_smem_rows + 1}, {}))]},
+                    ({"KDA_MINB": 4, "ROWS_PER_ITER": kda_pass_rows}, 0, {"min": kda_smem_rows + 1}, {}))]},
         },
         "mla_attn": flavor.d_attn_op(g),
         } if decode else {}),
