@@ -1,0 +1,115 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""The linear-attention operation family (GDN, KDA, GDN-2, GDP, Mamba-2)."""
+
+from typing import Any
+
+_LAZY_EXPORTS = {
+    "gated_delta_net": ("cudnn.linear_attention.ops", "gated_delta_net"),
+    "kimi_delta_attention": ("cudnn.linear_attention.ops", "kimi_delta_attention"),
+    "gated_delta_net_v2": ("cudnn.linear_attention.ops", "gated_delta_net_v2"),
+    "gated_delta_product": ("cudnn.linear_attention.ops", "gated_delta_product"),
+    "gated_delta_net_summary": ("cudnn.linear_attention.ops", "gated_delta_net_summary"),
+    "kimi_delta_attention_summary": ("cudnn.linear_attention.ops", "kimi_delta_attention_summary"),
+    "gated_delta_net_v2_summary": ("cudnn.linear_attention.ops", "gated_delta_net_v2_summary"),
+    "gated_delta_product_summary": ("cudnn.linear_attention.ops", "gated_delta_product_summary"),
+    "gated_delta_net_summary_bwd": ("cudnn.linear_attention.ops", "gated_delta_net_summary_bwd"),
+    "kimi_delta_attention_summary_bwd": ("cudnn.linear_attention.ops", "kimi_delta_attention_summary_bwd"),
+    "gated_delta_net_v2_summary_bwd": ("cudnn.linear_attention.ops", "gated_delta_net_v2_summary_bwd"),
+    "gated_delta_product_summary_bwd": ("cudnn.linear_attention.ops", "gated_delta_product_summary_bwd"),
+    "mamba2": ("cudnn.linear_attention.ops", "mamba2"),
+    "mamba2_summary": ("cudnn.linear_attention.ops", "mamba2_summary"),
+    "mamba2_summary_bwd": ("cudnn.linear_attention.ops", "mamba2_summary_bwd"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    try:
+        module_name, attr_name = _LAZY_EXPORTS[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    import importlib
+
+    value = getattr(importlib.import_module(module_name), attr_name)
+    globals()[name] = value
+    return value
+
+
+__all__ = list(_LAZY_EXPORTS)
+
+
+# --- family factories -------------------------------------------------------
+def _collect(ids, *specs):
+    """Build the engines named in ``ids``, tolerating a missing dependency.
+
+    ``ids`` is ``{name: engine_id}`` from engines/manifest.py, the single source
+    of engine ids. A missing optional dependency must cost only the engine that
+    needs it, never the whole family -- the manifest's own ImportError guard is
+    family-wide, so per-engine tolerance has to live here.
+    """
+    import importlib
+    import logging
+
+    out = []
+    for name, module, attr in specs:
+        if name not in ids:
+            continue
+        try:
+            engine = getattr(importlib.import_module(module), attr)()
+        except ImportError as exc:
+            logging.getLogger(__name__).info("engine %s is unavailable in this environment: %s", name, exc)
+            continue
+        engine.engine_id = ids[name]
+        out.append(engine)
+    return out
+
+
+def GdnEngines(ids):
+    """The GDN family, frost first and cuTile second (candidate order, not rank)."""
+    return _collect(
+        ids,
+        ("gdn_frost", "cudnn.linear_attention.frost.gdn_engine", "GdnFrostEngine"),
+        ("gdn_cutile", "cudnn.linear_attention.cutile.gdn_engine", "GdnCuTileEngine"),
+        ("gdn_summary_frost", "cudnn.linear_attention.frost.gdn_engine", "GdnSummaryFrostEngine"),
+    )
+
+
+def KdaEngines(ids):
+    """The KDA family: frost, cuTile, the CAKE C16 training route, and the Hopper sm90 path."""
+    return _collect(
+        ids,
+        ("kda_frost", "cudnn.linear_attention.frost.kda_engine", "KdaFrostEngine"),
+        ("kda_cutile", "cudnn.linear_attention.cutile.kda_engine", "KdaCuTileEngine"),
+        ("kda_summary_frost", "cudnn.linear_attention.frost.kda_engine", "KdaSummaryFrostEngine"),
+        ("kda_cake", "cudnn.linear_attention.cake.kda_engine", "KdaCakeEngine"),
+        ("kda_hopper", "cudnn.linear_attention.hopper.kda_engine", "KdaHopperEngine"),
+        ("kda_hopper_cuda", "cudnn.linear_attention.hopper.cuda_engine", "KdaHopperCudaEngine"),
+    )
+
+
+def Gdn2Engines(ids):
+    """The GDN-2 family."""
+    return _collect(
+        ids,
+        ("gdn2_frost", "cudnn.linear_attention.frost.gdn2_engine", "Gdn2FrostEngine"),
+        ("gdn2_summary_frost", "cudnn.linear_attention.frost.gdn2_engine", "Gdn2SummaryFrostEngine"),
+    )
+
+
+def GdpEngines(ids):
+    """The GDP family, the FROST GDN kernels behind an engine-side sub-token expansion."""
+    return _collect(
+        ids,
+        ("gdp_frost", "cudnn.linear_attention.frost.gdp_engine", "GdpFrostEngine"),
+        ("gdp_summary_frost", "cudnn.linear_attention.frost.gdp_engine", "GdpSummaryFrostEngine"),
+    )
+
+
+def Mamba2Engines(ids):
+    """The Mamba-2 SSD family: the FROST chunk-128 kernels in the natural orientation."""
+    return _collect(
+        ids,
+        ("mamba2_frost", "cudnn.linear_attention.frost.mamba2_engine", "Mamba2FrostEngine"),
+        ("mamba2_summary_frost", "cudnn.linear_attention.frost.mamba2_engine", "Mamba2SummaryFrostEngine"),
+    )
