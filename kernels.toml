@@ -71,6 +71,13 @@ source = "source/flashinfer-cake-k3-mla/cake_kimi_k3_mla_fp8_paged_attention_ea1
 build = "source/flashinfer-cake-k3-mla/build.sh"
 upstream = "FlashInfer 3637083a, csrc/cake_kimi_k3_mla (Cake-generated, Apache-2.0)"
 
+[kernels."cudnn_frost_kda"]
+sha256 = "2d9667fe1f7ae595c36803c564cc9cc2a92dcfd9a0c50bb05e23c7bcff663e71"
+prebuilt = "prebuilt/cudnn_frost_kda.cubin"
+source = "source/cudnn-frost-kda/cudnn/linear_attention/frost/kernel/kda_prefill_f16.py"
+build = "source/cudnn-frost-kda/build.py"
+upstream = "cuDNN frontend 1.32.0 (nvidia-cudnn-frontend wheel), FROST KDA prefill, CuTe DSL 4.8.0 (Apache-2.0 / MIT)"
+
 [kernels."flash_kda_d128_varlen"]
 sha256 = "751d1f12b73863328877fa69595a8ac4436b985905460f374ab34d6a672c5575"
 prebuilt = "prebuilt/flash_kda_d128_varlen.cubin"
