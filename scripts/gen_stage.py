@@ -49,8 +49,9 @@ the group is checked against (step/, scripts/compare_steps.py). `--layers 2`
 
 K3.1's MLA layers are DSA layers (scripts/k31_dsa.py): over the fp8 cache, P and a one-GPU D score the
 keys with the indexer and attend each row's top 2048 through TRT-LLM gen's sparse MLA in place of the
-dense passes above; under DCP each member scores its own positions, the members' top-k merge by an
-all-gather, and the sparse partials meet in k3_dcp's SPARSE exchange.
+dense passes above; under DCP each member scores its own positions, pushes its top-k into every
+member's Lamport stage, each member merges them once all have landed, and the sparse partials meet in
+k3_dcp's SPARSE exchange.
 
 `--kv` picks the MLA cache: SGLang's fp8 (scripts/k3_kv_fp8.py, the default)
 or bf16 (scripts/k3_kv_bf16.py). A flavor owns its page bytes, D's absorb,
@@ -1058,7 +1059,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                         k31_dsa.steps(step, w, L, kv, f"idx.{i}", False, b("mla_gate"), max_pages, max_ctx // tp,
                                       b("q_partial"), exchange=(
                                           b("dcp_lamport"), b("dcp_lamport_peers"), b("dcp_state"), b("tp_err"),
-                                          {"rank": "tp"}, B, i64(dcp_stage), i64(TP_TIMEOUT_NS)) if xchg else None)
+                                          {"rank": "tp"}, B, i64(dcp_stage), i64(TP_TIMEOUT_NS)) if xchg else None,
+                                      select=(b("tp_err"), i64(TP_TIMEOUT_NS),
+                                              i64(k31_dsa.cand_stage(seqs_max, tp))) if xchg else None)
                     else:
                         step(L + "absorb", "mla_absorb", b("q_partial"), w("w_kv_b"), b("q_abs"), B)
                         flavor.d_attn_steps(step, w, L, kv, g)
@@ -1329,7 +1332,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     # -0.0 before the first allreduce, and a carry starts at zero.
     init = ([{"label": "tp_init", "op": "tp_lamport_init_bf16", "args": [b("tp_ar_lamport"), i64(3 * ar_stage)]}]
             if xchg else []) + (
-        [{"label": "dcp_init", "op": "dcp_init", "args": [b("dcp_lamport"), i64(3 * dcp_stage)]}] if xchg and mla else [])
+        [{"label": "dcp_init", "op": "dcp_init", "args": [b("dcp_lamport"), i64(3 * dcp_stage)]}] if xchg and mla else []) + (
+        [{"label": "idx_init", "op": "idx_init",
+          "args": [b("idx_lamport"), i64(3 * k31_dsa.cand_stage(seqs_max, tp))]}] if xchg and mla and dsa else [])
     if init:
         programs["tp_init"] = kern_manifest.program(init, once=True)
     m = {

@@ -176,30 +176,47 @@ extern "C" __global__ void k31_topk_slots(int* __restrict__ ind, const int* __re
 }
 
 // D, under DCP: a member's local top-k (local positions, -1 past its count) as candidates for the
-// group's merge, (score, global position) per slot as two words: the bf16 score widened, the position;
-// local position l of member `rank` is global position l * W + rank (dealt one position a member).
-// An empty slot is (-inf, -1).
-//   grid (R), block 256
+// group's merge, pushed into slot `rank` of every member's stage (a TensorRT-LLM Lamport one-shot on
+// kern's peer ABI, as peer_allreduce_bf16.cu runs it): a stage is [W][R][2048] candidates, member-major,
+// a candidate two words, the score's ordered bf16 bits (16 wide) and its global position + 1 (0: an
+// empty slot). Neither word is ever 0xffffffff, the poison that says "not arrived". Local position l of
+// member `rank` is global position l * W + rank (dealt one position a member). Stages rotate through
+// state[2], which k31_dcp_select advances; every stage is poisoned once by k31_dcp_poison.
+//   grid (R), block 256: a thread pushes two adjacent candidates as one 16-byte word
+#define DCP_POISON 0xffffffffu
+__device__ __forceinline__ uint2 dcp_word(const bf16* __restrict__ row, int l, int W, int rank) {
+  if (l < 0) return make_uint2(0u, 0u);
+  const unsigned u = __bfloat16_as_ushort(row[l]);
+  return make_uint2(u & 0x8000u ? ~u & 0xffffu : u | 0x8000u, (unsigned)(l * W + rank) + 1u);
+}
+
 extern "C" __global__ void k31_dcp_pack(const bf16* __restrict__ logits, int stride, const int* __restrict__ ind,
-                                        int rank, int W, float2* __restrict__ cand) {
+                                        int rank, int W, int R, const unsigned long long* __restrict__ peers,
+                                        const int* __restrict__ state, long long stage_bytes) {
   const int r = blockIdx.x;
-  for (int i = threadIdx.x; i < TOPK; i += blockDim.x) {
-    const int l = ind[(size_t)r * TOPK + i];
-    cand[(size_t)r * TOPK + i] = l < 0 ? make_float2(-INFINITY, __int_as_float(-1))
-                                       : make_float2(bf(logits[(size_t)r * stride + l]), __int_as_float(l * W + rank));
+  const long long at = (long long)(state[2] % 3) * stage_bytes + (((long long)rank * R + r) * TOPK) * 8;
+  const bf16* row = logits + (size_t)r * stride;
+  for (int i = 2 * threadIdx.x; i < TOPK; i += 2 * blockDim.x) {
+    const uint2 a = dcp_word(row, ind[(size_t)r * TOPK + i], W, rank),
+                b = dcp_word(row, ind[(size_t)r * TOPK + i + 1], W, rank);
+    const uint4 v = make_uint4(a.x, a.y, b.x, b.y);
+    for (int q = 0; q < W; ++q) *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(peers[q]) + at + (long long)i * 8) = v;
   }
 }
 
+// Every stage of a member's candidate buffer, poisoned once before its first step.
+extern "C" __global__ void k31_dcp_poison(uint4* __restrict__ buf, long long bytes) {
+  const uint4 p = make_uint4(DCP_POISON, DCP_POISON, DCP_POISON, DCP_POISON);
+  for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < bytes / 16; i += (long long)gridDim.x * blockDim.x)
+    buf[i] = p;
+}
+
 // vLLM's order of the merge (dcp_indexer_cutedsl.py stable_key): a higher score first, a smaller
-// global position among equal scores; an empty candidate is 0, below everything. A score is a widened
-// bf16, so its ordered bits are 16 wide; a global position is below 2^24. 40 bits, five radix digits.
+// global position among equal scores; an empty candidate is 0, below everything. A global position is
+// below 2^24, so the key is the score's 16 ordered bits over 24 of position: 40 bits, five radix digits.
 #define KEY_POS 24
-__device__ __forceinline__ unsigned long long stable_key(float2 c) {
-  const int g = __float_as_int(c.y);
-  if (g < 0) return 0ull;
-  const unsigned b = __float_as_uint(c.x);
-  const unsigned s = (b ^ ((b & 0x80000000u) ? 0xffffffffu : 0x80000000u)) >> 16;
-  return ((unsigned long long)s << KEY_POS) | ((1u << KEY_POS) - 1 - (unsigned)g);
+__device__ __forceinline__ unsigned long long stable_key(uint2 w) {
+  return w.y ? ((unsigned long long)w.x << KEY_POS) | ((1u << KEY_POS) - w.y) : 0ull;
 }
 
 #ifndef DCP_W
@@ -208,15 +225,19 @@ __device__ __forceinline__ unsigned long long stable_key(float2 c) {
 #define SEL_THREADS 1024
 #define SEL_PER (DCP_W * TOPK / SEL_THREADS)  // 16 candidates a thread at W = 8
 
-// The group's top 2048 of a row from every member's candidates (cand [W][R][2048], member-major as
-// an all-gather lays them out), and of those the positions this member holds, as cache slots
-// through its page table, -1 after them: thread t owns candidates t + 1024 i, and the slots go out in
-// (t, i) order, a fixed order of the candidates, so the loads coalesce and the result never depends on
-// the schedule. lens is their count, at least 1 for
-// the attention (a row with none attends slot 0, live 0 says to discard it); live the true count.
-//   grid (R), block 1024, W = DCP_W
+// The group's top 2048 of a row from every member's candidates, waited for in this member's stage
+// (k31_dcp_pack), and of those the positions this member holds, as cache slots through its page
+// table, -1 after them: thread t owns candidates t + 1024 i, and the slots go out in (t, i) order, a
+// fixed order of the candidates, so the loads coalesce and the result never depends on the schedule.
+// lens is their count, at least 1 for the attention (a row with none attends slot 0, live 0 says to
+// discard it); live the true count. The blocks re-poison the stage the previous call read, and the
+// last to arrive advances the stage: state [8] starts zeroed, [0] block counter, [2] stage, [4..5]
+// i64 bytes to re-poison next call. A member whose candidates do not show within `timeout_ns` is
+// recorded in `err` as 1 + its rank, then the kernel traps.
+//   grid (R), every block resident at once; block 1024, W = DCP_W
 extern "C" __global__ void __launch_bounds__(SEL_THREADS) k31_dcp_select(
-    const float2* __restrict__ cand, int R, int rank, const int* __restrict__ block_table, int max_pages,
+    const uint8_t* __restrict__ lamport, int* state, int* err, long long stage_bytes, long long timeout_ns,
+    int R, int rank, const int* __restrict__ block_table, int max_pages,
     int* __restrict__ ind, int* __restrict__ lens, int* __restrict__ live) {
   constexpr int W = DCP_W;
   __shared__ unsigned whist[SEL_THREADS / 32][256];  // a warp's own: the top digit is mostly one bin
@@ -225,11 +246,44 @@ extern "C" __global__ void __launch_bounds__(SEL_THREADS) k31_dcp_select(
   __shared__ unsigned long long s_prefix;
   __shared__ unsigned s_need, s_found;
   const int r = blockIdx.x, t = threadIdx.x;
+  const int flag = state[2];
+  long long* clear_ptr = reinterpret_cast<long long*>(state + 4);
+  const long long clear_count = *clear_ptr;
+  __syncthreads();
+  if (t == 0) atomicAdd(state, 1);
+  const uint2* stage = reinterpret_cast<const uint2*>(lamport + (long long)(flag % 3) * stage_bytes);
   unsigned long long key[SEL_PER];
+  int fail = 0;
 #pragma unroll
   for (int i = 0; i < SEL_PER; ++i) {
     const int c = t + i * SEL_THREADS;  // candidate c of the row: member c / 2048, slot c % 2048
-    key[i] = stable_key(cand[((size_t)(c / TOPK) * R + r) * TOPK + c % TOPK]);
+    const uint2* p = stage + ((size_t)(c / TOPK) * R + r) * TOPK + c % TOPK;
+    uint2 w;
+    unsigned long long t0 = 0;
+    while (true) {
+      asm volatile("ld.volatile.global.v2.u32 {%0, %1}, [%2];" : "=r"(w.x), "=r"(w.y) : "l"(p));
+      if (w.x != DCP_POISON && w.y != DCP_POISON) break;
+      unsigned long long now;
+      asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+      if (t0 == 0) {
+        t0 = now;
+      } else if ((long long)(now - t0) > timeout_ns) {
+        fail = 1 + c / TOPK, w = make_uint2(0u, 0u);
+        break;
+      }
+    }
+    key[i] = stable_key(w);
+  }
+  if (fail) {
+    atomicMax(err, fail);
+    __threadfence_system();
+    __trap();
+  }
+  {
+    uint4* clear = reinterpret_cast<uint4*>(const_cast<uint8_t*>(lamport) + (long long)((flag + 2) % 3) * stage_bytes);
+    const uint4 poison = make_uint4(DCP_POISON, DCP_POISON, DCP_POISON, DCP_POISON);
+    for (long long i = (long long)r * SEL_THREADS + t; i < clear_count / 16; i += (long long)gridDim.x * SEL_THREADS)
+      clear[i] = poison;
   }
   // the 2048-th largest key by an 8-bit MSB-first radix select; keys are distinct but 0. A pass ends
   // the search once the threshold's digit bin is taken whole.
@@ -313,4 +367,11 @@ extern "C" __global__ void __launch_bounds__(SEL_THREADS) k31_dcp_select(
     if (pos[i] >= 0) row[at++] = bt[pos[i] / PAGE] * PAGE + pos[i] % PAGE;
   for (int i = total + t; i < TOPK; i += SEL_THREADS) row[i] = i == 0 ? 0 : -1;
   if (t == 0) lens[r] = total ? (int)total : 1, live[r] = (int)total;
+  if (r == 0 && t == 0) {
+    while (*reinterpret_cast<volatile int*>(state) != (int)gridDim.x) {
+    }
+    state[2] = (flag + 1) % 3;
+    *clear_ptr = (long long)W * R * TOPK * 8;
+    state[0] = 0;
+  }
 }
