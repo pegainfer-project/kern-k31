@@ -36,13 +36,13 @@ includes = ["deepgemm"]
 # K3.1's DSA glue: the indexer key into its cache, the query and head weights, the key stream the
 # MQA logits read, the top-k as cache slots. Ours, after vLLM's K3.1 math.
 [kernels."k31_dsa"]
-sha256 = "8bbdb8ff22de1e5cdbd1acaecef54b87103a62c32b9cc44b0c032c6af9fb9e99"
+sha256 = "e1b3095adfe59e0bf3a004e53c9935f7eaf49e4f50ace6d7de61b02c3e571341"
 source = "source/k31_dsa.cu"
 flags = "plain"
 
 # D's candidate exchange with a candidate in one word, for a member of fewer than 65534 positions.
 [kernels."k31_dsa+CAND32=1"]
-sha256 = "672d7a3847f6fc456675a6883da4a79366c2cd56a3a4caba55432c57f5aec62d"
+sha256 = "e72620765e6f1fa2912ded01d2c3b86620f054176d5d03c5f28cc48d84458873"
 source = "source/k31_dsa.cu"
 flags = "plain"
 defines = { CAND32 = 1 }
