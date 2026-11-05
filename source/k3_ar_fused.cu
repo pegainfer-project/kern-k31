@@ -43,7 +43,7 @@
 //   `err` gets 1 + the rank whose data did not show within `timeout_ns`, then the kernel traps.
 //   `lamport` holds the three stages, then NRANKS handshake words (the first call's, below).
 //   `state` [8 + 2 * KGRID] starts zeroed: [6] the handshake done, [8 + 2b] block b's stage,
-//   [9 + 2b] the vectors it re-poisons next call.
+//   [9 + 2b] the shape of the call that wrote the stage it re-poisons next call.
 //
 // The residual rows around them:
 //   kern_k3_land_add2_attnres_rms_nb<NB>   a layer's closing add, then the next layer's mix and norm:
@@ -141,8 +141,8 @@ struct Lamport {
   uint4* const* slot;  // this rank's slot in every peer's stage (shared memory)
   const uint4* mine;   // this rank's stage
   uint4* clear_buf;    // the previous call's stage
-  long long clear_count, tot;
-  int phase;
+  long long tot;
+  int phase, clear_rows, clear_width;  // the previous call's rows and vectors a row
 };
 
 // A deadline that passes is a broken group, never a slow one: the kernel records the late
@@ -174,6 +174,8 @@ __device__ __forceinline__ void lamport_handshake(uint8_t* lamport, const unsign
   }
 }
 
+// state[9 + 2 * block]: the call's rows above CLEAR_SHIFT bits, its vectors a row below
+#define CLEAR_SHIFT 12
 // Three stages rotate by call: a call pushes into stage `phase`, and re-poisons the stage of
 // the call before it (whose sums are done everywhere: this call's pushes are in) for the call
 // after next. Every block keeps the rotation itself (state[8 + 2 * block]: the phase, then
@@ -186,7 +188,8 @@ __device__ __forceinline__ Lamport lamport_open(uint8_t* lamport, const unsigned
   Lamport l;
   l.slot = s_slot;
   l.phase = state[8 + 2 * blockIdx.x];
-  l.clear_count = state[9 + 2 * blockIdx.x];
+  l.clear_rows = state[9 + 2 * blockIdx.x] >> CLEAR_SHIFT;
+  l.clear_width = state[9 + 2 * blockIdx.x] & ((1 << CLEAR_SHIFT) - 1);
   l.tot = tot;
   if (threadIdx.x < NRANKS)
     s_slot[threadIdx.x] = reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(peers[threadIdx.x]) +
@@ -198,11 +201,24 @@ __device__ __forceinline__ Lamport lamport_open(uint8_t* lamport, const unsigned
   return l;
 }
 
-__device__ __forceinline__ void lamport_clear(const Lamport& l) {
+// Only the words the previous call wrote: a one-shot's every slot of every row; a two-shot's row q in slot
+// q % NRANKS alone (its owner's sum, or this rank's own push into its own row), and the other slots of the rows
+// this rank owns (the peers' pushes): (B + 7 B / 8) rows' vectors instead of 8 B. The grid's last blocks first:
+// the row blocks are the first, and a small batch's words then fall on blocks that hold no row.
+__device__ __forceinline__ void lamport_clear(const Lamport& l, int rank) {
   const uint4 poison = make_uint4(0x80008000u, 0x80008000u, 0x80008000u, 0x80008000u);
-  for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < l.clear_count;
-       i += (long long)gridDim.x * blockDim.x)
-    l.clear_buf[i] = poison;
+  const int w = l.clear_width, tot = l.clear_rows * w, stride = KGRID * KTHREADS;
+  const int first = (KGRID - 1 - (int)blockIdx.x) * KTHREADS + (int)threadIdx.x;
+  if (l.clear_rows < TWO_SHOT_ROWS) {
+    for (int i = first; i < NRANKS * tot; i += stride) l.clear_buf[i] = poison;
+    return;
+  }
+  for (int i = first; i < tot; i += stride) l.clear_buf[i / w % NRANKS * tot + i] = poison;
+  const int own = (l.clear_rows - rank + NRANKS - 1) / NRANKS * w;
+  for (int i = first; i < (NRANKS - 1) * own; i += stride) {
+    const int q = i / own, k = i - q * own, s = q + (q >= rank);
+    l.clear_buf[s * tot + (rank + NRANKS * (k / w)) * w + k % w] = poison;
+  }
 }
 
 // Vector i of a call's `tot` this thread pushes, or -1: runs of PUSH_RUN vectors dealt to the
@@ -325,11 +341,11 @@ __device__ __forceinline__ unsigned* l2_stamp(int* state, const Lamport& l) {
   return reinterpret_cast<unsigned*>(state) + 2 * l.phase;
 }
 
-__device__ __forceinline__ void lamport_close(const Lamport& l, int* state, int* err, int fail) {
+__device__ __forceinline__ void lamport_close(const Lamport& l, int* state, int* err, int fail, int B, int width) {
   if (fail) give_up(err, fail);
   if (threadIdx.x == 0) {
     state[8 + 2 * blockIdx.x] = (l.phase + 1) % 3;
-    state[9 + 2 * blockIdx.x] = (int)(NRANKS * l.tot);
+    state[9 + 2 * blockIdx.x] = B << CLEAR_SHIFT | width;
     if (blockIdx.x == 0) state[6] = 1;
   }
 }
@@ -710,7 +726,7 @@ __device__ __forceinline__ void ar_attnres_rms(const uint4* __restrict__ x, uint
   }
   if (ANY_BATCH && two)
     for (long long j = two_shot_rest(); j < tot; j += PUSH_STRIDE) l.slot[(j / KVEC) % NRANKS][j] = unpoison4(x[j]);
-  lamport_clear(l);
+  lamport_clear(l, rank);
   unsigned* const stamp = l2_stamp(state, l);
   l2_load_while(pf, pf_bytes, B, stamp, AR_GRACE_NS, state + 7);
   l2_demote(dm, dm_bytes, B);
@@ -748,7 +764,7 @@ __device__ __forceinline__ void ar_attnres_rms(const uint4* __restrict__ x, uint
     }
     row_prefix_finish<NB>(cand, r, pv, sc, normed + (size_t)q * KH, t, s);
   }
-  lamport_close(l, state, err, fail);
+  lamport_close(l, state, err, fail, B, KVEC);
 }
 
 #define AR_ATTNRES_ENTRY(NB)                                                                                      \
@@ -984,7 +1000,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
                                  : shared[(long long)rj * KVEC + cj - KLATV];
       l.slot[rj % NRANKS][j] = unpoison4(u);
     }
-  lamport_clear(l);
+  lamport_clear(l, rank);
   unsigned* const stamp = l2_stamp(state, l);
   l2_load_while(pf, pf_bytes, B, stamp, FIN_GRACE_NS, state + 7);
   l2_load_while<true>(pf2, pf2_bytes, B, stamp, FIN_GRACE_NS, state + 7);
@@ -1034,7 +1050,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
       stv(latent_norm + (long long)q * KLAT + t * 8, o);
     }
   }
-  lamport_close(l, state, err, fail);
+  lamport_close(l, state, err, fail, B, ROWV);
 }
 
 // ---------------------------------------------------------------- embedding + K1a of the first layer
