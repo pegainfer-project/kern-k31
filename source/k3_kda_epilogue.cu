@@ -17,7 +17,7 @@
 // Block (i < rows, y) gates row i's heads 32y..32y+32, 16 lanes a head: lane k
 // sums the squares of K11's lane group (columns 32(k/4) + 4l + k%4, l < 8) in
 // K11's butterfly order, then finishes columns 8k..8k+8 with K11's operations,
-// so the result is K11's (and k3_kda_rec.cu's gate CTAs') bit for bit. Block
+// so the result is K11's bit for bit. Block
 // (rows + j, s) moves sequence j's last three rows of stream s into its window,
 // each thread reading a column's three rows before writing them, so a
 // sequence shorter than three rows shifts its old window correctly.

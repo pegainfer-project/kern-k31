@@ -79,7 +79,7 @@
 // The w_f_b tile (swizzled in shared memory) is summed by thread d over its row
 // d as a pairwise tree -- see the comment on the ga block.
 //
-// -DKDA_CONV=1 folds K2 (k3_conv_silu.cu) into the prologue: the block's
+// -DKDA_CONV=1 folds K2, the short conv + SiLU, into the prologue: the block's
 // thread d runs the short conv + SiLU of column base + d of the q, k and v
 // streams itself (the same f32 sums and bf16 landings, the window shifted in
 // place in the row's line), so conv_q / conv_k / conv_v never touch memory.

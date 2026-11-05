@@ -1,5 +1,5 @@
 // K11 `k3_kda_out_gate` — the K3 epilogue on its own, for span rows: the
-// FlashKDA span kernel (K8) writes the raw attention of the span's rows
+// span's KDA kernel (K8) writes the raw attention of the span's rows
 // 0..span into `attn`, and this finishes them into the batch rows
 // [*span_at, +span) of `gated` with the output rms, gamma_o and the sigmoid
 // gate, with K3's landing points. Contract: docs/k3-kernel-abi.md section K11.

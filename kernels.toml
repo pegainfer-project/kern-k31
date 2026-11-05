@@ -78,23 +78,11 @@ source = "source/cudnn-frost-kda/cudnn/linear_attention/frost/kernel/kda_prefill
 build = "source/cudnn-frost-kda/build.py"
 upstream = "cuDNN frontend 1.32.0 (nvidia-cudnn-frontend wheel), FROST KDA prefill, CuTe DSL 4.8.0 (Apache-2.0 / MIT)"
 
-[kernels."flash_kda_d128_varlen"]
-sha256 = "751d1f12b73863328877fa69595a8ac4436b985905460f374ab34d6a672c5575"
-prebuilt = "prebuilt/flash_kda_d128_varlen.cubin"
-source = "source/flash-kda/kern_flash_kda.cu"
-build = "source/flash-kda/build.sh"
-defines = { KERN_VARLEN = 1 }
-
 [kernels."flashinfer_moe_routing"]
 sha256 = "d797b1d2edad680ecc0578d4d8a57d5f1a6a364bbb3acd7ecd4d6270c6be4ae0"
 prebuilt = "prebuilt/flashinfer_moe_routing.cubin"
 source = "source/flashinfer-moe-routing/kern_moe_routing.cu"
 build = "source/flashinfer-moe-routing/build.sh"
-
-[kernels."k3_conv_silu+HEADS=12"]
-sha256 = "1a735a75171c2b313ac85405e0ae89d70e00fe2d410abdc85cc951fa434ad9ad"
-source = "source/k3_conv_silu.cu"
-defines = { HEADS = 12 }
 
 [kernels."k3_dcp"]
 sha256 = "88ad388058c3907de8adbe553667f29f134977d2115e705e2ca75fddc5c95890"
@@ -356,11 +344,6 @@ defines = { KV_FP8 = 1 }
 sha256 = "f99967a68ad95ce97fce73ca3d6e2897a50f55d7a62a64a577d206ef9f458a65"
 source = "source/k3_kda_epilogue.cu"
 defines = { KE_LD = 49408 }
-
-[kernels."k3_kda_rec+K12_LD=49408"]
-sha256 = "cb802ae088c58b76fdcd5e3062dda6993a4903ba3b17ba5498a2ac55cd7439da"
-source = "source/k3_kda_rec.cu"
-defines = { K12_LD = 49408 }
 
 [kernels."k3_kda_core+KDA_CONV=1+KDA_PDL=1+KDA_SMEM_STATE=1+ROWS_PER_ITER=1"]
 sha256 = "050e86b50ad1354a67693a9479a9d344b51f66d79cdeab38d26dd404248607b2"
