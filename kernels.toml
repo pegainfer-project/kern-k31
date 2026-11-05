@@ -309,12 +309,12 @@ source = "source/k3_head.cu"
 defines = { NRANKS = 8 }
 
 [kernels."k3_span_gather+K9_LD=49408+PARTIAL_BF16=1"]
-sha256 = "8b4a88ab8182727ddf73aa330e3a979513fe36823a5c92a8d5ce16d847bc45a1"
+sha256 = "952933077771d55323c53c25747eea2b1d91cb435ebeaa810e620d1be1beee09"
 source = "source/k3_span_gather.cu"
 defines = { K9_LD = 49408, PARTIAL_BF16 = 1 }
 
 [kernels."k3_span_gather+K9_LD=49408+KDA_STATE_BF16=1+PARTIAL_BF16=1"]
-sha256 = "efd9f1d1091899947763d8de18e9c23d093533246a579cfe13adcd35c741270d"
+sha256 = "f10681db0fd6d3deadc80362a59c737b3ccc075eac2f5eeb37d450ca1dbea553"
 source = "source/k3_span_gather.cu"
 defines = { K9_LD = 49408, KDA_STATE_BF16 = 1, PARTIAL_BF16 = 1 }
 
@@ -426,6 +426,11 @@ defines = { BN = 64, CTA_KB = 110, EVEN = 1, SPLITS = 3 }
 sha256 = "a16d706fed7ef7b1ef9d801a2907092fbcc5fb61b92f38c6c2b505259d4d3bb2"
 source = "source/k3_mla_glue.cu"
 defines = { KV_FP8 = 1 }
+
+[kernels."k3_kda_epilogue+KDA_STATE_BF16=1+KE_LD=49408"]
+sha256 = "f99967a68ad95ce97fce73ca3d6e2897a50f55d7a62a64a577d206ef9f458a65"
+source = "source/k3_kda_epilogue.cu"
+defines = { KDA_STATE_BF16 = 1, KE_LD = 49408 }
 
 [kernels."k3_kda_rec+K12_LD=49408+KDA_STATE_BF16=1"]
 sha256 = "cb802ae088c58b76fdcd5e3062dda6993a4903ba3b17ba5498a2ac55cd7439da"
