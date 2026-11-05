@@ -1,5 +1,5 @@
 // kda_conv_layout.cu: `k3_kda_core`'s CONV_TAP_MAJOR + LINE_GUARD build
-// against the build it varies (the KDA_CONV line layout), on one GPU, bit for
+// against the build it varies (rec and the window in one line), on one GPU, bit for
 // bit. Both run the same random rows over the same states, the base with rec
 // and the window [stream][tap][c] in one line, the variant with rec in its own
 // state and the window [tap][stream][c] in another, each indexed by its own
@@ -9,8 +9,10 @@
 // exactly, and the one slot nobody names is untouched.
 //
 //   nvcc -O2 -std=c++17 -arch=sm_103a kda_conv_layout.cu -o kda_conv_layout -lcuda
-//   ./kda_conv_layout --base <k3_kda_core+HEADS=12+KDA_CONV=1+...cubin> \
-//                     --variant <k3_kda_core+CONV_TAP_MAJOR=1+...+LINE_GUARD=1+...cubin> --B 64 [--smem 65536]
+//   ./kda_conv_layout --base <k3_kda_core+HEADS=12+...cubin> \
+//                     --variant <k3_kda_core+CONV_TAP_MAJOR=1+...+LINE_GUARD=1+...cubin> --B 64 [--rows-at-once 38]
+//
+// Both launch (min(B, rows-at-once), 12) blocks: a batch past that many rows walks them through the blocks.
 //
 // The model constants are the TP8 rank's (12 heads, the fused 6400-column
 // partial). Exit 0 PASS, 1 FAIL, 2 harness or driver error.
@@ -76,18 +78,19 @@ int main(int argc, char** argv) {
   std::string base, variant;
   int B = 64;
   unsigned seed = 1234;
-  int smem = 0;
+  int smem = 65536, at_once = 1 << 30;
   for (int i = 1; i + 1 < argc; i += 2) {
     std::string a = argv[i];
     if (a == "--base") base = argv[i + 1];
     else if (a == "--variant") variant = argv[i + 1];
     else if (a == "--B") B = std::atoi(argv[i + 1]);
     else if (a == "--seed") seed = (unsigned)std::atoi(argv[i + 1]);
-    else if (a == "--smem") smem = std::atoi(argv[i + 1]);  // dynamic smem of both launches (KDA_SMEM_STATE builds)
+    else if (a == "--smem") smem = std::atoi(argv[i + 1]);
+    else if (a == "--rows-at-once") at_once = std::atoi(argv[i + 1]);
     else { std::fprintf(stderr, "unknown option `%s`\n", argv[i]); return 2; }
   }
   if (base.empty() || variant.empty() || B < 2) {
-    std::fprintf(stderr, "usage: kda_conv_layout --base <cubin> --variant <cubin> [--B N >= 2] [--seed N]\n");
+    std::fprintf(stderr, "usage: kda_conv_layout --base <cubin> --variant <cubin> [--B N >= 2] [--rows-at-once G] [--smem bytes] [--seed N]\n");
     return 2;
   }
   CU(cuInit(0));
@@ -151,12 +154,11 @@ int main(int argc, char** argv) {
 
   void* ab[] = {&dp, &dcw, &dwsm, &dwfb, &ddt, &dal, &dgo, &dlines, &dbi, &lb, &dob, &b_, &dat, &span};
   void* av[] = {&dp, &dcw, &dwsm, &dwfb, &ddt, &dal, &dgo, &drec, &dvi, &rb, &dwin, &dvi, &wb, &dov, &b_, &dat, &span};
-  if (smem) {
-    CU(cuFuncSetAttribute(fb, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem));
-    CU(cuFuncSetAttribute(fv, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem));
-  }
-  CU(cuLaunchKernel(fb, B, HEADS, 1, 128, 1, 1, smem, 0, ab, nullptr));
-  CU(cuLaunchKernel(fv, B, HEADS, 1, 128, 1, 1, smem, 0, av, nullptr));
+  CU(cuFuncSetAttribute(fb, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem));
+  CU(cuFuncSetAttribute(fv, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem));
+  const unsigned gx = (unsigned)std::min(B, at_once);
+  CU(cuLaunchKernel(fb, gx, HEADS, 1, 128, 1, 1, smem, 0, ab, nullptr));
+  CU(cuLaunchKernel(fv, gx, HEADS, 1, 128, 1, 1, smem, 0, av, nullptr));
   CU(cuCtxSynchronize());
 
   auto ob = get(dob, poison.size() * 2), ov = get(dov, poison.size() * 2);

@@ -394,7 +394,7 @@ static void run_land_add2(const Opt& o, CUmodule mod) {
                                              g.smem, 0, args, nullptr)); }, roof);
 }
 
-// ---- K3 kda_core (KDA_CONV) -------------------------------------------
+// ---- K3 kda_core (the short conv folded in) ---------------------------
 // `--lds` past 4*INNER is one fused GEMM's row: wsm rides in it at column 4*INNER (beta, then f_a after HEADS
 // columns); otherwise wsm is a WSM-wide partial of its own.
 static void run_kda_core(const Opt& o, CUmodule mod) {
