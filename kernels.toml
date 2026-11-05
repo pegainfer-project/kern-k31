@@ -36,13 +36,13 @@ includes = ["deepgemm"]
 # K3.1's DSA glue: the indexer key into its cache, the query and head weights, the key stream the
 # MQA logits read, the top-k as cache slots. Ours, after vLLM's K3.1 math.
 [kernels."k31_dsa"]
-sha256 = "04891ddc887f587299e3b5a523d839ee6faf024c99a392ef9b9b9adeffe041b7"
+sha256 = "370dafdccd8a5ca8d1cc5ddf27622953b8f2fb17d8f083cccaaf12987506f030"
 source = "source/k31_dsa.cu"
 flags = "plain"
 
 # D's candidate exchange with a candidate in one word, for a member of fewer than 65534 positions.
 [kernels."k31_dsa+CAND32=1"]
-sha256 = "d18b5325e8d26ee0885aa0727da296aa1e37d6864fd01271cfd6d2d381fb8e0d"
+sha256 = "76357fa286606d86f9e51dfbd0d24db9013e9985de7948d028d33589ac7915c9"
 source = "source/k31_dsa.cu"
 flags = "plain"
 defines = { CAND32 = 1 }
@@ -127,6 +127,13 @@ defines = { INNER = 1536, MLA_FUSED = 3648 }
 sha256 = "79b9eb0233f6158ab36db5f6405bb84565d5e51fdf2cddc5130f049e5f8d9882"
 source = "source/k3_mla_prep.cu"
 defines = { INNER = 1536, KV_FP8 = 1, MLA_FUSED = 3648 }
+
+
+# D's wfu GEMM with DSA's indexer columns past the gate (k31_dsa.IDX_KW)
+[kernels."k3_mla_prep+INNER=1536+KV_FP8=1+MLA_FUSED=3808"]
+sha256 = "74cfa5263fa65e542206db38706b891e7ec1271a82da72b7f8721211695c1deb"
+source = "source/k3_mla_prep.cu"
+defines = { INNER = 1536, KV_FP8 = 1, MLA_FUSED = 3808 }
 
 [kernels."k3_mla_vup_gate+HEADS=12"]
 sha256 = "a6b673b9fa7595089c49b403cdf23c8d0224bab53b0b9224fc6392afe87c09c6"
