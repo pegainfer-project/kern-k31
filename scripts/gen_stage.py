@@ -603,7 +603,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                     for d, w in (({}, {"max": one}), ({"ANY_BATCH": 1}, {"min": one + 1})) if w.get("min", 0) <= t_max]
         ops["ar_finalize_rms"] = {
             "params": ["in buffer<bf16>", "in buffer<i32>", "in buffer<f32>", "in buffer<bf16>", *lamport_params,
-                       "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i64", "i64",
+                       "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "i32", "i64", "i64",
                        *PF_PARAMS, *PF_PARAMS],
             "impl": {"launches": ar_launches("kern_k3_ar_finalize_rms", (LATENT + H) // 8)},
         }
@@ -1237,12 +1237,10 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 elif not front:
                     proj(L + "sh_down", b("shared_act"), w("sh_down"), b("moe_flat", shared_at), H, sh_l)
                 if xchg:
-                    # the combine, the sum of both and the latent norm in one launch; fc2's partial read
-                    # past the grid wait (`early` 0): fc2 lets its dependents launch before its output is out,
-                    # and the shared GEMM may run between them
+                    # the combine, the sum of both and the latent norm in one launch
                     step(L + "reduce_mlp", "ar_finalize_rms", b("moe.fc2_out"), b("moe.exp2perm"),
                          b("topk_weight"), b("moe_flat", shared_at), *lamport(), w("gamma_lat"),
-                         b("routed_latent_norm"), b("moe_sum", shared_at), B, i32(0), i64(ar_stage),
+                         b("routed_latent_norm"), b("moe_sum", shared_at), B, i64(ar_stage),
                          i64(TP_TIMEOUT_NS))
                     moe = "moe_sum"
                 else:
