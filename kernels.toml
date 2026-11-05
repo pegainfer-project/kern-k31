@@ -285,56 +285,6 @@ sha256 = "928627f27ea4e05d04f4821042bb1cbbb9624867691fc6ca37f4d015f767599c"
 source = "source/k3_gemm_f32.cu"
 defines = { BN = 32, CTA_KB = 100, SPLITS = 3 }
 
-[kernels."k3_gemm_f32+BN=16+CTA_KB=200+EVEN=1+SPLITS=6"]
-sha256 = "fae3d460bb84bce1219bcda6b5b22aa65b0cbbdf9c1c0b887d7ab5637891e39d"
-source = "source/k3_gemm_f32.cu"
-defines = { BN = 16, CTA_KB = 200, EVEN = 1, SPLITS = 6 }
-
-[kernels."k3_gemm_f32+BN=32+CTA_KB=200+EVEN=1+SPLITS=6"]
-sha256 = "417162412fa4acb2c2c5cab4be6fa663dc7da0c0f1196c4ad251082abe51f832"
-source = "source/k3_gemm_f32.cu"
-defines = { BN = 32, CTA_KB = 200, EVEN = 1, SPLITS = 6 }
-
-[kernels."k3_gemm_f32+BN=48+CTA_KB=200+EVEN=1+SPLITS=6"]
-sha256 = "865050554fec15b55c90bcd169d41979b52648b4501bb4732e56218ba6e871e2"
-source = "source/k3_gemm_f32.cu"
-defines = { BN = 48, CTA_KB = 200, EVEN = 1, SPLITS = 6 }
-
-[kernels."k3_gemm_f32+BM=128+BN=16+CTA_KB=200+EVEN=1+SPLITS=4"]
-sha256 = "b4e16ff432a9dfeee393ef26f690e3cf964ecf00f763ada5e797afb6a4b42f6f"
-source = "source/k3_gemm_f32.cu"
-defines = { BM = 128, BN = 16, CTA_KB = 200, EVEN = 1, SPLITS = 4 }
-
-[kernels."k3_gemm_f32+BN=32+CTA_KB=110+EVEN=1+SPLITS=4"]
-sha256 = "e963dbdd5af1cda2974ca12317b5c4662330f1d02fce940498f26f8543f150cb"
-source = "source/k3_gemm_f32.cu"
-defines = { BN = 32, CTA_KB = 110, EVEN = 1, SPLITS = 4 }
-
-[kernels."k3_gemm_f32+BN=48+CTA_KB=110+EVEN=1+SPLITS=4"]
-sha256 = "8ca8db74903187655f078fea5e39cf96425c457a4873d5bfd83ed780d3f8532c"
-source = "source/k3_gemm_f32.cu"
-defines = { BN = 48, CTA_KB = 110, EVEN = 1, SPLITS = 4 }
-
-[kernels."k3_gemm_f32+BM=128+BN=16+CTA_KB=110+EVEN=1+SPLITS=4"]
-sha256 = "effb4736ca9a5cbcd43813e8b058c3eab0ae1eab19ee55fedb76a5eceaa0e638"
-source = "source/k3_gemm_f32.cu"
-defines = { BM = 128, BN = 16, CTA_KB = 110, EVEN = 1, SPLITS = 4 }
-
-[kernels."k3_gemm_f32+BN=32+CTA_KB=110+EVEN=1+SPLITS=3"]
-sha256 = "eec1f69db18971baea0c67a866d679532b17b57e01e57bd96e77e02cfda0024c"
-source = "source/k3_gemm_f32.cu"
-defines = { BN = 32, CTA_KB = 110, EVEN = 1, SPLITS = 3 }
-
-[kernels."k3_gemm_f32+BN=48+CTA_KB=110+EVEN=1+SPLITS=3"]
-sha256 = "8005f4cfc609c8d8dd5e059bc3cddca26a5d5a2e33fbc2802b64dd857afb1a27"
-source = "source/k3_gemm_f32.cu"
-defines = { BN = 48, CTA_KB = 110, EVEN = 1, SPLITS = 3 }
-
-[kernels."k3_gemm_f32+BN=64+CTA_KB=110+EVEN=1+SPLITS=3"]
-sha256 = "bf51d49fe832a08493743e86d38f860f0194177edc95967b1db7566012a595ca"
-source = "source/k3_gemm_f32.cu"
-defines = { BN = 64, CTA_KB = 110, EVEN = 1, SPLITS = 3 }
-
 [kernels."k3_mla_glue+KV_FP8=1"]
 sha256 = "a16d706fed7ef7b1ef9d801a2907092fbcc5fb61b92f38c6c2b505259d4d3bb2"
 source = "source/k3_mla_glue.cu"
