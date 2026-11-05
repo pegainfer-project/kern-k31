@@ -58,25 +58,26 @@ def tmap(param, dtype, dims, strides, box, swizzle):
         "param": param, "dtype": dtype, "dims": dims, "strides": strides, "box": box, "swizzle": swizzle}}]}}
 
 
-def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1):
+def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1, fold=False):
     """The layer's ops; `rows_max` a call's rows (P) or the batch (D), `max_ctx` a row's keys at most (a
-    member's, under DCP), `gate_stride` the gate's row stride in elements, `tp` D's DCP group."""
+    member's, under DCP), `gate_stride` the gate's row stride in elements, `tp` D's DCP group. `fold`: the
+    indexer's key and head weights come f32 out of the wfu GEMM (idx_key / idx_q's _f32 entries)."""
+    kw_t, f32 = ("in buffer<f32>", "_f32") if fold else ("in buffer<bf16>", "")
     dsa = lambda entry, grid, block, **kw: launch("k31_dsa", entry, grid=grid, block=block, **kw)
     # D's chain from the prep to the exchange launches as programmatic dependents (each kernel waits)
     pdl = {} if chunk else {"pdl": True}
     o = {
         "idx_key": {
-            "params": ["in buffer<bf16>", "i32", "in buffer<bf16>", "in buffer<bf16>", "in buffer<i64>",
-                       "inout state", "i32"],
-            "impl": {"launches": [dsa("k31_idx_key", [{"ceil_div": [T, 4]}, 1, 1], [128, 1, 1], **pdl)]},
+            "params": [kw_t, "i32", "in buffer<bf16>", "in buffer<bf16>", "in buffer<i64>", "inout state", "i32"],
+            "impl": {"launches": [dsa("k31_idx_key" + f32, [{"ceil_div": [T, 4]}, 1, 1], [128, 1, 1], **pdl)]},
         },
         # (q, ldq, weights_proj, ldw, iq, sfq, w, rid, B); P has no request ids
         "idx_q": {
-            "params": ["in buffer<bf16>", "i32", "in buffer<bf16>", "i32", "out buffer<u8>", "out buffer<u32>",
+            "params": ["in buffer<bf16>", "i32", kw_t, "i32", "out buffer<u8>", "out buffer<u32>",
                        "out buffer<bf16>", *([] if chunk else ["out buffer<u32>"]), "i32"],
             "impl": {"launches": [dsa(
-                "k31_idx_q", [T, 1, 1], [256, 1, 1],
-                params=["in buffer<bf16>", "i32", "in buffer<bf16>", "i32", "out buffer<u8>", "out buffer<u32>",
+                "k31_idx_q" + f32, [T, 1, 1], [256, 1, 1],
+                params=["in buffer<bf16>", "i32", kw_t, "i32", "out buffer<u8>", "out buffer<u32>",
                         "out buffer<bf16>", "i64" if chunk else "out buffer<u32>", "i32"],
                 args=[*({"param": i} for i in range(7)), i64(0) if chunk else {"param": 7},
                       {"param": 7 if chunk else 8}], **pdl)]},
@@ -270,9 +271,16 @@ def exchange_op(tail):
               *({"param": i} for i in range(4, len(params)))])]}}
 
 
-def weights(weight, seg, a, n):
-    """The layer's indexer weights, checkpoint prefix `a`, manifest prefix `n`."""
-    weight(n + "idx_kw", [IDX_KW, 7168], [seg(a + "indexer.wk.weight"), seg(a + "indexer.weights_proj.weight")])
+def kw_segs(seg, a):
+    """The indexer's key and head weight projections (wk | weights_proj), checkpoint prefix `a`."""
+    return [seg(a + "indexer.wk.weight"), seg(a + "indexer.weights_proj.weight")]
+
+
+def weights(weight, seg, a, n, kw=True):
+    """The layer's indexer weights, checkpoint prefix `a`, manifest prefix `n`; `kw` false when wk |
+    weights_proj ride in the wfu GEMM (kw_segs)."""
+    if kw:
+        weight(n + "idx_kw", [IDX_KW, 7168], kw_segs(seg, a))
     weight(n + "idx_qw", [IDX_Q, Q_LORA], [seg(a + "indexer.wq_b.weight")])
     weight(n + "idx_kn_w", [ID], [seg(a + "indexer.k_norm.weight")])
     weight(n + "idx_kn_b", [ID], [seg(a + "indexer.k_norm.bias")])
@@ -290,8 +298,9 @@ def cand_stage(seqs_max, tp, max_ctx):
     return tp * seqs_max * HOT * cand_bytes(max_ctx)
 
 
-def buffers(work, bufs, chunk, max_ctx, seqs_max, tp=1):
-    work("idx_kwo", IDX_KW)
+def buffers(work, bufs, chunk, max_ctx, seqs_max, tp=1, fold=False):
+    if not fold:
+        work("idx_kwo", IDX_KW)
     work("idx_qb", IDX_Q)
     work("idx_iq", IDX_Q, "u8")
     work("idx_sfq", IH, "u32")
@@ -327,18 +336,23 @@ def buffers(work, bufs, chunk, max_ctx, seqs_max, tp=1):
                 bufs[x + "_peers"] = {"dtype": "u64", "shape": [tp], "kind": "peer", "of": x, "group": "tp"}
 
 
-def steps(step, w, L, kv, idx, chunk, gate, max_pages, max_ctx, q, exchange=None, select=None, sched=True):
+def steps(step, w, L, kv, idx, chunk, gate, max_pages, max_ctx, q, exchange=None, select=None, sched=True, kw=None):
     """The layer from its input projections to `gated`: `gate` the gate's columns (at ops' stride), `q` the
     q_b output (P's bf16, D's f32), the latent row and q_norm already in place. Under DCP, `exchange`
     (the dcp_exchange call's trailing args) merges the members' partials into this member's heads, and
     `select` (err, timeout, stage bytes) is the candidates' exchange. D's paged logits read DeepGEMM's
     schedule, a function of seq_lens and the rows alone: `sched` false takes the one an earlier layer of
-    the step left in `idx_sched`."""
-    step(L + "idx_kw", "gemm_bf16", b("normed"), w("idx_kw"), b("idx_kwo"), B, i32(IDX_KW), i32(7168), i32(IDX_KW))
-    step(L + "idx_key", "idx_key", b("idx_kwo"), i32(IDX_KW), w("idx_kn_w"), w("idx_kn_b"), b("slot_mapping"),
-         {"state": idx}, B)
+    the step left in `idx_sched`. `kw` (the f32 wk | weights_proj columns, their row stride) when the wfu
+    GEMM projected them, else idx_kw does, bf16."""
+    if kw:
+        kwo, ld = kw
+        iw = dict(kwo, offset=kwo.get("offset", 0) + ID * 4)
+    else:
+        step(L + "idx_kw", "gemm_bf16", b("normed"), w("idx_kw"), b("idx_kwo"), B, i32(IDX_KW), i32(7168), i32(IDX_KW))
+        kwo, ld, iw = b("idx_kwo"), IDX_KW, b("idx_kwo", ID * 2)
+    step(L + "idx_key", "idx_key", kwo, i32(ld), w("idx_kn_w"), w("idx_kn_b"), b("slot_mapping"), {"state": idx}, B)
     step(L + "idx_qb", "gemm_bf16", b("q_norm"), w("idx_qw"), b("idx_qb"), B, i32(IDX_Q), i32(Q_LORA), i32(IDX_Q))
-    step(L + "idx_q", "idx_q", b("idx_qb"), i32(IDX_Q), b("idx_kwo", ID * 2), i32(IDX_KW), b("idx_iq"), b("idx_sfq"),
+    step(L + "idx_q", "idx_q", b("idx_qb"), i32(IDX_Q), iw, i32(ld), b("idx_iq"), b("idx_sfq"),
          b("idx_w"), *([] if chunk else [b("idx_rid")]), B)
     if chunk:
         step(L + "idx_plan", "idx_plan", b("cu_seqlens"), b("seq_lens"), {"var": "seqs"}, b("idx_ks"), b("idx_ke"),

@@ -232,6 +232,10 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     # them): at 6284 columns cuBLAS falls off its nvjet kernels to one twice as slow.
     kfused = fused_l + WSM if chunk or xchg else 0
     mla_fused_l = Q_LORA + KV_A + inner_l
+    # A D member's wfu GEMM also projects DSA's indexer key and head weights (wk | weights_proj): the same
+    # input, one launch; idx_key and idx_q read their f32 columns past the gate.
+    idx_fold = dsa and xchg
+    wfu_l = mla_fused_l + (k31_dsa.IDX_KW if idx_fold else 0)
     # This rank's columns of the shared expert and the dense FFN.
     sh_l, dn_l = SHARED // tp, DENSE_I // tp
     # A D member's MoE front is one GEMM over the router, this rank's LATENT / tp lat_down rows and its shared
@@ -418,7 +422,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                        "i64", "i64", "out buffer<bf16>", "out buffer<bf16>", "i32"],
             # k3_mla_prep.cu's fast path: the norm / append block and a gate block per 4096 columns
             "impl": {"launches": [launch("k3_mla_prep", "kern_k3_mla_prep", grid=[T, 1 + -(-inner_l // 4096), 1],
-                                         defines={"INNER": inner_l, "MLA_FUSED": mla_fused_l, **flavor.D_PREP},
+                                         defines={"INNER": inner_l, "MLA_FUSED": wfu_l, **flavor.D_PREP},
                                          pdl=True)
                                   if tp > 1
                                   else launch("k3_mla_prep", "kern_k3_mla_prep", defines=flavor.D_PREP or None,
@@ -643,7 +647,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     ops.update(bp["ops"])
     if dsa and mla:
         ops.update(k31_dsa.ops(chunk, t_max, seqs_max, max_ctx // tp, max_pages, mla_fused_l if chunk else inner_l,
-                               tp))
+                               tp, fold=idx_fold))
     if chunk and not mx:
         ops["k3_concat_cols"] = {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32"],
@@ -799,9 +803,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             work(q + "_q", k, "fp8e4m3", var=RW)
             buffers[q + "_sf"] = {"dtype": "u8", "shape": [sf_len(RW, k)], "kind": "workspace"}
     if mla:
-        work("mla_fused_partial", mla_fused_l, kpart)
+        work("mla_fused_partial", wfu_l, kpart)
         if dsa:
-            k31_dsa.buffers(work, buffers, chunk, max_ctx // tp, seqs_max, tp)
+            k31_dsa.buffers(work, buffers, chunk, max_ctx // tp, seqs_max, tp, fold=idx_fold)
         work("q_norm", Q_LORA)
     if decode and mla:
         work("q_partial", Q_B, "f32")
@@ -1025,7 +1029,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                     mx_gemm(L + "wfu", "normed", b("normed"), H, w, "wfu", b("mla_fused_partial"), mla_fused_l, H,
                             mla_fused_l)
                 else:
-                    proj(L + "wfu", b("normed"), w("wfu"), b("mla_fused_partial"), mla_fused_l, H, dt=kpart)
+                    proj(L + "wfu", b("normed"), w("wfu"), b("mla_fused_partial"), wfu_l, H, dt=kpart)
                 if chunk:
                     # q_norm and the latent row appended, the chunk's own latent rows expanded to k | v;
                     # a short call's q folded into the latent space, the attention over the latent pages
@@ -1088,7 +1092,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                     gemm(L + "q_b", b("q_norm"), w("w_q_b"), b("q_partial"), Q_B, Q_LORA)
                     if dsa:
                         k31_dsa.steps(step, w, L, kv, f"idx.{i}", False, b("mla_gate"), max_pages, max_ctx // tp,
-                                      b("q_partial"), sched=i == mla_layers[0], exchange=(
+                                      b("q_partial"), sched=i == mla_layers[0],
+                                      kw=(b("mla_fused_partial", mla_fused_l * 4), wfu_l) if idx_fold else None,
+                                      exchange=(
                                           b("dcp_lamport"), b("dcp_lamport_peers"), b("dcp_state"), b("tp_err"),
                                           {"rank": "tp"}, B, i64(dcp_stage), i64(TP_TIMEOUT_NS)) if xchg else None,
                                       select=(b("tp_err"), i64(TP_TIMEOUT_NS),
@@ -1236,9 +1242,10 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         scoring(n + "sw_mlp", q + "mlp_res_")
         if is_mla(i):
             # every head's q side; this member's heads of the o side (g_proj, kv_b's v half, o_proj)
-            weight(n + "wfu", [mla_fused_l, H],
+            weight(n + "wfu", [wfu_l, H],
                    [seg(a + "q_a_proj.weight"), seg(a + "kv_a_proj_with_mqa.weight"),
-                    seg(a + "g_proj.weight", rows=shard(inner_l))])
+                    seg(a + "g_proj.weight", rows=shard(inner_l)),
+                    *(k31_dsa.kw_segs(seg, a) if idx_fold else [])])
             if mx:
                 mxfp8(n + "wfu")
             weight(n + "gamma_q_a", [Q_LORA], [seg(a + "q_a_layernorm.weight")])
@@ -1246,7 +1253,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             weight(n + "w_q_b", [Q_B, Q_LORA], [seg(a + "q_b_proj.weight")])
             weight(n + "w_kv_b", [HEADS * 256, KV_LORA], [seg(a + "kv_b_proj.weight")])
             if dsa:
-                k31_dsa.weights(weight, seg, a, n)
+                k31_dsa.weights(weight, seg, a, n, kw=not idx_fold)
             if xchg and not dsa:
                 # the v-up's heads: this member's of kv_b, whole for the absorb above (DSA's exchange v-ups every head)
                 weight(n + "w_kv_b_l", [hl * 256, KV_LORA], [seg(a + "kv_b_proj.weight", rows=shard(hl * 256))])
