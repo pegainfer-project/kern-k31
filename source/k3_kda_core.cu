@@ -109,8 +109,8 @@
 //        -o target/cubins/k3_kda_core.cubin tools/kernels-src/k3_kda_core.cu
 #include <cuda_bf16.h>
 
-// HEADS is the heads this rank holds: 96 whole, or a tray-group shard
-// (`-DHEADS=24` for TP4, docs/multi-gpu.md "最终形态"); the per-head weights
+// HEADS is the heads this rank holds: 96 whole, or a group member's shard
+// (`-DHEADS=12` for TP8, docs/multi-gpu.md "最终形态"); the per-head weights
 // and the state line are then that rank's slice, the wsm partial keeps its
 // whole-model layout (beta at column h, f_a at WSM_FA).
 #ifndef HEADS
