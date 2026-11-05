@@ -26,8 +26,10 @@
 //!
 //! `--ctx N,... --bench 16,32,48,64` measures instead: every row holds N
 //! positions of whatever the pages hold (finite garbage: the attention reads
-//! it, nobody checks it), every step feeds each row a fresh pseudo-random
-//! token, and each row count's graph is replayed `--iters` times after
+//! it, nobody checks it), every step feeds each row its next token of its own
+//! stretch of `--tokens` (any length, read as one text: real tokens route the
+//! MoE as serving does, where random ones crowd a few experts and flatter
+//! it), and each row count's graph is replayed `--iters` times after
 //! `--warmup`. Each step is timed from the token write to the readback of
 //! `next_token`; `bench.r<rank>.json` holds every row count's median, p10 and
 //! p90, plus the back-to-back time of `--iters` replays (fresh tokens each) with one sync,
@@ -160,18 +162,14 @@ fn main() -> anyhow::Result<()> {
     let a = args()?;
     let m = kern_manifest::Verified::from_json(&std::fs::read_to_string(&a.manifest)?)?;
     let benching = !a.ctx.is_empty();
-    let ids: Vec<i64> = if benching {
-        Vec::new()
-    } else {
-        std::fs::read(&a.tokens)?.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect()
-    };
+    let ids: Vec<i64> = std::fs::read(&a.tokens)?.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
     let (b, steps) = if benching {
         (a.bench.iter().copied().max().ok_or_else(|| anyhow::anyhow!("--ctx needs --bench <rows,...>"))?, 1)
     } else {
         (a.rows, ids.len() / a.rows)
     };
     anyhow::ensure!(b * steps == ids.len() || benching, "{} tokens are not {b} rows", ids.len());
-    anyhow::ensure!(steps > 0, "no steps");
+    anyhow::ensure!(steps > 0 && ids.len() >= b, "{} tokens for {b} rows", ids.len());
     let seqs_max = m.vars["seqs"].max as usize;
     anyhow::ensure!(b <= seqs_max, "{b} rows, the manifest takes at most {seqs_max}");
     let dealt = m.states.values().any(|s| s.shard.is_some());
@@ -228,7 +226,7 @@ fn main() -> anyhow::Result<()> {
     // the attention's query offsets (an fp8-cache manifest's), every sequence one row
     let cu = m.buffers.contains_key("cu_seqlens_q").then_some(seqs_max);
     if benching {
-        return bench(&mut rt, &a, &leases, &pad, il, paged, cu);
+        return bench(&mut rt, &a, &leases, &pad, il, paged, cu, &ids);
     }
     if let Some(n) = cu {
         rt.write_input("cu_seqlens_q", &le(&cu_seqlens(b, n), i32::to_le_bytes))?;
@@ -311,12 +309,10 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A token in [1000, 101000) for step `s`, row `r`: distinct rows, no specials.
-fn token(s: usize, r: usize) -> i64 {
-    let mut x = (s as u64) << 32 | r as u64;
-    x = (x ^ (x >> 31)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    x = (x ^ (x >> 29)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    1000 + ((x ^ (x >> 32)) % 100_000) as i64
+/// Row `r` of `rows` at bench step `s`: the walk through its own stretch of `text`.
+fn token(text: &[i64], rows: usize, s: usize, r: usize) -> i64 {
+    let n = text.len() / rows;
+    text[r * n + s % n]
 }
 
 /// `cu_seqlens_q` for `rows` sequences of one row each, over a buffer of `seqs_max + 1`.
@@ -336,8 +332,10 @@ fn bench(
     il: Interleave,
     paged: bool,
     cu: Option<usize>,
+    text: &[i64],
 ) -> anyhow::Result<()> {
     let me = a.rank;
+    let b = leases.len();
     let mut report = Vec::new();
     let mut step = 0;
     for (&p, &rows) in a.ctx.iter().flat_map(|c| a.bench.iter().map(move |r| (c, r))) {
@@ -360,7 +358,7 @@ fn bench(
             if profiled && i == a.warmup {
                 unsafe { cudarc::driver::sys::cuProfilerStart() };
             }
-            let tok: Vec<i64> = (0..rows).map(|r| token(step, r)).collect();
+            let tok: Vec<i64> = (0..rows).map(|r| token(text, b, step, r)).collect();
             step += 1;
             let t = Instant::now();
             rt.write_input_at("token_ids", &le(&tok, i64::to_le_bytes), &vars)?;
@@ -391,7 +389,7 @@ fn bench(
         rt.synchronize()?;
         let t = Instant::now();
         for _ in 0..a.iters {
-            let tok: Vec<i64> = (0..rows).map(|r| token(step, r)).collect();
+            let tok: Vec<i64> = (0..rows).map(|r| token(text, b, step, r)).collect();
             step += 1;
             rt.write_input_at("token_ids", &le(&tok, i64::to_le_bytes), &vars)?;
             rt.issue("decode", &vars)?;
