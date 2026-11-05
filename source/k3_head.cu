@@ -29,7 +29,7 @@
 #endif
 #define PARTS 16
 #define THREADS 256
-#define KEY_ROWS 64
+#define KEY_ROWS 256  // the rows a step may take (gen_stage.py's D_SEQS_MAX)
 #define IDX_TOP 0x7fffffff
 
 typedef unsigned int u32;

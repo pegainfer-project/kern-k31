@@ -232,7 +232,7 @@ sha256 = "1f74c6d6e41efd3fd6e461715852fd269ffb3e37f81781f64aceaf36801314a8"
 source = "source/k3_ar_fused.cu"
 
 [kernels."k3_head+NRANKS=8"]
-sha256 = "9fffe9f0f4e32574cbcd777b6e52abe18f02598e5083c1d3c44e7adfcdfa14ac"
+sha256 = "28e2246591a175e094ef05c5099dbb88631f247e5a567978e25af60f9be3f379"
 source = "source/k3_head.cu"
 defines = { NRANKS = 8 }
 
