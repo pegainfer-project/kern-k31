@@ -8,9 +8,9 @@
 //   extern "C" __global__ void k31_topk_held(...the same...);
 //   grid (rows), block NT, dynamic smem k31_topk_smem (a __device__ int of the module)
 //
-// k31_topk runs two blocks an SM, for P's thousands of rows. k31_topk_held runs one, for D's few
-// rows, each latency-bound: a row of at most HELD_MAX is read once into registers and every digit
-// below is counted and collected from there.
+// k31_topk is for P's thousands of rows. k31_topk_held is for D's few rows, each latency-bound: a
+// row of at most HELD_MAX is read once into registers, and from there a histogram finds the cut
+// value and bitmaps of the row place the 2048 (held, below); a longer row takes P's route.
 //
 // A logit is ranked by its key, the bits of the float it widens to ordered as the float is, read in
 // digits: bits 31..20, 19..8, 7..0. A digit's 4096-bin histogram over the keys that share the digits
@@ -70,10 +70,13 @@ using Sort = cub::BlockRadixSort<int, NT, TK / NT>;
 
 #define BITMAP_MAX 262144  // rows up to this long order their 2048 by a bitmap, longer ones by a sort
 
+#define HELD_MAX 32768
+
 struct Smem {
   union {
     unsigned hist[BINS];
     unsigned tie[CAP];
+    // held's: the histogram, then each warp's 32 words of digits
     unsigned bits[BITMAP_MAX / 32];
     typename Sort::TempStorage sort;
   } u;
@@ -368,77 +371,196 @@ __device__ __forceinline__ bool sampled(Smem& s, const bf16* row, unsigned n) {
   return true;
 }
 
-#define HELD_U 16  // float4s a thread holds: rows of at most NT * 4 * HELD_U stay in registers
-#define HELD_MAX (NT * 4 * HELD_U)
 
-// The exact route over a row held in registers, one read for every level; a cut inside one key held
-// by more than CAP positions takes the ties in position order on one more read. A key of 0 (a negative NaN's) marks a slot past n: it
-// sits in the lowest bin, under the 2049 real keys, so no cut reaches it.
-__device__ __forceinline__ void held(Smem& s, const bf16* row, unsigned n) {
-  constexpr int Q = 4 * HELD_U;
-  const unsigned t = threadIdx.x, lane = t & 31, last = n >= 4 ? (n - 4) & ~3u : 0;
-  const auto at = [&](int u) { return (u * NT + t) * 4; };
-  float4 v[HELD_U];
+// D's route's shared memory, over Smem's: the histogram and later the bitmaps, the output slots' marks.
+struct Held {
+  unsigned bits[BINS + 32];
+  unsigned mark[TK];
+  unsigned wsum[NT / 32];
+  unsigned cut, above, digit, gt;
+};
+static_assert(sizeof(Held) <= sizeof(Smem), "held's layout fits the module's shared memory");
+
+// The exclusive sum of x over the block in thread order; every thread calls it. A warp's total is in
+// h.wsum, so it is free until the next barrier.
+__device__ __forceinline__ unsigned held_scan(Held& h, unsigned x) {
+  const unsigned lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+  unsigned c = x;
 #pragma unroll
-  for (int u = 0; u < HELD_U; ++u) v[u] = ld4v(row + min((unsigned)at(u), last));
-  unsigned k[Q];
-#pragma unroll
-  for (int u = 0; u < HELD_U; ++u) {
-    float x[4] = {v[u].x, v[u].y, v[u].z, v[u].w};
-    if (at(u) < n && at(u) + 3 >= n)
-#pragma unroll
-      for (int j = 0; j < 4; ++j) x[j] = at(u) + j < n ? lv(row, at(u) + j) : 0.0f;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) k[4 * u + j] = at(u) + j < n ? okey(x[j]) : 0u;
+  for (int i = 1; i < 32; i <<= 1) {
+    const unsigned y = __shfl_up_sync(0xffffffffu, c, i);
+    if (lane >= i) c += y;
   }
-  unsigned rem = TK, fpre = 0;
-  for (int level = 0; level < 3; ++level) {
-    const int sh = SHIFT[level];
-    for (int i = t; i < BINS; i += NT) s.u.hist[i] = 0;
-    __syncthreads();
+  if (lane == 31) h.wsum[w] = c;
+  __syncthreads();
+  unsigned before = 0;
 #pragma unroll
-    for (int q = 0; q < Q; ++q)
-      if (in_play(k[q], level, fpre)) atomicAdd(&s.u.hist[k[q] >> sh & 0xfff], 1u);
-    __syncthreads();
-    cut_bin(s, rem);
-    const unsigned p = prefix_of(level, fpre, s.cut);
-    if (s.count <= CAP) {
-      // every hit of the row claims its slot at once: one warp scan, one atomic a kind a warp; a
-      // candidate's key is read again rather than indexed out of the registers
-      unsigned long long ma = 0, mc = 0;
+  for (int i = 0; i < NT / 32; i += 4) {
+    const uint4 q = *reinterpret_cast<const uint4*>(h.wsum + i);
+    before += (i < w ? q.x : 0) + (i + 1 < w ? q.y : 0) + (i + 2 < w ? q.z : 0) + (i + 3 < w ? q.w : 0);
+  }
+  return before + c - x;
+}
+
+// The position of x's k-th set bit, k below its count.
+__device__ __forceinline__ unsigned nth_bit(unsigned x, unsigned k) {
+  unsigned p = 0;
 #pragma unroll
-      for (int q = 0; q < Q; ++q) {
-        const unsigned d = k[q] >> sh;
-        ma |= (unsigned long long)(d > p) << q, mc |= (unsigned long long)(d == p) << q;
-      }
-      const unsigned na = __popcll(ma), nc = __popcll(mc);
-      unsigned c = na | nc << 16;
+  for (int w = 16; w; w >>= 1) {
+    const unsigned c = __popc(x >> p & (1u << w) - 1);
+    if (k >= c) k -= c, p += w;
+  }
+  return p;
+}
+
+// D's route for a row of at most HELD_MAX, read once. Warp w holds positions [32 C w, 32 C (w + 1)),
+// lane l the eight from 32 C w + 256 j + 8 l for each j < C / 8, so every read is coalesced. Adding
+// +0 makes -0 +0 and every NaN 0x7fff, as widening and adding +0 does for the key (every NaN keys as
+// 0xffffffff, above +inf), and leaves the rest alone, subnormals too. Each value counts into the
+// 4096-bin histogram of its top 12 bits, the bins read in key order (a negative half's reversed),
+// whose cut bin a 17-slot histogram of the low 4 bits splits to the cut value K. One HSET2 compares
+// two values with K: the row's positions above K and at K become two bitmaps, a byte a group. A scan
+// of their words' counts places each word's taken positions (every one above K, the first `need` at
+// K), and each thread fills four output slots from the words holding them. The 2048 come out
+// ascending with no sort and in balanced work, the same for any ties.
+//
+// A slot past n is read as a NaN and taken back out: from the NaN bin and digit by count, from the
+// bitmaps by position. A row with 2048 NaNs or more cuts at NaN, which no ordered compare finds.
+template <int C>
+__device__ __forceinline__ void held(Held& h, const bf16* row, unsigned n, int* o) {
+  constexpr int V = C / 8, W = C / 2;
+  const unsigned t = threadIdx.x, pads = NT * C - n;
+  const auto at = [&](int j) { return 32 * C * (t >> 5) + 256 * j + 8 * (t & 31); };  // group j's first position
+  unsigned a[W];
 #pragma unroll
-      for (int o = 1; o < 32; o <<= 1) {
-        const unsigned y = __shfl_up_sync(0xffffffffu, c, o);
-        if (lane >= o) c += y;
+  for (int j = 0; j < V; ++j) {
+    const uint4 v = at(j) < n ? __ldg(reinterpret_cast<const uint4*>(row + at(j))) : make_uint4(~0u, ~0u, ~0u, ~0u);
+    a[4 * j] = v.x, a[4 * j + 1] = v.y, a[4 * j + 2] = v.z, a[4 * j + 3] = v.w;
+  }
+  for (int i = t; i < (BINS + 32) / 4; i += NT) reinterpret_cast<uint4*>(h.bits)[i] = make_uint4(0, 0, 0, 0);
+  unsigned* dig = h.bits + BINS;
+  // the group straddling n holds real values past it: NaNs from here on
+#pragma unroll
+  for (int j = 0; j < V; ++j)
+    if (at(j) == (n & ~7u))
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const unsigned i = at(j) + 2 * q;
+        a[4 * j + q] |= i < n ? (i + 1 < n ? 0u : 0xffff0000u) : ~0u;
       }
-      const unsigned tot = __shfl_sync(0xffffffffu, c, 31);
-      if (t == 0) s.nsel = 0, s.ncand = 0;
-      __syncthreads();
-      unsigned a0 = 0, c0 = 0;
-      if (lane == 31) a0 = atomicAdd(&s.nsel, tot & 0xffff), c0 = atomicAdd(&s.ncand, tot >> 16);
-      unsigned a = __shfl_sync(0xffffffffu, a0, 31) + (c & 0xffff) - na,
-               b = __shfl_sync(0xffffffffu, c0, 31) + (c >> 16) - nc;
-      const auto pos = [&](int q) { return (unsigned)at(q >> 2) + (q & 3); };
-      for (; ma; ma &= ma - 1) s.sel[a++] = pos(__ffsll(ma) - 1);
-      for (; mc; mc &= mc - 1, ++b) {
-        const unsigned i = pos(__ffsll(mc) - 1);
-        s.ckey[b] = okey(lv(row, i)), s.cpos[b] = i;
-      }
-      __syncthreads();
-      finish(s, TK - s.nsel, n, sh, p << sh);
-      return;
+#pragma unroll
+  for (int i = 0; i < W; ++i) {
+    const __nv_bfloat162 x = __hadd2(*reinterpret_cast<const __nv_bfloat162*>(&a[i]), __bfloat162bfloat162(0.0f));
+    a[i] = *reinterpret_cast<const unsigned*>(&x);
+  }
+  __syncthreads();
+#pragma unroll
+  for (int i = 0; i < W; ++i) atomicAdd(&h.bits[a[i] >> 4 & 0xfff], 1u), atomicAdd(&h.bits[a[i] >> 20], 1u);
+  __syncthreads();
+  {
+    // thread t reads key bins 4095 - 8t down to 4088 - 8t: raw bins 2047 - 8t down for t < 256 (the
+    // NaN bin first), 8t up for the negative half
+    const uint4* h4 = reinterpret_cast<const uint4*>(h.bits);
+    const bool pos = t < 256;
+    const uint4 x = h4[pos ? (0x7f8 - 8 * t) / 4 + 1 : 2 * t], y = h4[pos ? (0x7f8 - 8 * t) / 4 : 2 * t + 1];
+    const unsigned c[8] = {(pos ? x.w : x.x) - (t == 0 ? pads : 0), pos ? x.z : x.y, pos ? x.y : x.z, pos ? x.x : x.w,
+                           pos ? y.w : y.x, pos ? y.z : y.y, pos ? y.y : y.z, pos ? y.x : y.w};
+    unsigned sum = 0;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) sum += c[k];
+    unsigned ab = held_scan(h, sum);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+      if (ab < TK && ab + c[k] >= TK) h.cut = BINS - 1 - 8 * t - k, h.above = ab;
+      ab += c[k];
     }
-    rem -= s.above, fpre = p;
-    __syncthreads();
   }
-  ties_in_order(s, row, n, fpre, rem);
+  __syncthreads();
+  const unsigned rb = h.cut ^ (h.cut & 0x800 ? 0x800 : 0xfff), rem = TK - h.above, neg = rb >> 11;
+  // a value's top 12 bits are the cut bin's when (value ^ rb << 4) is below 16: its digit
+#pragma unroll
+  for (int i = 0; i < W; ++i) {
+    atomicAdd(dig + min((a[i] ^ rb << 4) & 0xffffu, 16u), 1u);
+    atomicAdd(dig + min(a[i] >> 16 ^ rb << 4, 16u), 1u);
+  }
+  __syncthreads();
+  if (t < 32) {
+    // lane l < 16 holds key digit 15 - l; the count from the top first reaching rem marks the cut
+    const unsigned d = 15 - t, r = neg ? 15 - d : d, c0 = t < 16 ? dig[r] - (rb == 0x7ff && r == 15 ? pads : 0) : 0;
+    unsigned c = c0;
+#pragma unroll
+    for (int i = 1; i < 16; i <<= 1) {
+      const unsigned y = __shfl_up_sync(0xffffffffu, c, i);
+      if (t >= i) c += y;
+    }
+    if (t < 16 && c >= rem && c - c0 < rem) h.digit = r, h.gt = c - c0;
+  }
+  __syncthreads();
+  const unsigned K = rb << 4 | h.digit, need = rem - h.gt;
+  // above K by an unordered compare (a NaN is above every value), at K by an ordered one; for a NaN K,
+  // the unordered compare with +inf finds the NaNs, and nothing is above
+  const bool nan = K == 0x7fff;
+  const __nv_bfloat162 ka = __bfloat162bfloat162(__ushort_as_bfloat16((unsigned short)(nan ? 0x7f80 : K))),
+                       kb = __bfloat162bfloat162(__ushort_as_bfloat16((unsigned short)K));
+  // the bitmaps over the histogram's words, word q's low value at bit 2q of its group's byte and its
+  // high one at 2q + 1
+  constexpr unsigned NW = NT * C / 32;
+  unsigned *gbits = h.bits, *ebits = gbits + NW, *take = ebits + NW;
+#pragma unroll
+  for (int j = 0; j < V; ++j) {
+    unsigned g = 0, e = 0;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const __nv_bfloat162 x = *reinterpret_cast<const __nv_bfloat162*>(&a[4 * j + q]);
+      const unsigned bit = 1u << 2 * q | 1u << 17 + 2 * q;
+      g |= __hgtu2_mask(x, ka) & bit, e |= __heq2_mask(x, kb) & bit;
+    }
+    const unsigned keep = 0xffu >> 8 - min(max((int)(n - at(j)), 0), 8);
+    g = (g | g >> 16) & keep, e = (e | e >> 16) & keep;
+    reinterpret_cast<unsigned char*>(gbits)[at(j) / 8] = nan ? 0 : g;
+    reinterpret_cast<unsigned char*>(ebits)[at(j) / 8] = nan ? g : e;
+  }
+  __syncthreads();
+  // thread t owns PW words; one scan of their counts places them, the first `need` ties kept
+  constexpr int PW = C >= 32 ? C / 32 : 1;
+  const bool owns = t * PW < NW;
+  unsigned gw[PW], ew[PW], cg = 0, ce = 0;
+#pragma unroll
+  for (int i = 0; i < PW; ++i) {
+    gw[i] = owns ? gbits[t * PW + i] : 0, ew[i] = owns ? ebits[t * PW + i] : 0;
+    cg += __popc(gw[i]), ce += __popc(ew[i]);
+  }
+  const unsigned pre = held_scan(h, cg | ce << 16), ties = pre >> 16;
+  unsigned r = need > ties ? need - ties : 0, q = (pre & 0xffffu) + min(ties, need);
+  if (ce > r)
+#pragma unroll
+    for (int i = 0; i < PW; ++i) {
+      const unsigned c = __popc(ew[i]);
+      ew[i] = r >= c ? ew[i] : r ? ew[i] & (1u << nth_bit(ew[i], r)) - 1 : 0;
+      r -= min(r, c);
+    }
+  // a word's owner marks the slot it starts at and each of its slots a multiple of 4: the word and
+  // how many of its positions come before the slot
+  if (owns)
+#pragma unroll
+    for (int i = 0; i < PW; ++i) {
+      const unsigned x = gw[i] | ew[i], c = __popc(x), wd = t * PW + i;
+      take[wd] = x;
+      if (c) h.mark[q] = wd << 5;
+      for (unsigned k = (q + 3) & ~3u; k < q + c; k += 4) h.mark[k] = wd << 5 | (k - q);
+      q += c;
+    }
+  __syncthreads();
+  // output slots 4t to 4t + 3, a word read again where a slot starts one
+  unsigned k = 4 * t, m = h.mark[k], wd = m >> 5, x = take[wd];
+  x &= ~0u << nth_bit(x, m & 31);
+  int v[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i, ++k) {
+    if (!x) m = h.mark[k], wd = m >> 5, x = take[wd];
+    v[i] = wd * 32 + __ffs(x) - 1, x &= x - 1;
+  }
+  reinterpret_cast<int4*>(o)[t] = make_int4(v[0], v[1], v[2], v[3]);
 }
 
 // The exact route: a level a read until the cut's bin fits CAP.
@@ -469,15 +591,22 @@ __device__ __forceinline__ void topk(const bf16* __restrict__ logits, int stride
   extern __shared__ __align__(16) unsigned char raw[];
   Smem& s = *reinterpret_cast<Smem*>(raw);
   const int t = threadIdx.x;
-  const unsigned n = (unsigned)max(lens[blockIdx.x], 0);
   const bf16* row = logits + (size_t)blockIdx.x * stride;
+  const unsigned n = (unsigned)max(lens[blockIdx.x], 0);
   int* o = out + (size_t)blockIdx.x * TK;
   if (n <= TK) {
     for (int i = t; i < TK; i += NT) o[i] = i < (int)n ? i : -1;
     return;
   }
-  if (HELD && n <= HELD_MAX) held(s, row, n);
-  else if (n < SAMPLE_MIN || !sampled(s, row, n)) exact(s, row, n);
+  if (HELD && n <= HELD_MAX) {
+    Held& h = *reinterpret_cast<Held*>(raw);
+    if (n <= NT * 8) held<8>(h, row, n, o);
+    else if (n <= NT * 16) held<16>(h, row, n, o);
+    else if (n <= NT * 32) held<32>(h, row, n, o);
+    else held<64>(h, row, n, o);
+    return;
+  }
+  if (n < SAMPLE_MIN || !sampled(s, row, n)) exact(s, row, n);
   if (n <= BITMAP_MAX) {
     // ascending: each thread a run of words, its bits' rank from a scan of the runs' counts
     const unsigned words = (n + 31) / 32, per = (words + NT - 1) / NT, w0 = min(t * per, words), w1 = min(w0 + per, words);
