@@ -238,14 +238,12 @@ extern "C" __global__ void k31_dcp_poison(uint4* __restrict__ buf, long long byt
 }
 
 // vLLM's order of the merge (dcp_indexer_cutedsl.py stable_key): a higher score first, a smaller
-// global position among equal scores; an empty candidate is 0, below everything. A global position is
-// below 2^24, so the key is the score's 16 ordered bits over 24 of position: 40 bits, five radix digits.
+// global position among equal scores; an empty candidate is below everything. A global position is below
+// 2^24, so the order is that of a 40-bit key, the score's 16 ordered bits over p = 2^24 - (position + 1).
 #define KEY_POS 24
-__device__ __forceinline__ unsigned long long stable_key(unsigned score, unsigned g1) {
-  return g1 ? ((unsigned long long)score << KEY_POS) | ((1u << KEY_POS) - g1) : 0ull;
-}
 
-// A candidate as the stage holds it, and its key given its member m of W.
+// A candidate as the stage holds it: whether it is there, its score bits, its global position + 1 given
+// its member m of W.
 #if CAND32
 typedef unsigned cand;
 __device__ __forceinline__ cand ld_cand(const uint8_t* p) {
@@ -254,10 +252,9 @@ __device__ __forceinline__ cand ld_cand(const uint8_t* p) {
   return w;
 }
 __device__ __forceinline__ bool arrived(cand w) { return w != DCP_POISON; }
-__device__ __forceinline__ unsigned long long cand_key(cand w, int W, int m) {
-  const unsigned l1 = w & 0xffffu;
-  return stable_key(w >> 16, l1 ? (l1 - 1) * W + m + 1 : 0u);
-}
+__device__ __forceinline__ bool cand_live(cand w) { return w & 0xffffu; }
+__device__ __forceinline__ unsigned cand_score(cand w) { return w >> 16; }
+__device__ __forceinline__ unsigned cand_g1(cand w, int W, int m) { return ((w & 0xffffu) - 1) * W + m + 1; }
 #else
 typedef uint2 cand;
 __device__ __forceinline__ cand ld_cand(const uint8_t* p) {
@@ -266,7 +263,9 @@ __device__ __forceinline__ cand ld_cand(const uint8_t* p) {
   return w;
 }
 __device__ __forceinline__ bool arrived(cand w) { return w.x != DCP_POISON && w.y != DCP_POISON; }
-__device__ __forceinline__ unsigned long long cand_key(cand w, int, int) { return stable_key(w.x, w.y); }
+__device__ __forceinline__ bool cand_live(cand w) { return w.y; }
+__device__ __forceinline__ unsigned cand_score(cand w) { return w.x; }
+__device__ __forceinline__ unsigned cand_g1(cand w, int, int) { return w.y; }
 #endif
 
 #ifndef DCP_W
@@ -274,6 +273,39 @@ __device__ __forceinline__ unsigned long long cand_key(cand w, int, int) { retur
 #endif
 #define SEL_THREADS 1024
 #define SEL_PER (DCP_W * TOPK / SEL_THREADS)  // 16 candidates a thread at W = 8
+#define SEL_BINS 4096                        // a 12-bit digit, four bins a thread
+
+// Of a 4096-bin histogram h (a larger bin holds larger keys), the bin of the need-th largest key into
+// res[0] and how many of that bin to take into res[1], 0 meaning all of it; nothing written when the
+// histogram holds fewer than `need` keys. Thread t sums bins 4092 - 4t .. 4095 - 4t, a block scan from
+// the top finds the thread whose bins the need-th key falls in. Every thread of the block calls it; the
+// result is there after the caller's next __syncthreads.
+__device__ __forceinline__ void sel_find(const unsigned* h, unsigned need, unsigned* totals, unsigned* res) {
+  const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+  const uint4 v = reinterpret_cast<const uint4*>(h)[SEL_BINS / 4 - 1 - t];
+  const unsigned sum = v.x + v.y + v.z + v.w;
+  unsigned c = sum;
+#pragma unroll
+  for (int o = 1; o < 32; o <<= 1) {
+    const unsigned y = __shfl_up_sync(0xffffffffu, c, o);
+    if (lane >= o) c += y;
+  }
+  if (lane == 31) totals[warp] = c;
+  __syncthreads();
+  unsigned off = lane < warp ? totals[lane] : 0u;
+#pragma unroll
+  for (int o = 16; o; o >>= 1) off += __shfl_xor_sync(0xffffffffu, off, o);
+  c += off;
+  if (c >= need && c - sum < need) {
+    unsigned acc = c - sum, h = v.w;
+    int j = 0;
+    if (acc + h < need) acc += h, h = v.z, j = 1;
+    if (j == 1 && acc + h < need) acc += h, h = v.y, j = 2;
+    if (j == 2 && acc + h < need) acc += h, h = v.x, j = 3;
+    res[0] = SEL_BINS - 1 - 4 * t - j;
+    res[1] = need - acc == h ? 0u : need - acc;
+  }
+}
 
 // The group's top 2048 of a row from every member's candidates, waited for in this member's stage
 // (k31_dcp_pack), and of those the positions this member holds, as cache slots through its page
@@ -284,6 +316,11 @@ __device__ __forceinline__ unsigned long long cand_key(cand w, int, int) { retur
 // last to arrive advances the stage: state [8] starts zeroed, [0] block counter, [2] stage, [4..5]
 // i64 bytes to re-poison next call. A member whose candidates do not show within `timeout_ns` is
 // recorded in `err` as 1 + its rank, then the kernel traps.
+//
+// The 2048-th largest key is found digit by digit, each digit a histogram over the candidates still
+// tied with the threshold, stopping once the threshold's bin is taken whole: the score's top 12 bits,
+// its low 4, then p's top 12 and low 12 among the candidates of the threshold's score. Member m's
+// candidates are thread t's i = 2m and 2m + 1, so this member's share is two candidates a thread.
 //   grid (R), every block resident at once; block 1024, W = DCP_W
 extern "C" __global__ void __launch_bounds__(SEL_THREADS) k31_dcp_select(
     const uint8_t* __restrict__ lamport, int* state, int* err, long long stage_bytes, long long timeout_ns,
@@ -291,15 +328,18 @@ extern "C" __global__ void __launch_bounds__(SEL_THREADS) k31_dcp_select(
     int* __restrict__ ind, int* __restrict__ lens, int* __restrict__ live) {
   pdl_entry();
   constexpr int W = DCP_W;
-  __shared__ unsigned whist[SEL_THREADS / 32][256];  // a warp's own: the top digit is mostly one bin
-  __shared__ unsigned hist[256];
-  __shared__ unsigned scan[SEL_THREADS / 32];
-  __shared__ unsigned long long s_prefix;
-  __shared__ unsigned s_need, s_found;
+  static_assert(SEL_PER == 2 * W && TOPK == 2 * SEL_THREADS, "member m is candidates 2m and 2m + 1 of a thread");
+  __shared__ __align__(16) unsigned hist[2][SEL_BINS];
+  __shared__ unsigned low[16];
+  __shared__ unsigned totals[SEL_THREADS / 32];
+  __shared__ unsigned res[4][2];
   const int r = blockIdx.x, t = threadIdx.x;
   const int flag = state[2];
   long long* clear_ptr = reinterpret_cast<long long*>(state + 4);
   const long long clear_count = *clear_ptr;
+  for (int i = t; i < 2 * SEL_BINS; i += SEL_THREADS) (&hist[0][0])[i] = 0;
+  if (t < 16) low[t] = 0;
+  if (t == 0) res[0][0] = ~0u;
   __syncthreads();
   if (t == 0) atomicAdd(state, 1);
   const uint8_t* stage = lamport + (long long)(flag % 3) * stage_bytes;
@@ -311,22 +351,19 @@ extern "C" __global__ void __launch_bounds__(SEL_THREADS) k31_dcp_select(
   cand w[SEL_PER];
 #pragma unroll
   for (int i = 0; i < SEL_PER; ++i) w[i] = ld_cand(slot(i));
-  unsigned long long key[SEL_PER];
   int fail = 0;
 #pragma unroll
   for (int i = 0; i < SEL_PER; ++i) {
-    const int m = (t + i * SEL_THREADS) / TOPK;
     for (unsigned long long t0 = 0; !arrived(w[i]); w[i] = ld_cand(slot(i))) {
       unsigned long long now;
       asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
       if (t0 == 0) {
         t0 = now;
       } else if ((long long)(now - t0) > timeout_ns) {
-        fail = 1 + m, w[i] = cand{};
+        fail = 1 + i / 2, w[i] = cand{};
         break;
       }
     }
-    key[i] = cand_key(w[i], W, m);
   }
   if (fail) {
     atomicMax(err, fail);
@@ -339,60 +376,69 @@ extern "C" __global__ void __launch_bounds__(SEL_THREADS) k31_dcp_select(
     for (long long i = (long long)r * SEL_THREADS + t; i < clear_count / 16; i += (long long)gridDim.x * SEL_THREADS)
       clear[i] = poison;
   }
-  // the 2048-th largest key by an 8-bit MSB-first radix select; keys are distinct but 0. A pass ends
-  // the search once the threshold's digit bin is taken whole.
-  unsigned long long prefix = 0;
-  unsigned need = TOPK;
-  for (int shift = KEY_POS + 8; shift >= 0; shift -= 8) {
-    for (int i = t & 31; i < 256; i += 32) whist[t >> 5][i] = 0;
-    __syncwarp();
-    const unsigned long long hi = ~0ull << (shift + 8);
+  const auto p_of = [&](int i) { return (1u << KEY_POS) - cand_g1(w[i], W, i / 2); };
+  // the threshold key: (score, p) at or above it are the top 2048; (0, 0) takes every candidate there is
+  unsigned thr_score = 0, thr_p = 0;
 #pragma unroll
-    for (int i = 0; i < SEL_PER; ++i)
-      if (key[i] != 0 && (key[i] & hi) == prefix) atomicAdd(&whist[t >> 5][(key[i] >> shift) & 0xff], 1u);
-    __syncthreads();
-    if (t < 256) {
-      unsigned h = 0;
-#pragma unroll 8
-      for (int w = 0; w < SEL_THREADS / 32; ++w) h += whist[w][t];
-      hist[t] = h;
-    }
-    __syncthreads();
-    if (t == 0) s_found = 0;
-    if (t < 256) {  // cum: keys whose digit is 255 - t or above, a scan over the 256 bins
-      const unsigned h = hist[255 - t];
-      unsigned c = h;
+  for (int i = 0; i < SEL_PER; ++i)
+    if (cand_live(w[i])) atomicAdd(&hist[0][cand_score(w[i]) >> 4], 1u);
+  __syncthreads();
+  sel_find(hist[0], TOPK, totals, res[0]);
+  __syncthreads();
+  if (res[0][0] != ~0u) {
+    const unsigned hi = res[0][0];
+    unsigned need = res[0][1];
+    thr_score = hi << 4;
+    if (need) {
+      for (int i = t; i < SEL_BINS; i += SEL_THREADS) hist[0][i] = 0;  // for p's low digit
 #pragma unroll
-      for (int o = 1; o < 32; o <<= 1) {
-        const unsigned y = __shfl_up_sync(0xffffffffu, c, o);
-        if ((t & 31) >= o) c += y;
+      for (int i = 0; i < SEL_PER; ++i)
+        if (cand_live(w[i]) && cand_score(w[i]) >> 4 == hi) atomicAdd(&low[cand_score(w[i]) & 15], 1u);
+      __syncthreads();
+      if (t < 32) {
+        const unsigned h = t < 16 ? low[15 - t] : 0u;
+        unsigned c = h;
+#pragma unroll
+        for (int o = 1; o < 16; o <<= 1) {
+          const unsigned y = __shfl_up_sync(0xffffffffu, c, o);
+          if (t >= o) c += y;
+        }
+        if (t < 16 && c >= need && c - h < need) res[1][0] = 15 - t, res[1][1] = need - (c - h) == h ? 0u : need - (c - h);
       }
-      if ((t & 31) == 31) scan[t >> 5] = c;
-      __syncwarp();
-      asm volatile("bar.sync 1, 256;");
-      for (int w = 0; w < (t >> 5); ++w) c += scan[w];
-      if (c >= need && c - h < need) {
-        s_prefix = prefix | ((unsigned long long)(255 - t) << shift);
-        s_need = need - (c - h) == h ? 0u : need - (c - h);
-        s_found = 1;
-      }
+      __syncthreads();
+      thr_score |= res[1][0];
+      need = res[1][1];
     }
-    __syncthreads();
-    if (!s_found) break;  // fewer than 2048 candidates in all (first pass only): take them all
-    prefix = s_prefix, need = s_need;
-    if (need == 0) break;
-  }
-  // `prefix` is now the threshold key (or 0: fewer than 2048 candidates, take them all)
-  const unsigned long long thr = prefix;
-  int mine = 0;
-  int pos[SEL_PER];
+    if (need) {
 #pragma unroll
-  for (int i = 0; i < SEL_PER; ++i) {
-    const bool take = key[i] != 0 && key[i] >= thr;
-    const int g = take ? (int)((1u << KEY_POS) - 1 - (unsigned)(key[i] & ((1u << KEY_POS) - 1))) : -1;
-    pos[i] = take && g % W == rank ? g / W : -1;
-    mine += pos[i] >= 0;
+      for (int i = 0; i < SEL_PER; ++i)
+        if (cand_live(w[i]) && cand_score(w[i]) == thr_score) atomicAdd(&hist[1][p_of(i) >> 12], 1u);
+      __syncthreads();
+      sel_find(hist[1], need, totals, res[2]);
+      __syncthreads();
+      thr_p = res[2][0] << 12;
+      need = res[2][1];
+    }
+    if (need) {
+#pragma unroll
+      for (int i = 0; i < SEL_PER; ++i)
+        if (cand_live(w[i]) && cand_score(w[i]) == thr_score && p_of(i) >> 12 == thr_p >> 12)
+          atomicAdd(&hist[0][p_of(i) & 0xfff], 1u);
+      __syncthreads();
+      sel_find(hist[0], need, totals, res[3]);
+      __syncthreads();
+      thr_p |= res[3][0];  // a position is one candidate: its bin is taken whole
+    }
   }
+  // this member's two candidates a thread, taken at or above the threshold, as local positions
+  int pos[2] = {-1, -1};
+#pragma unroll
+  for (int i = 0; i < SEL_PER; ++i)
+    if (i / 2 == rank && cand_live(w[i])) {
+      const unsigned sc = cand_score(w[i]), p = p_of(i);
+      if (sc > thr_score || (sc == thr_score && p >= thr_p)) pos[i & 1] = (int)(cand_g1(w[i], W, i / 2) - 1) / W;
+    }
+  const int mine = (pos[0] >= 0) + (pos[1] >= 0);
   // exclusive scan of `mine` over the block, candidate order
   unsigned x = mine;
 #pragma unroll
@@ -400,25 +446,25 @@ extern "C" __global__ void __launch_bounds__(SEL_THREADS) k31_dcp_select(
     const unsigned y = __shfl_up_sync(0xffffffffu, x, o);
     if ((t & 31) >= o) x += y;
   }
-  if ((t & 31) == 31) scan[t >> 5] = x;
+  if ((t & 31) == 31) totals[t >> 5] = x;
   __syncthreads();
   if (t < 32) {
-    unsigned w = scan[t];
+    unsigned v = totals[t];
 #pragma unroll
     for (int o = 1; o < 32; o <<= 1) {
-      const unsigned y = __shfl_up_sync(0xffffffffu, w, o);
-      if (t >= o) w += y;
+      const unsigned y = __shfl_up_sync(0xffffffffu, v, o);
+      if (t >= o) v += y;
     }
-    scan[t] = w;
+    totals[t] = v;
   }
   __syncthreads();
-  unsigned at = x - mine + ((t >> 5) ? scan[(t >> 5) - 1] : 0u);
-  const unsigned total = scan[SEL_THREADS / 32 - 1];
+  unsigned at = x - mine + ((t >> 5) ? totals[(t >> 5) - 1] : 0u);
+  const unsigned total = totals[SEL_THREADS / 32 - 1];
   const int* bt = block_table + (size_t)r * max_pages;
   int* row = ind + (size_t)r * TOPK;
 #pragma unroll
-  for (int i = 0; i < SEL_PER; ++i)
-    if (pos[i] >= 0) row[at++] = bt[pos[i] / PAGE] * PAGE + pos[i] % PAGE;
+  for (int j = 0; j < 2; ++j)
+    if (pos[j] >= 0) row[at++] = bt[pos[j] / PAGE] * PAGE + pos[j] % PAGE;
   for (int i = total + t; i < TOPK; i += SEL_THREADS) row[i] = i == 0 ? 0 : -1;
   if (t == 0) lens[r] = total ? (int)total : 1, live[r] = (int)total;
   if (r == 0 && t == 0) {
