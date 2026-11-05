@@ -585,9 +585,13 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                     "params": ["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32",
                                "inout buffer<bf16>", "in buffer<f32>", "in buffer<bf16>", "out buffer<bf16>", "i32",
                                "i32", *PF_PARAMS],
+                    # the clusters past the batch's prefetch the next weight; past TP_AR_GRID rows none is idle
                     "impl": {"launches": [launch("k3_ar_fused", f"kern_k3_land_add2_attnres_rms_nb{nb}",
-                                                 grid=[LAND_CL * TP_AR_GRID, 1, 1], block=[1024 // LAND_CL, 1, 1],
-                                                 cluster=[LAND_CL, 1, 1], smem=CAND_SMEM // LAND_CL, pdl=True)]},
+                                                 grid=[grid, 1, 1], block=[1024 // LAND_CL, 1, 1],
+                                                 cluster=[LAND_CL, 1, 1], smem=CAND_SMEM // LAND_CL, pdl=True,
+                                                 when={"var": T, **when})
+                                          for grid, when in ((LAND_CL * TP_AR_GRID, {"max": TP_AR_GRID}),
+                                                             ({"mul": [T, LAND_CL]}, {"min": TP_AR_GRID + 1}))]},
                 },
                 "ar_attnres_rms": lambda: {
                     "params": ["in buffer<bf16>", "inout buffer<u8>", "in buffer<u64>", "inout buffer<i32>",
