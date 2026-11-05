@@ -543,12 +543,19 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         # The layer's two sums with their neighbours (source/k3_ar_fused.cu): the attention's with the
         # landing, mix and norm after it; the MoE's with the combine before it and the latent norm after.
         lamport_params = ["inout buffer<u8>", "in buffer<u64>", "inout buffer<i32>", "out buffer<i32>", "i32"]
+
+        def ar_launches(entry, row_vectors, **kw):
+            """`entry`'s launches: k3_ar_fused.cu's one-pass build while a pass of the grid holds the rows' pushes
+            and every row has a block, its ANY_BATCH build past that, as far as t_max reaches."""
+            one = min(TP_AR_GRID, TP_AR_GRID * 1024 // row_vectors)
+            return [launch("k3_ar_fused", entry, defines={"NRANKS": tp, **d}, grid=[TP_AR_GRID, 1, 1],
+                           block=[1024, 1, 1], pdl=True, when={"var": T, **w}, **kw)
+                    for d, w in (({}, {"max": one}), ({"ANY_BATCH": 1}, {"min": one + 1})) if w.get("min", 0) <= t_max]
         ops["ar_finalize_rms"] = {
             "params": ["in buffer<bf16>", "in buffer<i32>", "in buffer<f32>", "in buffer<bf16>", *lamport_params,
                        "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i64", "i64",
                        *PF_PARAMS, *PF_PARAMS],
-            "impl": {"launches": [launch("k3_ar_fused", "kern_k3_ar_finalize_rms", defines={"NRANKS": tp},
-                                         grid=[TP_AR_GRID, 1, 1], block=[1024, 1, 1], pdl=True)]},
+            "impl": {"launches": ar_launches("kern_k3_ar_finalize_rms", (LATENT + H) // 8)},
         }
         # a sum on its own: one kernel, every rank's partial pushed into every
         # peer's Lamport stage over NVLink (one hop, no ring), summed in f32.
@@ -598,9 +605,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                                "out buffer<i32>", "i32", "in buffer<bf16>", "in buffer<bf16>", "in buffer<f32>",
                                "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i64", "i64",
                                *PF_PARAMS, *PF_PARAMS],
-                    "impl": {"launches": [launch("k3_ar_fused", f"kern_k3_ar_attnres_rms_nb{nb}",
-                                                 defines={"NRANKS": tp}, grid=[TP_AR_GRID, 1, 1], block=[1024, 1, 1],
-                                                 smem=CAND_SMEM, pdl=True)]},
+                    "impl": {"launches": ar_launches(f"kern_k3_ar_attnres_rms_nb{nb}", H // 8, smem=CAND_SMEM)},
                 },
             }[base]()
         return name

@@ -93,6 +93,12 @@ namespace cg = cooperative_groups;
 #ifndef TWO_SHOT_ROWS
 #define TWO_SHOT_ROWS 14
 #endif
+// ANY_BATCH 0 builds for a batch whose pushes fit one pass of the grid (B x a row's vectors <= KGRID x KTHREADS)
+// and whose rows a block each (B <= KGRID), 1 for any batch. gen_stage.py launches the first up to that bound:
+// the second's loops hold registers that spill on the 1024-thread blocks (+0.2 ms a 64-row step).
+#ifndef ANY_BATCH
+#define ANY_BATCH 0
+#endif
 
 typedef __nv_bfloat16 bf16_t;
 typedef __nv_bfloat162 bf162_t;
@@ -220,6 +226,9 @@ __device__ __forceinline__ long long share(long long tot, int B) {
   const int i = per * (int)blockIdx.x + (int)threadIdx.x;
   return (int)threadIdx.x < per && i < (int)tot ? i : -1;
 }
+
+// Whether q is one of block b's rows b, b + KGRID, ..
+__device__ __forceinline__ bool block_row(int q, int b, int B) { return q < B && (ANY_BATCH || q == b); }
 
 // The two-shot's vectors past share()'s first pass: i + KGRID * KTHREADS, + 2 KGRID * KTHREADS, ..
 #define PUSH_STRIDE (KGRID * KTHREADS)
@@ -699,7 +708,7 @@ __device__ __forceinline__ void ar_attnres_rms(const uint4* __restrict__ x, uint
     else
       lamport_push(l, i, v);
   }
-  if (two)
+  if (ANY_BATCH && two)
     for (long long j = two_shot_rest(); j < tot; j += PUSH_STRIDE) l.slot[(j / KVEC) % NRANKS][j] = unpoison4(x[j]);
   lamport_clear(l);
   unsigned* const stamp = l2_stamp(state, l);
@@ -707,12 +716,12 @@ __device__ __forceinline__ void ar_attnres_rms(const uint4* __restrict__ x, uint
   l2_demote(dm, dm_bytes, B);
 
   int fail = 0;
-  if (two)
-    for (int q = b; q < B; q += KGRID)
-      if (q % NRANKS != rank) gather_share<KVEC>(l, rank, B, q, timeout_ns, fail);
-  for (int q = b; q < B; q += KGRID) {
+  for (int q = b; block_row(q, b, B); q += KGRID) {
+    if (two && q == b)  // every gather out before the first row's wait
+      for (int g = b; block_row(g, b, B); g += KGRID)
+        if (g % NRANKS != rank) gather_share<KVEC>(l, rank, B, g, timeout_ns, fail);
     const size_t at = (size_t)q * KH + t * 8;
-    if (q != b) {  // a row past the grid's first: the last row's reads of cand and s done first
+    if (ANY_BATCH && q != b) {  // a row past the grid's first: the last row's reads of cand and s done first
       __syncthreads();
       r = row_prefetch<NB>(blocks + (size_t)q * KNB_MAX * KH, sw, gamma, cand, t);
       if (act && !snapshot) pr = ldv(prefix + at);
@@ -968,7 +977,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
     else
       lamport_push(l, i, v);
   }
-  if (two)
+  if (ANY_BATCH && two)
     for (long long j = two_shot_rest(); j < tot; j += PUSH_STRIDE) {
       const int rj = (int)(j / ROWV), cj = (int)(j % ROWV);
       const uint4 u = cj < KLATV ? finalize(fc2, exp2perm + rj * TOPK, wts + rj * TOPK, cj)
@@ -981,10 +990,10 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
   l2_load_while<true>(pf2, pf2_bytes, B, stamp, FIN_GRACE_NS, state + 7);
 
   int fail = 0;
-  if (two)
-    for (int q = b; q < B; q += KGRID)
-      if (q % NRANKS != rank) gather_share<ROWV>(l, rank, B, q, timeout_ns, fail);
-  for (int q = b; q < B; q += KGRID) {
+  for (int q = b; block_row(q, b, B); q += KGRID) {
+    if (two && q == b)  // every gather out before the first row's wait
+      for (int g = b; block_row(g, b, B); g += KGRID)
+        if (g % NRANKS != rank) gather_share<ROWV>(l, rank, B, g, timeout_ns, fail);
     const long long base = (long long)q * ROWV;
     const int owner = q % NRANKS;
     // Two-shot, the block waits for its gathers, then for the row's shared half, before any thread polls the
