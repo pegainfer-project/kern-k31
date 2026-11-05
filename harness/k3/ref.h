@@ -40,6 +40,7 @@ enum : int {
   MLA_FUSED = Q_LORA + KV_A + INNER,  // 14400
   KDA_FUSED = 4 * INNER,      // 49152
   WSM = 256,
+  WSM_FA = 96,                // f_a's first column in a WSM-wide row
   EXPERTS = 896,
   TOPK = 16,
   LATENT = 3584,
@@ -55,9 +56,9 @@ static const float EPS = 1e-5f;
 static const float LB = -5.0f;
 
 // KDA line (§0 状态布局)
-static const long long REC_BYTES = 6291456LL;              // f32[96][128][128]
-static const long long WIN_BYTES = 3LL * INNER * 2;        // 73728 = bf16[3][12288]
-static const long long LINE_BYTES = REC_BYTES + 3 * WIN_BYTES;  // 6512640
+static const long long REC_BYTES = (long long)HEADS * HEAD_DIM * HEAD_DIM * 2;  // bf16[HEADS][128 v][128 k]
+static const long long WIN_BYTES = 3LL * INNER * 2;        // bf16[3 tap][INNER]
+static const long long LINE_BYTES = REC_BYTES + 3 * WIN_BYTES;
 
 // ------------------------------------------------------------------- bf16
 typedef uint16_t bf16;
@@ -250,7 +251,7 @@ static inline void ref_land_add2(const float* p1, const float* p2,
 // =========================================================================
 // K2  kern_k3_conv_silu
 // =========================================================================
-// Line helpers: window s of row b lives at line + REC_BYTES + s*73728, and is
+// Line helpers: rec of row b is at its line, window s at line + REC_BYTES + s*WIN_BYTES,
 // bf16[3 tap][INNER] with tap 0 the oldest.
 static inline bf16* win_ptr(void* kda_base, const int* line_index,
                             long long line_bytes, int b, int s) {
@@ -258,17 +259,17 @@ static inline bf16* win_ptr(void* kda_base, const int* line_index,
                REC_BYTES + (long long)s * WIN_BYTES;
   return (bf16*)p;
 }
-static inline float* rec_ptr(void* kda_base, const int* line_index,
-                             long long line_bytes, int b) {
-  return (float*)((uint8_t*)kda_base + (long long)line_index[b] * line_bytes);
+static inline bf16* rec_ptr(void* kda_base, const int* line_index,
+                            long long line_bytes, int b) {
+  return (bf16*)((uint8_t*)kda_base + (long long)line_index[b] * line_bytes);
 }
 
 // for s in {0,1,2} (q,k,v), column c:
-//   x  = bf16(partial[b, s*INNER + c])
+//   x  = bf16(partial[b*lds + s*INNER + c])
 //   y  = sum_{t<3} f32(win_s[t][c])*cw[s][t][c] + f32(x)*cw[s][3][c]
 //   sb = bf16(y);  out_s[b,c] = bf16(sb * sigma(sb))
 //   window shifts: win[0]=win[1]; win[1]=win[2]; win[2]=x
-static inline void ref_conv_silu(const float* partial, const float* cw,
+static inline void ref_conv_silu(const float* partial, int lds, const float* cw,
                                  void* kda_base, const int* line_index,
                                  long long line_bytes, bf16* conv_q,
                                  bf16* conv_k, bf16* conv_v, int B) {
@@ -277,7 +278,7 @@ static inline void ref_conv_silu(const float* partial, const float* cw,
     for (int s = 0; s < 3; ++s) {
       bf16* w = win_ptr(kda_base, line_index, line_bytes, b, s);
       for (int c = 0; c < INNER; ++c) {
-        bf16 x = f2b(partial[(size_t)b * KDA_FUSED + (size_t)s * INNER + c]);
+        bf16 x = f2b(partial[(size_t)b * lds + (size_t)s * INNER + c]);
         double y = 0.0;
         for (int t = 0; t < 3; ++t)
           y += (double)b2f(w[(size_t)t * INNER + c]) *
@@ -295,22 +296,27 @@ static inline void ref_conv_silu(const float* partial, const float* cw,
 }
 
 // =========================================================================
-// K3  kern_k3_kda_core
+// K3  kern_k3_kda_core, K2 folded in (KDA_CONV)
 // =========================================================================
-// Per row b, head h (see the kernel comment block in the ABI doc).  The q and
-// k normalisation chains are bf16 throughout; `rec` is updated in place.
-static inline void ref_kda_core(const bf16* conv_q, const bf16* conv_k,
-                                const bf16* conv_v, const float* wsm_partial,
-                                const float* gate_partial, const bf16* w_f_b,
-                                const float* dt_bias, const float* a_log,
-                                const float* gamma_o, void* kda_base,
-                                const int* line_index, long long line_bytes,
-                                bf16* out, int B) {
+// Per row b, head h (the kernel's comment block): the conv of q | k | v from
+// `partial` (row stride `lds`, the gate at column 3*INNER), then the delta rule
+// with beta at wsm column h and f_a at `wsm_fa` (row stride `wsm_ld`).  The q
+// and k normalisation chains are bf16 throughout.  rec is updated in place as
+// the kernel does it: loaded from bf16, the step and attn on the unrounded new
+// state, which lands in bf16 once on the way back.
+static inline void ref_kda_core(const float* partial, int lds, const float* cw,
+                                const float* wsm, int wsm_ld, int wsm_fa,
+                                const bf16* w_f_b, const float* dt_bias,
+                                const float* a_log, const float* gamma_o,
+                                void* kda_base, const int* line_index,
+                                long long line_bytes, bf16* out, int B) {
+  std::vector<bf16> cq((size_t)B * INNER), ck((size_t)B * INNER), cv((size_t)B * INNER);
+  ref_conv_silu(partial, lds, cw, kda_base, line_index, line_bytes, cq.data(), ck.data(), cv.data(), B);
   parallel_for(B * HEADS, [&](int bh) {
     int b = bh / HEADS, h = bh % HEADS;
-    const bf16* q = conv_q + (size_t)b * INNER + (size_t)h * 128;
-    const bf16* k = conv_k + (size_t)b * INNER + (size_t)h * 128;
-    const bf16* v = conv_v + (size_t)b * INNER + (size_t)h * 128;
+    const bf16* q = cq.data() + (size_t)b * INNER + (size_t)h * 128;
+    const bf16* k = ck.data() + (size_t)b * INNER + (size_t)h * 128;
+    const bf16* v = cv.data() + (size_t)b * INNER + (size_t)h * 128;
 
     // qtot = sum_d bf16(q[d]*q[d]) accumulated in f32; qr = bf16(rsqrt(f32(bf16(qtot))+1e-6))
     double qtot = 0.0, ktot = 0.0;
@@ -328,11 +334,10 @@ static inline void ref_kda_core(const bf16* conv_q, const bf16* conv_k,
       kn[d] = (double)b2f(bmul(k[d], kr));
     }
 
-    // beta from wsm column h; flow from wsm columns 96..224
-    double beta = sigmoidd((double)b2f(f2b(wsm_partial[(size_t)b * WSM + h])));
+    const float* w = wsm + (size_t)b * wsm_ld;
+    double beta = sigmoidd((double)b2f(f2b(w[h])));
     bf16 flow[128];
-    for (int j = 0; j < 128; ++j)
-      flow[j] = f2b(wsm_partial[(size_t)b * WSM + 96 + j]);
+    for (int j = 0; j < 128; ++j) flow[j] = f2b(w[wsm_fa + j]);
 
     double dec[128];
     double ea = std::exp((double)a_log[h]);
@@ -345,23 +350,20 @@ static inline void ref_kda_core(const bf16* conv_q, const bf16* conv_k,
       dec[d] = std::exp((double)LB * sigmoidd(ea * raw));
     }
 
-    float* S = rec_ptr(kda_base, line_index, line_bytes, b) +
-               (size_t)h * 128 * 128;
-    bf16 attn[128];
+    bf16* S = rec_ptr(kda_base, line_index, line_bytes, b) + (size_t)h * 128 * 128;
     double attn_f[128];
     for (int dv = 0; dv < 128; ++dv) {
-      float* Srow = S + (size_t)dv * 128;
+      bf16* Srow = S + (size_t)dv * 128;
       double m = 0.0;
-      for (int kk = 0; kk < 128; ++kk) m += (double)Srow[kk] * dec[kk] * kn[kk];
+      for (int kk = 0; kk < 128; ++kk) m += (double)b2f(Srow[kk]) * dec[kk] * kn[kk];
       double dlt = ((double)b2f(v[dv]) - m) * beta;
       double a = 0.0;
       for (int kk = 0; kk < 128; ++kk) {
-        float sp = (float)((double)Srow[kk] * dec[kk] + dlt * kn[kk]);
-        Srow[kk] = sp;            // rec is f32 state: attn sees the stored value
-        a += (double)sp * qs[kk];
+        double sp = (double)b2f(Srow[kk]) * dec[kk] + dlt * kn[kk];
+        a += sp * qs[kk];
+        Srow[kk] = f2b((float)sp);
       }
-      attn[dv] = f2b((float)a);
-      attn_f[dv] = b2f(attn[dv]);
+      attn_f[dv] = b2f(f2b((float)a));
     }
 
     double ss = 0.0;
@@ -369,8 +371,7 @@ static inline void ref_kda_core(const bf16* conv_q, const bf16* conv_k,
     double r = 1.0 / std::sqrt(ss / 128.0 + (double)EPS);
     for (int d = 0; d < 128; ++d) {
       bf16 o = f2b((float)(attn_f[d] * r * (double)gamma_o[d]));
-      double g = (double)b2f(f2b(gate_partial[(size_t)b * KDA_FUSED +
-                                              3 * INNER + (size_t)h * 128 + d]));
+      double g = (double)b2f(f2b(partial[(size_t)b * lds + 3 * INNER + (size_t)h * 128 + d]));
       bf16 gt = f2b((float)sigmoidd(g));
       out[(size_t)b * INNER + (size_t)h * 128 + d] = bmul(o, gt);
     }
@@ -393,24 +394,24 @@ static inline void ref_span_gather(const float* partial, const float* cw,
   wsm += (size_t)at * WSM;
   line_index += at;
   for (int i = 0; i < span; ++i)
-    ref_conv_silu(partial + (size_t)i * KDA_FUSED, cw, kda_base, line_index,
+    ref_conv_silu(partial + (size_t)i * KDA_FUSED, KDA_FUSED, cw, kda_base, line_index,
                   line_bytes, span_q + (size_t)i * INNER,
                   span_k + (size_t)i * INNER, span_v + (size_t)i * INNER, 1);
   for (int i = 0; i < span; ++i) {
     for (int h = 0; h < HEADS; ++h)
       span_beta[(size_t)h * span + i] = f2b(wsm[(size_t)i * WSM + h]);
     for (int j = 0; j < 128; ++j)
-      span_flow[(size_t)i * 128 + j] = f2b(wsm[(size_t)i * WSM + 96 + j]);
+      span_flow[(size_t)i * 128 + j] = f2b(wsm[(size_t)i * WSM + WSM_FA + j]);
   }
 }
 
 // =========================================================================
-// K10 kern_k3_span_state:  rec of row at's line <-> buf [HEADS][128][128] f32
+// K10 kern_k3_span_state:  rec of row at's line <-> buf [HEADS][128][128] bf16
 // =========================================================================
 static inline void ref_span_state(void* kda_base, const int* line_index,
                                   long long line_bytes, const int* span_at,
-                                  float* buf, int to_line) {
-  float* rec = rec_ptr(kda_base, line_index, line_bytes, *span_at);
+                                  bf16* buf, int to_line) {
+  bf16* rec = rec_ptr(kda_base, line_index, line_bytes, *span_at);
   if (to_line) std::memcpy(rec, buf, (size_t)REC_BYTES);
   else std::memcpy(buf, rec, (size_t)REC_BYTES);
 }

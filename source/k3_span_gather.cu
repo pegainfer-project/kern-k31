@@ -43,10 +43,7 @@
 #endif
 #define K9_INNER (HEADS * 128)
 #define K9_KDA_FUSED (4 * K9_INNER)
-#ifndef KDA_STATE_BF16  // the line's recurrent state ahead of the windows: f32, or bf16 (k3_kda_rec.cu's)
-#define KDA_STATE_BF16 0
-#endif
-#define K9_REC_BYTES ((long long)HEADS * 128 * 128 * (KDA_STATE_BF16 ? 2 : 4))
+#define K9_REC_BYTES ((long long)HEADS * 128 * 128 * 2)  // the line's bf16 recurrent state ahead of the windows
 #define K9_WIN_BYTES ((long long)3 * K9_INNER * 2)
 #define K9_WSM 256
 #define K9_WSM_FA 96

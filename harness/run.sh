@@ -9,7 +9,9 @@
 #   sass  every D1 cubin: no stack, no local memory, no .MULTICAST in its SASS
 #   tp8   harness/k3 (kern's K3 kernel harness, copied from its tools/k3-harness)
 #         built with the TP8 rank's model constants (HEADS 12; the build copy's ref.h
-#         patched) over the HEADS=12 / INNER=1536 variants and the router
+#         patched) over the HEADS=12 / INNER=1536 variants and the router; kda_core
+#         is the D step's two builds (gen_stage.py), conv folded in, over the fused
+#         6400-column partial
 #   d1    harness/d1.cu: vup_gate at 12 heads, the DCP fixup / pack / combine
 #         over 8 simulated members, FlashInfer routing of a 112-expert slice (contiguous and every 8th)
 #         with kern's finalize
@@ -53,7 +55,9 @@ cubin() {
   echo "$f"
 }
 
-D1=(k3_conv_silu+HEADS=12 k3_kda_core+HEADS=12 k3_kda_out_gate+HEADS=12 k3_mla_vup_gate+HEADS=12
+KDA_SMEM=k3_kda_core+HEADS=12+KDA_CONV=1+KDA_PDL=1+KDA_SMEM_STATE=1+LDS=6400+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400
+KDA_REGS=k3_kda_core+HEADS=12+KDA_CONV=1+KDA_MINB=4+LDS=6400+ROWS_PER_ITER=4+WSM_FA=12+WSM_LDS=6400
+D1=(k3_conv_silu+HEADS=12 "$KDA_SMEM" "$KDA_REGS" k3_kda_out_gate+HEADS=12 k3_mla_vup_gate+HEADS=12
     k3_mla_prep+INNER=1536+MLA_FUSED=3648 k3_dcp k3_router_argmax)
 
 sass() {
@@ -73,16 +77,15 @@ tp8() {
   local h="$out/k3-harness-tp8"
   mkdir -p "$h"
   cp "$here/k3/harness.cu" "$h/"
-  sed -e 's/^  HEADS = 96,/  HEADS = 12,/' \
-      -e 's/^static const long long REC_BYTES = 6291456LL;/static const long long REC_BYTES = (long long)HEADS * 128 * 128 * 4;/' \
-      "$here/k3/ref.h" > "$h/ref.h"
-  [ "$(grep -c '^  HEADS = 12,\|REC_BYTES = (long long)HEADS' "$h/ref.h")" -eq 2 ] \
-    || { echo "ref.h no longer has the constants this patch rewrites" >&2; exit 2; }
+  sed -e 's/^  HEADS = 96,/  HEADS = 12,/' "$here/k3/ref.h" > "$h/ref.h"
+  [ "$(grep -c '^  HEADS = 12,' "$h/ref.h")" -eq 1 ] \
+    || { echo "ref.h no longer has the constant this patch rewrites" >&2; exit 2; }
   build "$h/harness.cu" "$h/harness"
   local run=(r "$h/harness" --reps "$reps")
   for B in 1 2 8 64; do
     "${run[@]}" --kernel conv_silu --cubin "$(cubin k3_conv_silu+HEADS=12)" --B "$B" --grid "$B,3,3" --block 128,1,1
-    "${run[@]}" --kernel kda_core --cubin "$(cubin k3_kda_core+HEADS=12)" --B "$B"
+    "${run[@]}" --kernel kda_core --cubin "$(cubin "$KDA_SMEM")" --B "$B" --lds 6400 --smem 65536
+    "${run[@]}" --kernel kda_core --cubin "$(cubin "$KDA_REGS")" --B "$B" --lds 6400
     "${run[@]}" --kernel kda_out_gate --cubin "$(cubin k3_kda_out_gate+HEADS=12)" --B "$B" --grid "$B,3,1"
     "${run[@]}" --kernel mla_prep --cubin "$(cubin k3_mla_prep+INNER=1536+MLA_FUSED=3648)" --B "$B"
     "${run[@]}" --kernel mla_prep --cubin "$(cubin k3_mla_prep+INNER=1536+MLA_FUSED=3648)" --B "$B" \
@@ -114,20 +117,13 @@ d1() {
 
 conv() {
   build "$here/kda_conv_layout.cu" "$out/kda_conv_layout"
-  local d=HEADS=12+KDA_CONV=1+LDS=6400
+  local tap=CONV_TAP_MAJOR=1+HEADS=12+KDA_CONV=1
+  # the D step's two builds (gen_stage.py routes up to 25 rows to the first)
   for B in 2 8 64; do
-    r "$out/kda_conv_layout" --B "$B" --base "$(cubin k3_kda_core+$d+WSM_FA=12+WSM_LDS=6400)" \
-      --variant "$(cubin k3_kda_core+CONV_TAP_MAJOR=1+$d+LINE_GUARD=1+WSM_FA=12+WSM_LDS=6400)"
-    # the D step's two builds (gen_stage.py routes up to 25 rows to the first)
-    r "$out/kda_conv_layout" --B "$B" --smem 65536 \
-      --base "$(cubin k3_kda_core+HEADS=12+KDA_CONV=1+KDA_SMEM_STATE=1+LDS=6400+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400)" \
-      --variant "$(cubin k3_kda_core+CONV_TAP_MAJOR=1+HEADS=12+KDA_CONV=1+KDA_SMEM_STATE=1+LDS=6400+LINE_GUARD=1+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400)"
-    r "$out/kda_conv_layout" --B "$B" --smem 65536 \
-      --base "$(cubin k3_kda_core+HEADS=12+KDA_CONV=1+KDA_PDL=1+KDA_SMEM_STATE=1+LDS=6400+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400)" \
-      --variant "$(cubin k3_kda_core+CONV_TAP_MAJOR=1+HEADS=12+KDA_CONV=1+KDA_PDL=1+KDA_SMEM_STATE=1+LDS=6400+LINE_GUARD=1+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400)"
-    r "$out/kda_conv_layout" --B "$B" \
-      --base "$(cubin k3_kda_core+HEADS=12+KDA_CONV=1+KDA_MINB=4+LDS=6400+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400)" \
-      --variant "$(cubin k3_kda_core+CONV_TAP_MAJOR=1+HEADS=12+KDA_CONV=1+KDA_MINB=4+LDS=6400+LINE_GUARD=1+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400)"
+    r "$out/kda_conv_layout" --B "$B" --smem 65536 --base "$(cubin "$KDA_SMEM")" \
+      --variant "$(cubin k3_kda_core+$tap+KDA_PDL=1+KDA_SMEM_STATE=1+LDS=6400+LINE_GUARD=1+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400)"
+    r "$out/kda_conv_layout" --B "$B" --base "$(cubin "$KDA_REGS")" \
+      --variant "$(cubin k3_kda_core+$tap+KDA_MINB=4+LDS=6400+LINE_GUARD=1+ROWS_PER_ITER=4+WSM_FA=12+WSM_LDS=6400)"
   done
 }
 

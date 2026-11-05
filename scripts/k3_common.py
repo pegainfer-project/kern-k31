@@ -24,7 +24,7 @@ NB_MAX = 8
 LAYERS = 93
 MLA_LAYERS = {3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63, 67, 71, 75, 79, 83, 87, 91, 92}
 
-# KDA state line: the recurrent state [96,128,128] (bf16, or f32 with --kda-state f32) then the three
+# KDA state line: the recurrent state [96,128,128] bf16, then the three
 # conv windows bf16 [3][12288] (q, k, v).
 # MLA latent cache: 64-token pages of [mla_layers][64][576], e4m3 or bf16 (the flavor's BYTES).
 PAGE = 64

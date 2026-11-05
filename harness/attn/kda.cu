@@ -15,7 +15,7 @@
 #define CK(x) do { CUresult r_ = (x); if (r_ != CUDA_SUCCESS) { const char* s; cuGetErrorString(r_, &s); \
   fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, s); exit(2); } } while (0)
 static const int H = 12, KD = 128, INNER = H * KD, LDS = 6400;
-static const long long REC = (long long)H * KD * KD * 4, LINE = REC + 3LL * 3 * INNER * 2;
+static const long long REC = (long long)H * KD * KD * 2, LINE = REC + 3LL * 3 * INNER * 2;
 static uint64_t rng = 88172645463325252ull;
 static float frand() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return (rng >> 40) / 16777216.0f * 2 - 1; }
 static uint16_t f2b(float f) { uint32_t u; memcpy(&u, &f, 4); return (u + 0x7fff + ((u >> 16) & 1)) >> 16; }
@@ -55,10 +55,13 @@ int main(int argc, char** argv) {
               d_wfb = up(wfb.data(), wfb.size() * 2), d_dtb = up(dtb.data(), INNER * 4), d_alog = up(alog.data(), H * 4),
               d_gam = up(gam.data(), KD * 4);
   int zero[2] = {0, 0}; CUdeviceptr d_span = up(zero, 8);
-  const int SETS = 6;  // rotating line sets: 6 x 64 lines x 814 KB = 312 MB
+  const int SETS = 6;  // rotating line sets: 6 x 64 lines x 421 KB = 162 MB
   std::vector<uint8_t> lines((size_t)SETS * BM * LINE);
-  { float* f = (float*)lines.data(); for (size_t i = 0; i < lines.size() / 4; ++i) f[i] = frand() * 0.05f; }
-  for (int l = 0; l < SETS * BM; ++l) { uint16_t* w = (uint16_t*)(lines.data() + (size_t)l * LINE + REC); for (int i = 0; i < 9 * INNER; ++i) w[i] = f2b(frand()); }
+  for (int l = 0; l < SETS * BM; ++l) {
+    uint16_t* s = (uint16_t*)(lines.data() + (size_t)l * LINE);
+    for (long long i = 0; i < REC / 2; ++i) s[i] = f2b(frand() * 0.05f);
+    for (int i = 0; i < 9 * INNER; ++i) s[REC / 2 + i] = f2b(frand());
+  }
   CUdeviceptr d_lines = up(lines.data(), lines.size());
   std::vector<int> li(SETS * BM); for (int i = 0; i < SETS * BM; ++i) li[i] = i;
   CUdeviceptr d_li = up(li.data(), li.size() * 4);

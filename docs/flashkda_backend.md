@@ -261,7 +261,7 @@ SGLang forces K3 decode to Triton (`arg_groups/kimi_k3_hook.py`), whatever the p
 
 **What `k3_kda_rec` changes.**
 - It reads and writes the state through `line_index`, which is the state pool.
-- It keeps the state in fp32 registers and rounds it only as an MMA operand; the line is stored bf16 with `KDA_STATE_BF16=1`.
+- It keeps the state in fp32 registers and rounds it only as an MMA operand; the line is stored bf16.
 - Warp 9 advances the conv windows.
 - 56 extra gate CTAs sit on the SMs the heads leave idle. They apply RMS·γ·sigmoid(gate) as tiles are published through release/acquire progress counters.
 - Its grid is `nseq·96 + 56`, block 512, with 182 KB of shared memory.

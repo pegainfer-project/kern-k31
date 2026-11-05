@@ -29,7 +29,7 @@
 typedef uint16_t bf16;
 
 static const int HEADS = 12, KD = 128, INNER = HEADS * KD, LDS = 6400, TAPS = 3, STREAMS = 3;
-static const long long REC = (long long)HEADS * KD * KD * 4, WIN = (long long)TAPS * STREAMS * INNER * 2;
+static const long long REC = (long long)HEADS * KD * KD * 2, WIN = (long long)TAPS * STREAMS * INNER * 2;
 static const long long LINE = REC + WIN;
 
 static void cu(CUresult r, const char* what) {
@@ -123,7 +123,7 @@ int main(int argc, char** argv) {
   auto partial = f32((size_t)B * LDS, 0.f, 1.f), cw = f32((size_t)STREAMS * 4 * INNER, 0.f, 0.5f);
   auto w_f_b = b16((size_t)INNER * KD, 0.044f);
   auto dt_bias = f32(INNER, 0.f, 1.f), a_log = f32(HEADS, 0.f, 0.5f), gamma_o = f32(KD, 1.f, 0.1f);
-  auto rec = f32((size_t)slots * REC / 4, 0.f, 0.1f);
+  auto rec = b16((size_t)slots * REC / 2, 0.1f);
   auto win = b16((size_t)slots * WIN / 2, 1.f);  // in the variant's layout
 
   std::vector<uint8_t> lines((size_t)slots * LINE);
@@ -141,7 +141,7 @@ int main(int argc, char** argv) {
   CUdeviceptr dwfb = put(w_f_b.data(), w_f_b.size() * 2), ddt = put(dt_bias.data(), dt_bias.size() * 4);
   CUdeviceptr dal = put(a_log.data(), a_log.size() * 4), dgo = put(gamma_o.data(), gamma_o.size() * 4);
   CUdeviceptr dlines = put(lines.data(), lines.size());
-  CUdeviceptr drec = put(rec.data(), rec.size() * 4), dwin = put(win.data(), win.size() * 2);
+  CUdeviceptr drec = put(rec.data(), rec.size() * 2), dwin = put(win.data(), win.size() * 2);
   CUdeviceptr dbi = put(base_index.data(), B * 4), dvi = put(var_index.data(), B * 4);
   std::vector<bf16> poison((size_t)B * INNER, 0x7fc0);
   CUdeviceptr dob = put(poison.data(), poison.size() * 2), dov = put(poison.data(), poison.size() * 2);
@@ -160,7 +160,7 @@ int main(int argc, char** argv) {
   CU(cuCtxSynchronize());
 
   auto ob = get(dob, poison.size() * 2), ov = get(dov, poison.size() * 2);
-  auto lb_ = get(dlines, lines.size()), rv = get(drec, rec.size() * 4), wv = get(dwin, win.size() * 2);
+  auto lb_ = get(dlines, lines.size()), rv = get(drec, rec.size() * 2), wv = get(dwin, win.size() * 2);
   long bad_out = 0, bad_pad = 0, bad_rec = 0, bad_win = 0;
   for (int b = 0; b < B; ++b) {
     const bf16* x = (const bf16*)ob.data() + (size_t)b * INNER;

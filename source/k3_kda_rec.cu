@@ -52,20 +52,10 @@
 #ifndef K12_LD  // partial's row stride: q | k | v | gate, then wsm when one projection made both
 #define K12_LD K12_FUSED
 #endif
-// -DKDA_STATE_BF16=1: the recurrent state is stored bf16 (vLLM's mamba_ssm_cache_dtype bfloat16); it is
-// f32 in registers between tiles either way.
-#ifndef KDA_STATE_BF16
-#define KDA_STATE_BF16 0
-#endif
-#if KDA_STATE_BF16
+// The recurrent state is stored bf16 (vLLM's mamba_ssm_cache_dtype bfloat16), f32 in registers between tiles.
 typedef __nv_bfloat16 rec_t;
 __device__ __forceinline__ float2 rec_ld(const rec_t* p) { return __bfloat1622float2(*(const __nv_bfloat162*)p); }
 __device__ __forceinline__ void rec_st(rec_t* p, float2 v) { *(__nv_bfloat162*)p = __float22bfloat162_rn(v); }
-#else
-typedef float rec_t;
-__device__ __forceinline__ float2 rec_ld(const rec_t* p) { return *(const float2*)p; }
-__device__ __forceinline__ void rec_st(rec_t* p, float2 v) { *(float2*)p = v; }
-#endif
 #define K12_REC_BYTES ((long long)HEADS * 128 * 128 * sizeof(rec_t))
 #define K12_WIN_BYTES ((long long)3 * K12_INNER * 2)
 #define K12_STAGES 8
