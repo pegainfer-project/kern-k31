@@ -211,10 +211,10 @@ source = "source/k3_mla_decode.cu"
 sha256 = "294904766b0a807501ef596c0698dfa819713085d5510981f427b30c8ef77920"
 source = "source/k3_mla_absorb_tc.cu"
 
-[kernels."k3_moe_front+EXPERTS=896+LDS=6016+SH=768+STRIDE=8"]
-sha256 = "9282dde7a1c56ee7d1bf3fcb1645057327555206be4fae1866f4bdb85eb52f1b"
+[kernels."k3_moe_front+EXPERTS=896+LDS=2880+NRANKS=8+SH=768+STRIDE=8"]
+sha256 = "b03587d918522255a5673638cc91e0fabbbc61d8902b51c2ed55cc0b3135a5a6"
 source = "source/k3_moe_front.cu"
-defines = { EXPERTS = 896, LDS = 6016, SH = 768, STRIDE = 8 }
+defines = { EXPERTS = 896, LDS = 2880, NRANKS = 8, SH = 768, STRIDE = 8 }
 
 [kernels."k3_ar_fused+NRANKS=8"]
 sha256 = "c918d91af942b6cecd213291699aa9be54fb2646bd328d15b0627d1fa0f3e27d"

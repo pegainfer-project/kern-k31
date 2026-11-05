@@ -234,12 +234,16 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     mla_fused_l = Q_LORA + KV_A + inner_l
     # This rank's columns of the shared expert and the dense FFN.
     sh_l, dn_l = SHARED // tp, DENSE_I // tp
-    # A D member's MoE front is one GEMM over the router, lat_down and this
-    # rank's shared gate | up rows (one read of 86 MB at 6016 columns instead of
-    # three launches with their split-K reduces); each reader takes its
-    # columns of the f32 row. Its kernel holds the rank's shared down projection in shared memory, which one
-    # GPU's whole shared expert does not fit: TP1 runs the three launches.
-    front = EXPERTS + LATENT + 2 * sh_l if xchg else 0
+    # A D member's MoE front is one GEMM over the router, this rank's LATENT / tp lat_down rows and its shared
+    # gate | up rows (one read of 41 MB at 2880 columns instead of three launches with their split-K reduces).
+    # moe_front routes on the router's columns, which every member computes, while the latent's slices are
+    # quantised and gathered over the group behind the top-k. Its kernel holds the rank's shared down
+    # projection in shared memory, which one GPU's whole shared expert does not fit: TP1 runs the three launches.
+    lat_l = LATENT // tp
+    front = EXPERTS + lat_l + 2 * sh_l if xchg else 0
+    # k3_moe_front.cu's gather: a row's slice in 16-byte vectors (e4m3, then a scale a 16-bit lane) a member,
+    # two stages of every member's slots
+    lat_stage = tp * D_SEQS_MAX * (lat_l // 16 + -(-lat_l // 256)) * 16
     assert not front or bp["tile"] == 16, \
         f"k3_moe_front.cu builds the MoE GEMMs' tables for 16-token tiles, the variants' tile is {bp['tile']}"
     # P's projections land in their GEMM's epilogue (cuBLASLt, bf16 D); D's
@@ -444,10 +448,12 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             "params": ["in buffer<f32>", "in buffer<f32>", "in buffer<bf16>", "out buffer<i32>", "out buffer<f32>",
                        "out buffer<u8>", "out buffer<u8>", "out buffer<bf16>", *["inout buffer<i32>"] * 3,
                        *["out buffer<i32>"] * 6, "in buffer<bf16>", "out buffer<bf16>", "in buffer<u8>", "in buffer<u8>",
-                       "i32", "i32"],
+                       "i32", "i32", "inout buffer<u8>", "in buffer<u64>", "inout buffer<i32>", "out buffer<i32>",
+                       "i64"],
             "impl": {"launches": [{**launch("k3_moe_front", "kern_k3_moe_front", grid=grid, block=[1024, 1, 1],
                                             smem=smem, when={"var": T, **when},
-                                            defines={"EXPERTS": EXPERTS, "LDS": front, "SH": sh_l, "STRIDE": tp}),
+                                            defines={"EXPERTS": EXPERTS, "LDS": front, "SH": sh_l, "STRIDE": tp,
+                                                     "NRANKS": tp}),
                                    "pdl": True}
                                   for grid, smem, when in (
                                       ([{"add": [T, H // 64]}, 1, 1], 1024 + 2 * sh_l * 128 + 64 * 64 * 2,
@@ -834,6 +840,10 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         # moe_front's shared-expert flags and its rows' ids, to them
         buffers["sh_ready"] = {"dtype": "i32", "shape": [H // 64, D_SEQS_MAX], "kind": "carry"}
         buffers["sh_ids"] = {"dtype": "i32", "shape": [H // 64, D_SEQS_MAX], "kind": "carry"}
+        # moe_front's latent gather: two Lamport stages, their peers, the stage of the next call
+        buffers["lat_lamport"] = {"dtype": "u8", "shape": [2 * lat_stage], "kind": "carry", "export": True}
+        buffers["lat_lamport_peers"] = {"dtype": "u64", "shape": [tp], "kind": "peer", "of": "lat_lamport", "group": "tp"}
+        buffers["lat_state"] = {"dtype": "i32", "shape": [1], "kind": "carry"}
     else:
         work("router_partial", EXPERTS, "f32", var=RW)
     work("topk_idx", TOPK, "i32", var=RW)
@@ -1132,7 +1142,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                          b("sh_ids"), b("moe_done"), *(b("moe." + n) for n in ("cta_batch", "cta_limit", "num_non_exiting",
                                                                   "total_padded", "route_map", "exp2perm")),
                          w("sh_down"), b("moe_flat", seqs_max * LATENT * 2), w("moe.w13s"), w("moe.w13_sfs"),
-                         {"rank": "tp"}, B)
+                         {"rank": "tp"}, B, b("lat_lamport"), b("lat_lamport_peers"), b("lat_state"), b("tp_err"),
+                         i64(TP_TIMEOUT_NS))
                 else:
                     gemm(L + "router", b("normed"), w("w_router"), b("router_partial"), EXPERTS, H)
                     step(L + "topk", "router_topk", b("router_partial"), w("bias"), w("rs"), b("topk_idx"),
@@ -1276,7 +1287,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             e = q + "block_sparse_moe."
             if front:
                 weight(n + "w_front", [front, H],
-                       [seg(e + "gate.weight"), seg(e + "routed_expert_down_proj.weight"),
+                       [seg(e + "gate.weight"), seg(e + "routed_expert_down_proj.weight", rows=shard(lat_l)),
                         seg(e + "shared_experts.gate_proj.weight", rows=shard(sh_l)),
                         seg(e + "shared_experts.up_proj.weight", rows=shard(sh_l))])
             else:
@@ -1355,6 +1366,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     # -0.0 before the first allreduce, and a carry starts at zero.
     init = ([{"label": "tp_init", "op": "tp_lamport_init_bf16", "args": [b("tp_ar_lamport"), i64(3 * ar_stage)]}]
             if xchg else []) + (
+        [{"label": "lat_init", "op": "tp_lamport_init_bf16", "args": [b("lat_lamport"), i64(2 * lat_stage)]}]
+        if front else []) + (
         [{"label": "dcp_init", "op": "dcp_init", "args": [b("dcp_lamport"), i64(3 * dcp_stage)]}] if xchg and mla else []) + (
         [{"label": "idx_init", "op": "idx_init",
           "args": [b("idx_lamport"), i64(3 * k31_dsa.cand_stage(seqs_max, tp, max_ctx // tp))]}] if xchg and mla and dsa else [])

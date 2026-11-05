@@ -1,11 +1,12 @@
 // A DCP decode step's MoE front in one launch: everything between the front
-// GEMM (router | lat_down | this rank's shared gate | up, one f32 row of LDS
+// GEMM (router | this rank's LATL lat_down rows | its shared gate | up, one f32 row of LDS
 // columns) and the batched GEMMs, and the shared expert's down projection.
 //
 //   kern_k3_moe_front(const f32* S, const f32* bias, const bf16* rs, i32* idx, f32* wts,
-//       u8* q, u8* sf, bf16* act, i32* ready, i32* done, i32* cta_batch, i32* cta_limit,
+//       u8* q, u8* sf, bf16* act, i32* ready, i32* ids, i32* done, i32* cta_batch, i32* cta_limit,
 //       i32* num_non_exiting, i32* total_padded, i32* route_map, i32* exp2perm,
-//       const bf16* wsh, bf16* sh_out, int first, int T)
+//       const bf16* wsh, bf16* sh_out, const u8* w13, const u8* w13_sf, int first, int T,
+//       u8* stage, const u64* peers, i32* lstate, i32* err, i64 timeout_ns)
 //   grid (T + NSH / 64, 1, 1)   block (1024, 1, 1)   shared SMEM_SH bytes   T <= ROWS_MAX
 //   or grid (T, 1, 1), shared 0: the row blocks alone, the shared down projection left to a GEMM after FC2
 //
@@ -22,9 +23,11 @@
 //   * meanwhile warps 28..31 run k3_land.cu's land_situ on the shared expert's
 //     gate | up (the SH columns after the latent) and publish the row to each
 //     shared-expert block T + c (ready[c * ROWS_MAX + b] = 1, st.release.gpu); once the
-//     candidates are in, warps 14..27 land the latent (columns EXPERTS + [0, LATENT))
-//     to bf16 and quantise it to mxfp8 as k3_moe_prefill.cu's kern_k3_moe_quant
-//     (four threads per 32-element group);
+//     candidates are in, warps 26..27 land this rank's slice of the latent (columns
+//     EXPERTS + [0, LATL), the latent's [first * LATL, (first + 1) * LATL); `first` is
+//     the rank) to bf16 and quantise it to mxfp8 as k3_moe_prefill.cu's kern_k3_moe_quant
+//     (four threads per 32-element group), and warps 1..8 trade the slices of row b
+//     with the group (gather, below) into the whole row's q | sf;
 // then the last row block to finish (`done`, a zeroed carry it re-zeroes) builds
 // the routing tables of this rank's experts `first + j * STRIDE` (j < LOCAL)
 // over all T rows: what FlashInfer's routing writes for the batched GEMMs'
@@ -34,7 +37,7 @@
 // Blocks T + c, when the grid has them: the shared expert's down projection of 64 output columns
 // (shared_down, below); the row blocks publish to them only then.
 //
-//   nvcc -cubin -arch=sm_103a -DEXPERTS=896 -DLDS=6016 -DSH=768 -DSTRIDE=8 k3_moe_front.cu
+//   nvcc -cubin -arch=sm_103a -DEXPERTS=896 -DLDS=2880 -DNRANKS=8 -DSH=768 -DSTRIDE=8 k3_moe_front.cu
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cstdint>
@@ -52,6 +55,10 @@
 #define STRIDE 8
 #endif
 #define LATENT 3584
+#ifndef NRANKS
+#define NRANKS 8
+#endif
+#define LATL (LATENT / NRANKS)  // the latent columns of this rank's front
 #ifndef NSH
 #define NSH 7168  // the shared expert's output width (the hidden size)
 #endif
@@ -65,9 +72,9 @@ static_assert(FC1_W % (READERS * 16) == 0 && FC1_SF % (READERS * 16) == 0, "16-b
 #define TILE 16
 #define LOCAL (EXPERTS / STRIDE)
 #define THREADS 1024
-#define QUANT_THREADS (LATENT / 8)
+#define QUANT_THREADS (LATL / 8)
 #define SITU_THREADS (SH / 4)
-static_assert(QUANT_THREADS % 32 == 0 && SH % 4 == 0, "whole warps");
+static_assert(QUANT_THREADS % 4 == 0 && SH % 4 == 0, "whole 32-column groups");
 #define IDS_PER ((ROWS_MAX * TOPK + THREADS - 1) / THREADS)  // the expanded ids a thread routes at most
 static_assert(LOCAL <= THREADS, "an expert a thread");
 
@@ -217,7 +224,7 @@ __device__ __forceinline__ unsigned long long merge32(unsigned long long v, int 
 }
 
 #define SORT_WARPS (EXPERTS / 32)
-#define QUANT_WARP0 (SORT_WARPS - QUANT_THREADS / 32)
+#define QUANT_WARP0 (SORT_WARPS - (QUANT_THREADS + 31) / 32)
 static_assert(EXPERTS % 32 == 0 && TOPK <= SORT_WARPS && SORT_WARPS <= 31 && QUANT_WARP0 > 0,
               "a warp of experts each, at least TOPK of them; a warp left for the SiTU, the latent's after warp 0");
 
@@ -377,6 +384,84 @@ __device__ __forceinline__ void shared_down(const __nv_bfloat16* __restrict__ ac
   if (warp == 2) asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 64;" ::"r"(s_tmem) : "memory");
 }
 
+// ---- a row's mxfp8 latent over the group ----
+// Row b's block quantises its rank's LATL columns (LATL / 32 whole groups: the bytes and scales a quantisation
+// of the whole row gives them) and pushes them as GVEC 16-byte vectors into slot (rank, b) of every member's
+// Lamport stage: GVEC_Q of e4m3 bytes, then the scales one a 16-bit lane. A slot is poisoned when every
+// 16-bit lane of it reads 0x8000: a scale lane is at most 0x00fe, and an e4m3 -0 (0x80) is sent as +0, so
+// data never reads as poison. (A zero product's sign is all that can differ; FC1 sums 3584 of them.)
+// Two stages alternate by call (`lstate[0]`, flipped by the tables block); a member re-poisons each slot as
+// it reads it, which is before any peer can come round to that stage again (two calls on, past this
+// member's next pushes). A peer's first push waits on nothing: the layer's attention all-reduce before
+// this call has seen every member through its once-program, which poisons the stages.
+#define GVEC_Q (LATL / 16)
+#define GVEC (GVEC_Q + (LATL / 32 + 7) / 8)
+#define GSTAGE (NRANKS * ROWS_MAX * GVEC)  // vectors
+#define GTHREADS ((SORT_WARPS - 1) * 32)   // the sort warps past warp 0 push and gather
+static_assert(LATL % 32 == 0 && NRANKS * GVEC <= GTHREADS, "whole groups, a vector a thread");
+
+__device__ __forceinline__ uint32_t pos_zero(uint32_t w) {
+#pragma unroll
+  for (int k = 0; k < 32; k += 8)
+    if (((w >> k) & 0xffu) == 0x80u) w &= ~(0xffu << k);
+  return w;
+}
+
+__device__ __forceinline__ bool lane_poisoned(uint32_t w) { return (w & 0xffffu) == 0x8000u || (w >> 16) == 0x8000u; }
+
+__device__ __forceinline__ uint4 ld_volatile4(const uint4* p) {
+  uint4 v;
+  asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+  return v;
+}
+
+// Thread k < NRANKS GVEC of the gather: pushes vector k % GVEC of the row's slice to member k / GVEC, then waits
+// for vector k % GVEC of member k / GVEC's slice in its own stage, lands it in q / sf and re-poisons it. A
+// deadline that passes is a broken group: the member records the late rank in `err` and traps.
+__device__ __forceinline__ void gather(const uint8_t* s_q, const uint8_t* s_sf, uint4* stage,
+                                       const unsigned long long* peers, long long phase_at, int rank, int b, int k,
+                                       uint8_t* __restrict__ q, uint8_t* __restrict__ sf, int* err,
+                                       long long timeout_ns) {
+  const int r = k / GVEC, v = k % GVEC;
+  uint4 o;
+  if (v < GVEC_Q) {
+    const uint4 x = reinterpret_cast<const uint4*>(s_q)[v];
+    o = make_uint4(pos_zero(x.x), pos_zero(x.y), pos_zero(x.z), pos_zero(x.w));
+  } else {
+    uint32_t w[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int g = (v - GVEC_Q) * 8 + 2 * j;
+      w[j] = (g < LATL / 32 ? s_sf[g] : 0u) | (g + 1 < LATL / 32 ? (uint32_t)s_sf[g + 1] << 16 : 0u);
+    }
+    o = make_uint4(w[0], w[1], w[2], w[3]);
+  }
+  const long long slot = (long long)(rank * ROWS_MAX + b) * GVEC + v;
+  reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(peers[r]) + phase_at)[slot] = o;
+  uint4* mine = reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(stage) + phase_at) + (long long)(r * ROWS_MAX + b) * GVEC + v;
+  uint4 x = ld_volatile4(mine);
+  const long long t0 = clock64();
+  while (lane_poisoned(x.x) || lane_poisoned(x.y) || lane_poisoned(x.z) || lane_poisoned(x.w)) {
+    if (clock64() - t0 > 2 * timeout_ns) {
+      atomicMax(err, 1 + r);
+      __threadfence_system();
+      __trap();
+    }
+    x = ld_volatile4(mine);
+  }
+  *mine = make_uint4(0x80008000u, 0x80008000u, 0x80008000u, 0x80008000u);
+  if (v < GVEC_Q) {
+    reinterpret_cast<uint4*>(q + (long long)b * LATENT + r * LATL)[v] = x;
+  } else {
+    const uint32_t w[4] = {x.x, x.y, x.z, x.w};
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int g = (v - GVEC_Q) * 8 + j;
+      if (g < LATL / 32) sf[(long long)b * (LATENT / 32) + r * (LATL / 32) + g] = (uint8_t)(w[j / 2] >> (16 * (j % 2)));
+    }
+  }
+}
+
 extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
     const float* __restrict__ S, const float* __restrict__ bias, const __nv_bfloat16* __restrict__ rs,
     int* __restrict__ idx, float* __restrict__ wts, uint8_t* __restrict__ q, uint8_t* __restrict__ sf,
@@ -385,7 +470,8 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
     int* __restrict__ cta_limit, int* __restrict__ num_non_exiting, int* __restrict__ total_padded,
     int* __restrict__ route_map, int* __restrict__ exp2perm, const __nv_bfloat16* __restrict__ wsh,
     __nv_bfloat16* __restrict__ sh_out, const uint8_t* __restrict__ w13, const uint8_t* __restrict__ w13_sf, int first,
-    int T) {
+    int T, uint4* stage, const unsigned long long* __restrict__ peers, int* __restrict__ lstate, int* err,
+    long long timeout_ns) {
   __shared__ float s_sig[EXPERTS];
   __shared__ unsigned long long s_cand[EXPERTS];
   __shared__ u32 s_max[32], s_tau;
@@ -444,8 +530,16 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
       const int j = __reduce_min_sync(0xffffffffu, mine), j2 = __reduce_min_sync(0xffffffffu, mine == j ? LOCAL : mine);
       if (lane == 0) s_jmin = j + 256 * j2;
       asm volatile("bar.arrive 4, %0;" ::"n"(32 + THREADS - SORT_WARPS * 32) : "memory");  // to the SiTU warps
-    } else if (warp >= QUANT_WARP0) {
-      quant8(row + EXPERTS, q + (long long)b * LATENT, sf + (long long)b * (LATENT / 32), t - QUANT_WARP0 * 32);
+    } else {
+      // this rank's latent slice to shared memory (the lanes past it quantise columns nobody reads), then to
+      // the group
+      __shared__ __align__(16) uint8_t s_q[(QUANT_THREADS + 31) / 32 * 32 * 8];
+      __shared__ uint8_t s_sf[(QUANT_THREADS + 31) / 32 * 8];
+      const long long phase_at = (long long)lstate[0] * GSTAGE * 16;
+      if (warp >= QUANT_WARP0) quant8(row + EXPERTS, s_q, s_sf, t - QUANT_WARP0 * 32);
+      asm volatile("bar.sync 5, %0;" ::"n"(GTHREADS) : "memory");
+      if (t - 32 < NRANKS * GVEC)
+        gather(s_q, s_sf, stage, peers, phase_at, first, b, t - 32, q, sf, err, timeout_ns);
     }
   } else {
     // every pass's gate | up loads in flight before the first is used
@@ -455,8 +549,8 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
     for (int p = 0; p < PASSES; ++p) {
       const int k = t - SORT_WARPS * 32 + p * SITU_LANES;
       if (k < SITU_THREADS) {
-        g[p] = reinterpret_cast<const float4*>(row + EXPERTS + LATENT)[k];
-        u[p] = reinterpret_cast<const float4*>(row + EXPERTS + LATENT + SH)[k];
+        g[p] = reinterpret_cast<const float4*>(row + EXPERTS + LATL)[k];
+        u[p] = reinterpret_cast<const float4*>(row + EXPERTS + LATL + SH)[k];
       }
     }
 #pragma unroll
@@ -490,5 +584,8 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
   __syncthreads();
   if (!s_last) return;
   route(idx, first, T, s_count, cta_batch, cta_limit, num_non_exiting, total_padded, route_map, exp2perm);
-  if (t == 0) *done = 0;
+  if (t == 0) {
+    *done = 0;
+    lstate[0] ^= 1;
+  }
 }
