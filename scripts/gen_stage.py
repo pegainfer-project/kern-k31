@@ -93,6 +93,8 @@ KV = {"fp8": k3_kv_fp8, "bf16": k3_kv_bf16}
 # k3_ar_fused.cu's KGRID, one block an SM: every block resident on 148 and 152 SMs, a multiple of the cluster of 8
 # and under the 256-row flag table
 TP_AR_GRID = 144
+# the rows a D step takes at most: k3_head.cu's KEY_ROWS and k3_moe_front.cu's ROWS_MAX, its tables' strides
+D_SEQS_MAX = 256
 DCP_GRID = 2 * 144  # k3_dcp.cu bounds the exchange to two blocks an SM: every block resident on 148 and 152 SMs
 KDA_SLOTS = 3 * 152  # k3_kda_core.cu: three blocks an SM, every one resident, each walking a head's rows
 CAND_SMEM = NB_MAX * H * 2  # k3_ar_fused.cu: a row's snapshots prefetched into shared memory
@@ -840,11 +842,12 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         buffers["argmax_done"] = {"dtype": "i32", "shape": [seqs_max], "kind": "carry"}
     if xchg:
         # every member's slice of the logits lands in member 0's whole row, which the caller reads;
-        # the members' best keys change hands through 3 stages of [tp, 64] u64
+        # the members' best keys change hands through 3 stages of [tp, D_SEQS_MAX] u64
         buffers["logits"] = {"dtype": "f32", "shape": [seqs_max, V], "kind": "carry", "export": True}
         buffers["logits_peers"] = {"dtype": "u64", "shape": [tp], "kind": "peer", "of": "logits", "group": "tp"}
         work("logits_part", V // tp, "f32", var="seqs")
-        buffers["head_keys"] = {"dtype": "u8", "shape": [3 * tp * 64 * 8], "kind": "carry", "export": True}
+        buffers["head_keys"] = {"dtype": "u8", "shape": [3 * tp * D_SEQS_MAX * 8], "kind": "carry",
+                                 "export": True}
         buffers["head_keys_peers"] = {"dtype": "u64", "shape": [tp], "kind": "peer", "of": "head_keys",
                                       "group": "tp"}
         buffers["head_state"] = {"dtype": "i32", "shape": [8], "kind": "carry"}
