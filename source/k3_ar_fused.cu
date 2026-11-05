@@ -49,6 +49,10 @@
 //   kern_k3_land_add2_attnres_rms_nb<NB>   a layer's closing add, then the next layer's mix and norm:
 //                                   a row a cluster of LAND_CL blocks of 1024 / LAND_CL threads, dynamic
 //                                   smem KCAND_BYTES / LAND_CL; the blocks past LAND_CL * B prefetch `pf`
+//   kern_k3_land_gather_attnres_rms_nb<NB>(.., u8* stage, const u64* peers, i32* err, int rank, int phase,
+//       i64 timeout_ns, pf, pf_bytes)
+//                                   the same with p1 this rank's KH / NRANKS columns of the row (lat_up's
+//                                   column slice, rows KH / NRANKS apart), gathered over the group first
 // A snapshot count is an entry, not a switch in one: a call runs its own code from the entry on. In
 // the step every call fetches its instructions cold, and one kernel holding all nine counts (390 KB of
 // code) ran the counts far from its entry 5-6 us slower than nb 1.
@@ -797,12 +801,58 @@ struct LandSmem {
   unsigned long long bar;  // the norm's (cluster_block_sum)
 };
 
-template <int NB>
+// The gather of p1's column slices: vector v of row b sits in slot b * KVEC + v of a stage, written only by
+// its owner (v / GVEC_OWN), so a stage holds a row once. Row b's cluster pushes this rank's GVEC_OWN vectors
+// into the NRANKS - 1 peers' stages a store a thread, then every thread waits for its own vector, takes it and
+// re-poisons the slot. A bf16 -0.0 goes as +0.0 (the all-reduces' rule), this rank's own vectors too, so every
+// rank lands the same row. Two stages alternate by call (`phase`, the generator's count): a peer comes round
+// to a stage again two calls on, past an all-reduce that waited for this rank's re-poison. The first call
+// needs no handshake: the attention all-reduce before it has seen every member through its once-program,
+// which poisons the stages.
+#define GVEC_OWN (KVEC / NRANKS)
+#define LAND_ROWS_MAX 256  // gen_stage.py's D_SEQS_MAX: a stage's rows
+static_assert(KVEC % NRANKS == 0 && (NRANKS - 1) * GVEC_OWN <= KTHREADS, "a push a thread of the row's cluster");
+
+struct Gather {
+  uint8_t* stage;
+  const unsigned long long* peers;
+  int* err;
+  int rank, phase;
+  long long timeout_ns;
+};
+
+__device__ __forceinline__ void gather_push(const Gather& g, const bf16_t* __restrict__ p1, int b, int k) {
+  if (k >= (NRANKS - 1) * GVEC_OWN) return;
+  const int j = k % GVEC_OWN, q = k / GVEC_OWN, peer = q + (q >= g.rank);
+  const uint4 v = unpoison4(*reinterpret_cast<const uint4*>(p1 + ((size_t)b * GVEC_OWN + j) * 8));
+  const long long slot = (long long)g.phase * LAND_ROWS_MAX * KVEC + (long long)b * KVEC + g.rank * GVEC_OWN + j;
+  reinterpret_cast<uint4*>(g.peers[peer])[slot] = v;
+}
+
+__device__ __forceinline__ V8 gather_take(const Gather& g, const bf16_t* __restrict__ p1, int b, int vi) {
+  const int owner = vi / GVEC_OWN;
+  uint4 x;
+  if (owner == g.rank) {
+    x = unpoison4(*reinterpret_cast<const uint4*>(p1 + ((size_t)b * GVEC_OWN + vi - owner * GVEC_OWN) * 8));
+  } else {
+    uint4* slot = reinterpret_cast<uint4*>(g.stage) + (long long)g.phase * LAND_ROWS_MAX * KVEC + (long long)b * KVEC + vi;
+    x = ld_volatile(slot);
+    const long long t0 = dl_now();
+    while (!arrived(x)) {
+      if (dl_past(t0, g.timeout_ns)) give_up(g.err, 1 + owner);
+      x = ld_volatile(slot);
+    }
+    *slot = make_uint4(0x80008000u, 0x80008000u, 0x80008000u, 0x80008000u);
+  }
+  return asv(x);
+}
+
+template <int NB, bool GATHER>
 __device__ __forceinline__ void land_add2_attnres_rms(const bf16_t* __restrict__ p1, const bf16_t* __restrict__ p2,
                                                       const bf16_t* __restrict__ prefix2, bf16_t* __restrict__ hidden,
                                                       int two, bf16_t* __restrict__ blocks, const float* __restrict__ sw,
                                                       const bf16_t* __restrict__ gamma, bf16_t* __restrict__ normed,
-                                                      int snapshot, uint4* cand, LandSmem& s) {
+                                                      int snapshot, uint4* cand, LandSmem& s, const Gather& gat) {
   const int b = blockIdx.x / LAND_CL, t = threadIdx.x, v0 = (blockIdx.x % LAND_CL) * LV;
   const bool act = t < LV;
   const size_t off = (size_t)b * KH + (v0 + t) * 8;
@@ -833,9 +883,10 @@ __device__ __forceinline__ void land_add2_attnres_rms(const bf16_t* __restrict__
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
   }
   grid_wait();
+  if constexpr (GATHER) gather_push(gat, p1, b, (blockIdx.x % LAND_CL) * LT + t);
   V8 pv = pr;
   if (act) {
-    const V8 a = ldv(p1 + off);
+    const V8 a = GATHER ? gather_take(gat, p1, b, v0 + t) : ldv(p1 + off);
     V8 c;
     if (two) c = ldv(p2 + off);
 #pragma unroll
@@ -923,9 +974,26 @@ __device__ __forceinline__ void land_add2_attnres_rms(const bf16_t* __restrict__
     __shared__ LandSmem s;                                                                                     \
     asm volatile("griddepcontrol.launch_dependents;");                                                         \
     if ((int)blockIdx.x >= LAND_CL * B) return grid_wait(), l2_prefetch(pf, pf_bytes, LAND_CL * B);            \
-    land_add2_attnres_rms<NB>(p1, p2, prefix2, hidden, two, blocks, sw, gamma, normed, snapshot, cand, s);     \
+    land_add2_attnres_rms<NB, false>(p1, p2, prefix2, hidden, two, blocks, sw, gamma, normed, snapshot, cand, s, \
+                                     Gather{});                                                                 \
   }
 NB_ENTRIES(LAND_ENTRY)
+
+#define GATHER_ENTRY(NB)                                                                                         \
+  extern "C" __global__ void __launch_bounds__(LT, 1) kern_k3_land_gather_attnres_rms_nb##NB(                  \
+      const bf16_t* __restrict__ p1, const bf16_t* __restrict__ p2, const bf16_t* __restrict__ prefix2,        \
+      bf16_t* __restrict__ hidden, int two, bf16_t* __restrict__ blocks, const float* __restrict__ sw,         \
+      const bf16_t* __restrict__ gamma, bf16_t* __restrict__ normed, int snapshot, int B, uint8_t* stage,      \
+      const unsigned long long* peers, int* err, int rank, int phase, long long timeout_ns,                    \
+      const uint8_t* __restrict__ pf, long long pf_bytes) {                                                    \
+    extern __shared__ uint4 cand[];                                                                            \
+    __shared__ LandSmem s;                                                                                     \
+    asm volatile("griddepcontrol.launch_dependents;");                                                         \
+    if ((int)blockIdx.x >= LAND_CL * B) return grid_wait(), l2_prefetch(pf, pf_bytes, LAND_CL * B);            \
+    land_add2_attnres_rms<NB, true>(p1, p2, prefix2, hidden, two, blocks, sw, gamma, normed, snapshot, cand, s, \
+                                    Gather{stage, peers, err, rank, phase, timeout_ns});                        \
+  }
+NB_ENTRIES(GATHER_ENTRY)
 
 // ---------------------------------------------------------------- MoE finalize + all-reduce + latent rms
 // A row's exchange: the latent's KLATV vectors, then the shared expert's KVEC.

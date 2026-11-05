@@ -224,12 +224,12 @@ source = "source/k3_moe_front.cu"
 defines = { EXPERTS = 896, LDS = 2880, NRANKS = 8, SH = 768, STRIDE = 8 }
 
 [kernels."k3_ar_fused+NRANKS=8"]
-sha256 = "5664b80c18a35f7a768042c2b9b112fd2d4a0245a3998feb50f12bb2c44c4446"
+sha256 = "5504781dd2f22d4bf1868328efdca7bdc573b2b8047ec303878932bc1dd6b553"
 source = "source/k3_ar_fused.cu"
 defines = { NRANKS = 8 }
 
 [kernels."k3_ar_fused+ANY_BATCH=1+NRANKS=8"]
-sha256 = "7e868bda2abc2b6bdc93506494859b822a8d059d465df7116336b0c5365bf1a8"
+sha256 = "8c8fa92d93071b73a0d5de8c8ee290d5b0c0215b5de5bea5fa8d019ee3f64419"
 source = "source/k3_ar_fused.cu"
 defines = { ANY_BATCH = 1, NRANKS = 8 }
 
@@ -247,7 +247,7 @@ source = "source/k3_mla_absorb.cu"
 defines = { QBF16 = 1 }
 
 [kernels."k3_ar_fused"]
-sha256 = "5664b80c18a35f7a768042c2b9b112fd2d4a0245a3998feb50f12bb2c44c4446"
+sha256 = "5504781dd2f22d4bf1868328efdca7bdc573b2b8047ec303878932bc1dd6b553"
 source = "source/k3_ar_fused.cu"
 
 [kernels."k3_head+NRANKS=8"]

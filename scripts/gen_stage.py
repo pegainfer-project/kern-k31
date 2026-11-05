@@ -106,12 +106,19 @@ KDA_SLOTS = 3 * 152  # k3_kda_core.cu: three blocks an SM, every one resident, e
 CAND_SMEM = NB_MAX * H * 2  # k3_ar_fused.cu: a row's snapshots prefetched into shared memory
 LAND_CL = 4  # k3_ar_fused.cu: the closing add's row over a cluster of 4 blocks
 PF_PARAMS = ["in buffer<bf16>", "i64"]  # k3_ar_fused.cu: the next GEMM's weight, prefetched into L2
-PF_OPS = {"ar_attnres_rms", "ar_finalize_rms", "land_add2_attnres_rms_snap"}
+PF_OPS = {"ar_attnres_rms", "ar_finalize_rms", "land_add2_attnres_rms_snap", "land_gather_attnres_rms"}
 base_op = lambda op: op.rsplit("_nb", 1)[0]  # an op without its snapshot count (k3_ar_fused.cu: an entry a count)
 PF_MAX = 96 << 20  # of the GB300's 129 MB L2
 LAND_PF_MAX = 16 << 20  # the closing add's prefetch hints: their issue holds the grid the next GEMM waits on
 # ar_finalize_rms also loads the next o_proj's weight at evict_last; ar_attnres_rms after that o_proj demotes it
 PF_LAST = ".o_proj"
+
+
+# D's lat_up column slice (H / R x 3584) pinned to a split-K 1 cuBLASLt kernel: from 8 to 256 rows it gives
+# every output the bits of the replicated H-wide GEMM (every split-K 1 kernel sums K in one order), where the
+# heuristic splits K below 128 rows (another order, and 6.3 against 4.9 us at 8-64 rows; results/latup)
+LAT_UP_ALGO = {"id": 66, "tile": 13, "stages": 35, "split_k": 1, "reduction": 0, "swizzle": 0, "custom": 1,
+               "inner_shape": 0, "cluster_shape": 3}
 
 
 # source/k3_gemm_f32.cu: D's K = 7168 f32 projections (qkvg 6400, front 6016) over 1-32 rows in cuBLAS's split-K
@@ -249,6 +256,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     # k3_moe_front.cu's gather: a row's slice in 16-byte vectors (e4m3, then a scale a 16-bit lane) a member,
     # two stages of every member's slots
     lat_stage = tp * D_SEQS_MAX * (lat_l // 16 + -(-lat_l // 256)) * 16
+    # bytes: a stage of the closing add's gather of lat_up's column slices, a row's vectors once (k3_ar_fused.cu)
+    land_stage = D_SEQS_MAX * H * 2
     assert not front or bp["tile"] == 16, \
         f"k3_moe_front.cu builds the MoE GEMMs' tables for 16-token tiles, the variants' tile is {bp['tile']}"
     # P's projections land in their GEMM's epilogue (cuBLASLt, bf16 D); D's
@@ -340,6 +349,10 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32", "i32"],
             "impl": {"launches": [{"entry": "extern:cublaslt_bf16_tn"}]},
         },
+        **({"gemm_bf16_lat_up": {
+            "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32", "i32"],
+            "impl": {"launches": [{"entry": "extern:cublaslt_bf16_tn", "algo": LAT_UP_ALGO}]},
+        }} if xchg else {}),
         # a D group's vocab-parallel head (k3_head.cu): the slices to member 0, the members' keys exchanged
         **({"head_argmax": {
             "params": ["in buffer<f32>", "out buffer<f32>", "in buffer<u64>", "out buffer<i64>", "inout buffer<i32>",
@@ -627,6 +640,19 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                                           for grid, when in ((LAND_CL * TP_AR_GRID, {"max": TP_AR_GRID}),
                                                              ({"mul": [T, LAND_CL]}, {"min": TP_AR_GRID + 1}))]},
                 },
+                # ... with p1 this rank's column slice of lat_up, gathered over the group first
+                "land_gather_attnres_rms": lambda: {
+                    "params": ["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32",
+                               "inout buffer<bf16>", "in buffer<f32>", "in buffer<bf16>", "out buffer<bf16>", "i32",
+                               "i32", "inout buffer<u8>", "in buffer<u64>", "out buffer<i32>", "i32", "i32", "i64",
+                               *PF_PARAMS],
+                    "impl": {"launches": [launch("k3_ar_fused", f"kern_k3_land_gather_attnres_rms_nb{nb}",
+                                                 grid=[grid, 1, 1], block=[1024 // LAND_CL, 1, 1],
+                                                 cluster=[LAND_CL, 1, 1], smem=CAND_SMEM // LAND_CL, pdl=True,
+                                                 when={"var": T, **when})
+                                          for grid, when in ((LAND_CL * TP_AR_GRID, {"max": TP_AR_GRID}),
+                                                             ({"mul": [T, LAND_CL]}, {"min": TP_AR_GRID + 1}))]},
+                },
                 "ar_attnres_rms": lambda: {
                     "params": ["in buffer<bf16>", "inout buffer<u8>", "in buffer<u64>", "inout buffer<i32>",
                                "out buffer<i32>", "i32", "in buffer<bf16>", "in buffer<bf16>", "in buffer<f32>",
@@ -855,6 +881,11 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         buffers["lat_state"] = {"dtype": "i32", "shape": [1], "kind": "carry"}
     else:
         work("router_partial", EXPERTS, "f32", var=RW)
+    if xchg:
+        # the closing add's gather of lat_up's column slices: two Lamport stages and their peers
+        buffers["land_lamport"] = {"dtype": "u8", "shape": [2 * land_stage], "kind": "carry", "export": True}
+        buffers["land_lamport_peers"] = {"dtype": "u64", "shape": [tp], "kind": "peer", "of": "land_lamport",
+                                         "group": "tp"}
     work("topk_idx", TOPK, "i32", var=RW)
     work("topk_weight", TOPK, "f32", var=RW)
     if decode and not front:
@@ -967,6 +998,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         # takes it on its own. ("ar", label, partial): D's dense MLP down
         # projection, left to the next mix's all-reduce.
         closing = None
+        gathers = 0  # the closing adds that gathered lat_up's slices: their count alternates the two stages
 
         def summed_closing():
             """An "ar" closing summed by itself."""
@@ -983,8 +1015,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             closing = None
 
         def mix_in(label, sw, gamma, nb, snapshot=0):
-            """The closing add fused into the next mix; D's takes a snapshot layer's too."""
-            nonlocal closing
+            """The closing add fused into the next mix; D's takes a snapshot layer's too, and gathers lat_up's
+            column slices of a group's MoE layer."""
+            nonlocal closing, gathers
             if closing[0] == "ar" and not snapshot:
                 # the sum, the closing add (K1b's, no snapshot) and the mix in one launch
                 step(label, nb_op("ar_attnres_rms", nb), closing[2], *lamport(), b("prefix2"), b("blocks"), sw, gamma,
@@ -993,7 +1026,12 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 return
             summed_closing()
             _, p1, p2, two = closing
-            if decode:
+            if decode and xchg and p1 == b("routed_partial"):
+                step(label, nb_op("land_gather_attnres_rms", nb), p1, p2, b("prefix2"), b("hidden"), i32(two),
+                     b("blocks"), sw, gamma, b("normed"), i32(snapshot), B, b("land_lamport"),
+                     b("land_lamport_peers"), b("tp_err"), {"rank": "tp"}, i32(gathers % 2), i64(TP_TIMEOUT_NS))
+                gathers += 1
+            elif decode:
                 step(label, nb_op("land_add2_attnres_rms_snap", nb), p1, p2, b("prefix2"), b("hidden"), i32(two),
                      b("blocks"), sw, gamma, b("normed"), i32(snapshot), B)
             else:
@@ -1195,7 +1233,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 else:
                     moe = "moe_flat"
                     step(L + "lat_norm", "rms", b(moe), w("gamma_lat"), b("routed_latent_norm"), i32(LATENT), B)
-                proj(L + "lat_up", b("routed_latent_norm"), w("w_lat_up"), b("routed_partial"), H, LATENT)
+                # this member's H / R columns of the hidden, rows H / R apart; the closing add gathers them
+                step(L + "lat_up", "gemm_bf16_lat_up" if xchg else "gemm_bf16", b("routed_latent_norm"), w("w_lat_up"),
+                     b("routed_partial"), rows8, i32(H // tp), i32(LATENT), i32(H // tp))
                 closing = (L + "hidden", b("routed_partial"), b(moe, shared_at), 1)
             else:
                 # lat_down and the shared expert's gate | up one GEMM; the top-k, the latent's mxfp8, the
@@ -1339,7 +1379,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                                      "args": [buf(n + "w_lat_up"), buf(n + "sh_down"), buf(n + "w_moe_back"), i32(H),
                                               i32(LATENT), i32(sh_l)]})
             else:
-                weight(n + "w_lat_up", [H, LATENT], [seg(e + "routed_expert_up_proj.weight")])
+                weight(n + "w_lat_up", [H // tp, LATENT], [seg(e + "routed_expert_up_proj.weight", rows=shard(H // tp))])
                 weight(n + "sh_down", [H, sh_l], [seg(e + "shared_experts.down_proj.weight", cols=shard(sh_l))])
             moe_weights(once, i, n + "moe.")
 
@@ -1385,6 +1425,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             if xchg else []) + (
         [{"label": "lat_init", "op": "tp_lamport_init_bf16", "args": [b("lat_lamport"), i64(2 * lat_stage)]}]
         if front else []) + (
+        [{"label": "land_init", "op": "tp_lamport_init_bf16", "args": [b("land_lamport"), i64(2 * land_stage)]}]
+        if xchg else []) + (
         [{"label": "dcp_init", "op": "dcp_init", "args": [b("dcp_lamport"), i64(3 * dcp_stage)]}] if xchg and mla else []) + (
         [{"label": "idx_init", "op": "idx_init",
           "args": [b("idx_lamport"), i64(3 * k31_dsa.cand_stage(seqs_max, tp, max_ctx // tp))]}] if xchg and mla and dsa else [])
