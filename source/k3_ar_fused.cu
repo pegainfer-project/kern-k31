@@ -6,18 +6,20 @@
 // rotate by call, each block keeping the rotation itself (`state`, below).
 //
 // The exchange runs over a row's sixteen-byte vectors. Every block pushes an
-// equal run of all rows' vectors (the two-shot: the first blocks, a vector a
-// thread) and re-poisons a share of the previous call's stage; block b < B
-// then waits for row b and runs the epilogue on it,
+// equal run of all rows' vectors (the two-shot: a vector a thread, over the
+// grid's stride) and re-poisons a share of the previous call's stage; block b
+// then waits for rows b, b + KGRID, .. and runs the epilogue on each,
 // a row per 1024 threads. From TWO_SHOT_ROWS rows a row goes to its owner
 // (row % NRANKS) only, whose row block sums it as the one-shot does; the
 // blocks of the rows a rank does not own first gather its rows' sums to the
-// others (gather_share). The blocks past B load the next GEMM's weight
-// `pf` (`pf_bytes`) into L2 while a row block still waits (k3_l2_prefetch.cuh;
-// state[2 * phase] stamps a row's data in, state[7] is the loads' sink);
-// kern_k3_ar_finalize_rms's then the next layer's o_proj
-// weight `pf2` at evict_last, which the kern_k3_ar_attnres_rms after that
-// o_proj puts back to evict_normal (`dm`).
+// others (gather_share). A block waits on nothing before its pushes are out,
+// and on no row before its gathers are out: a gather waits only on pushes, a
+// row only on pushes and gathers, so no wait closes a cycle. The blocks past
+// B load the next GEMM's weight `pf` (`pf_bytes`) into L2 while a row block
+// still waits (k3_l2_prefetch.cuh; state[2 * phase] stamps a row's data in,
+// state[7] is the loads' sink); kern_k3_ar_finalize_rms's then the next
+// layer's o_proj weight `pf2` at evict_last, which the kern_k3_ar_attnres_rms
+// after that o_proj puts back to evict_normal (`dm`).
 //
 //   kern_k3_ar_attnres_rms_nb<NB>(const bf16* x, u8* lamport, const u64* lamport_peers, i32* state,
 //       i32* err, int rank, const bf16* prefix, const bf16* blocks, const f32* sw,
@@ -201,7 +203,8 @@ __device__ __forceinline__ void lamport_clear(const Lamport& l) {
 // KGRID blocks in order, so a row's pushes leave from several SMs rather than from the one block
 // a row would fill (an SM pushes ~55 GB/s). The grid is a constant: a division by gridDim.x
 // costs the push 0.3 us. The two-shot (from TWO_SHOT_ROWS rows) pushes from the first blocks a
-// vector a thread instead, so the blocks past them start loading the next weight (l2_load_while) at once.
+// vector a thread instead, so the blocks past them start loading the next weight (l2_load_while) at once;
+// past KGRID * KTHREADS vectors the pushes go on at that stride (two_shot_rest).
 #ifndef PUSH_RUN
 #define PUSH_RUN 128
 #endif
@@ -216,6 +219,12 @@ __device__ __forceinline__ long long share(long long tot, int B) {
   const int per = share_per(tot);
   const int i = per * (int)blockIdx.x + (int)threadIdx.x;
   return (int)threadIdx.x < per && i < (int)tot ? i : -1;
+}
+
+// The two-shot's vectors past share()'s first pass: i + KGRID * KTHREADS, + 2 KGRID * KTHREADS, ..
+#define PUSH_STRIDE (KGRID * KTHREADS)
+__device__ __forceinline__ long long two_shot_rest() {
+  return (long long)blockIdx.x * KTHREADS + threadIdx.x + PUSH_STRIDE;
 }
 
 __device__ __forceinline__ uint4 unpoison4(uint4 v) {
@@ -284,12 +293,13 @@ __device__ __forceinline__ uint4 lamport_get(const Lamport& l, bool two, int own
   return two ? unpoison4(v) : v;
 }
 
-// Two-shot: the sums of this rank's rows (row % NRANKS == rank) gathered to the other ranks by the blocks of the
-// rows it does not own, an equal run of the owned vectors each (RW a row), before they wait for their own row: the
+// Two-shot: the sums of this rank's rows (row % NRANKS == rank) gathered to the other ranks for the rows it does
+// not own, an equal run of the owned vectors each (RW a row) by row b's block, before it waits for any row: the
 // gather leaves from ~7B/8 SMs instead of B/8. The owner's row block sums its row again for itself.
 template <int RW>
-__device__ __forceinline__ void gather_share(const Lamport& l, int rank, int B, long long timeout_ns, int& fail) {
-  const int b = blockIdx.x, nown = (B - rank + NRANKS - 1) / NRANKS, m = B - nown;
+__device__ __forceinline__ void gather_share(const Lamport& l, int rank, int B, int b, long long timeout_ns,
+                                             int& fail) {
+  const int nown = (B - rank + NRANKS - 1) / NRANKS, m = B - nown;
   const int per = (nown * RW + m - 1) / m, g = (b - (b - rank + NRANKS - 1) / NRANKS) * per + (int)threadIdx.x;
   if ((int)threadIdx.x >= per || g >= nown * RW) return;
   const long long i = (long long)(rank + NRANKS * (g / RW)) * RW + g % RW;
@@ -689,21 +699,31 @@ __device__ __forceinline__ void ar_attnres_rms(const uint4* __restrict__ x, uint
     else
       lamport_push(l, i, v);
   }
+  if (two)
+    for (long long j = two_shot_rest(); j < tot; j += PUSH_STRIDE) l.slot[(j / KVEC) % NRANKS][j] = unpoison4(x[j]);
   lamport_clear(l);
   unsigned* const stamp = l2_stamp(state, l);
   l2_load_while(pf, pf_bytes, B, stamp, AR_GRACE_NS, state + 7);
   l2_demote(dm, dm_bytes, B);
 
   int fail = 0;
-  if (row) {
-    if (two && b % NRANKS != rank) gather_share<KVEC>(l, rank, B, timeout_ns, fail);
+  if (two)
+    for (int q = b; q < B; q += KGRID)
+      if (q % NRANKS != rank) gather_share<KVEC>(l, rank, B, q, timeout_ns, fail);
+  for (int q = b; q < B; q += KGRID) {
+    const size_t at = (size_t)q * KH + t * 8;
+    if (q != b) {  // a row past the grid's first: the last row's reads of cand and s done first
+      __syncthreads();
+      r = row_prefetch<NB>(blocks + (size_t)q * KNB_MAX * KH, sw, gamma, cand, t);
+      if (act && !snapshot) pr = ldv(prefix + at);
+    }
     float sc[NB + 1];
     row_snap_scores<NB>(cand, r, sc, s, t);
     V8 pv;
     pv.w[0] = 0u, pv.w[1] = 0u, pv.w[2] = 0u, pv.w[3] = 0u;
     if (act) {
-      const long long i = (long long)b * KVEC + t;
-      const int owner = b % NRANKS;
+      const long long i = (long long)q * KVEC + t;
+      const int owner = q % NRANKS;
       const V8 lp = asv(lamport_get(l, two, owner, rank, i, timeout_ns, fail));
       l2_arrive(stamp);
       if (snapshot) {
@@ -715,9 +735,9 @@ __device__ __forceinline__ void ar_attnres_rms(const uint4* __restrict__ x, uint
           pv.w[j] = f2bf(make_float2(rf.x + lf.x, rf.y + lf.y));
         }
       }
-      stv(prefix2 + off, pv);
+      stv(prefix2 + at, pv);
     }
-    row_prefix_finish<NB>(cand, r, pv, sc, normed + (size_t)b * KH, t, s);
+    row_prefix_finish<NB>(cand, r, pv, sc, normed + (size_t)q * KH, t, s);
   }
   lamport_close(l, state, err, fail);
 }
@@ -885,11 +905,12 @@ NB_ENTRIES(LAND_ENTRY)
 // ---------------------------------------------------------------- MoE finalize + all-reduce + latent rms
 // A row's exchange: the latent's KLATV vectors, then the shared expert's KVEC.
 #define ROWV (KLATV + KVEC)
-// a block's push share is one vector a thread up to the manifests' 64 rows
-static_assert(((64 * ROWV + PUSH_RUN - 1) / PUSH_RUN + KGRID - 1) / KGRID * PUSH_RUN <= KTHREADS,
+// a block's one-shot push share is one vector a thread
+static_assert(((TWO_SHOT_ROWS * ROWV + PUSH_RUN - 1) / PUSH_RUN + KGRID - 1) / KGRID * PUSH_RUN <= KTHREADS,
               "a push share past KTHREADS");
 
-// kern_k3_moe_finalize's column vector h of a row, its top-k (exp2perm, wts) in shared memory
+// kern_k3_moe_finalize's column vector h of a row, its top-k (exp2perm, wts) in shared memory, or past the
+// first push pass in global memory
 __device__ __forceinline__ uint4 finalize(const bf16_t* __restrict__ fc2, const int* e2p, const float* w16, int h) {
   float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 #pragma unroll
@@ -947,22 +968,32 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
     else
       lamport_push(l, i, v);
   }
+  if (two)
+    for (long long j = two_shot_rest(); j < tot; j += PUSH_STRIDE) {
+      const int rj = (int)(j / ROWV), cj = (int)(j % ROWV);
+      const uint4 u = cj < KLATV ? finalize(fc2, exp2perm + rj * TOPK, wts + rj * TOPK, cj)
+                                 : shared[(long long)rj * KVEC + cj - KLATV];
+      l.slot[rj % NRANKS][j] = unpoison4(u);
+    }
   lamport_clear(l);
   unsigned* const stamp = l2_stamp(state, l);
   l2_load_while(pf, pf_bytes, B, stamp, FIN_GRACE_NS, state + 7);
   l2_load_while<true>(pf2, pf2_bytes, B, stamp, FIN_GRACE_NS, state + 7);
 
   int fail = 0;
-  if (b < B) {
-    const long long base = (long long)b * ROWV;
-    const int owner = b % NRANKS;
-    // Two-shot, the block waits for its gather, then for the row's shared half, before any thread polls the
+  if (two)
+    for (int q = b; q < B; q += KGRID)
+      if (q % NRANKS != rank) gather_share<ROWV>(l, rank, B, q, timeout_ns, fail);
+  for (int q = b; q < B; q += KGRID) {
+    const long long base = (long long)q * ROWV;
+    const int owner = q % NRANKS;
+    // Two-shot, the block waits for its gathers, then for the row's shared half, before any thread polls the
     // next thing: warps that run ahead spin on slots still empty, and their polls slow everyone's (10.5 -> 9.0 us
-    // at 36 rows; one-shot the second wait costs 0.2-0.4, so not there)
-    if (two && owner != rank) gather_share<ROWV>(l, rank, B, timeout_ns, fail);
+    // at 36 rows; one-shot the second wait costs 0.2-0.4, so not there). The barrier also keeps a row past the
+    // grid's first off the last row's `red`.
     if (two) __syncthreads();
     const auto summed = [&](long long i) { return lamport_get(l, two, owner, rank, i, timeout_ns, fail); };
-    if (t < KVEC) shared_sum[(long long)b * KVEC + t] = summed(base + KLATV + t);
+    if (t < KVEC) shared_sum[(long long)q * KVEC + t] = summed(base + KLATV + t);
     if (two) __syncthreads();
     l2_arrive(stamp);
     // kern_k3_rms at h = KLAT: vector t of the row, its squares serially, a warp
@@ -991,7 +1022,7 @@ extern "C" __global__ void __launch_bounds__(KTHREADS, 1) kern_k3_ar_finalize_rm
         const float2 f = bf2f(v.w[j]);
         o.w[j] = from_bf162(__hmul2(__floats2bfloat162_rn(f.x * rs, f.y * rs), as_bf162(gv.w[j])));
       }
-      stv(latent_norm + (long long)b * KLAT + t * 8, o);
+      stv(latent_norm + (long long)q * KLAT + t * 8, o);
     }
   }
   lamport_close(l, state, err, fail);
