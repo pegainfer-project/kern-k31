@@ -214,6 +214,7 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1):
     if not chunk and tp > 1:
         if max_ctx * tp >= 1 << 24:
             raise SystemExit(f"k31_dcp_select keys a global position in 24 bits; a context of {max_ctx * tp} is past it")
+        cand = {"defines": {"CAND32": 1}} if cand_bytes(max_ctx) == 4 else {}
         o.update({
             # (logits, stride, ind, rows, peers, state, stage bytes): the local top-k as candidates, pushed into
             # every member's stage
@@ -221,7 +222,7 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1):
                 "params": ["in buffer<bf16>", "i32", "in buffer<i32>", "i32", "in buffer<u64>", "in buffer<i32>",
                            "i64"],
                 "impl": {"launches": [dsa(
-                    "k31_dcp_pack", [T, 1, 1], [256, 1, 1],
+                    "k31_dcp_pack", [T, 1, 1], [256, 1, 1], **cand,
                     params=["in buffer<bf16>", "i32", "in buffer<i32>", "i32", "i32", "i32", "in buffer<u64>",
                             "in buffer<i32>", "i64"],
                     args=[{"param": 0}, {"param": 1}, {"param": 2}, {"rank": "tp"}, i32(tp),
@@ -233,7 +234,7 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1):
                 "params": ["inout buffer<u8>", "inout buffer<i32>", "out buffer<i32>", "i64", "i64", "i32",
                            "in buffer<i32>", "i32", "out buffer<i32>", "out buffer<i32>", "out buffer<i32>"],
                 "impl": {"launches": [launch(
-                    "k31_dsa", "k31_dcp_select", grid=[T, 1, 1], block=[1024, 1, 1],
+                    "k31_dsa", "k31_dcp_select", grid=[T, 1, 1], block=[1024, 1, 1], **cand,
                     params=["inout buffer<u8>", "inout buffer<i32>", "out buffer<i32>", "i64", "i64", "i32", "i32",
                             "in buffer<i32>", "i32", "out buffer<i32>", "out buffer<i32>", "out buffer<i32>"],
                     args=[*({"param": i} for i in range(6)), {"rank": "tp"}, *({"param": i} for i in range(6, 11))],
@@ -242,7 +243,7 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1):
             # every stage of the candidates poisoned, once before the first step
             "idx_init": {
                 "params": ["inout buffer<u8>", "i64"],
-                "impl": {"launches": [dsa("k31_dcp_poison", [SMS, 1, 1], [256, 1, 1],
+                "impl": {"launches": [dsa("k31_dcp_poison", [SMS, 1, 1], [256, 1, 1], **cand,
                                           params=["inout buffer<u8>", "i64"], args=[{"param": 0}, {"param": 1}])]},
             },
         })
@@ -272,9 +273,16 @@ def weights(weight, seg, a, n):
     weight(n + "idx_kn_b", [ID], [seg(a + "indexer.k_norm.bias")])
 
 
-def cand_stage(seqs_max, tp):
-    """Bytes of one stage of D's candidates under DCP: every member's rows, 2048 of 8 bytes each."""
-    return tp * seqs_max * TOPK * 8
+def cand_bytes(max_ctx):
+    """A candidate's bytes in D's exchange: one word (k31_dsa's CAND32 build) while a member's local position
+    + 1 stays below 0xffff, the poison's half; two past it (K3.1's 1M context at TP8)."""
+    return 4 if max_ctx + 1 < 0xffff else 8
+
+
+def cand_stage(seqs_max, tp, max_ctx):
+    """Bytes of one stage of D's candidates under DCP: every member's rows, 2048 candidates each; `max_ctx`
+    a member's keys at most."""
+    return tp * seqs_max * TOPK * cand_bytes(max_ctx)
 
 
 def buffers(work, bufs, chunk, max_ctx, seqs_max, tp=1):
@@ -301,8 +309,8 @@ def buffers(work, bufs, chunk, max_ctx, seqs_max, tp=1):
         bufs["idx_sched"] = {"dtype": "i32", "shape": [(SMS + 1) * 2], "kind": "workspace"}
         if tp > 1:
             # three stages of every member's candidates (k31_dcp_pack), the stage they rotate through
-            bufs["idx_lamport"] = {"dtype": "u8", "shape": [3 * cand_stage(seqs_max, tp)], "kind": "carry",
-                                   "export": True}
+            bufs["idx_lamport"] = {"dtype": "u8", "shape": [3 * cand_stage(seqs_max, tp, max_ctx)],
+                                   "kind": "carry", "export": True}
             bufs["idx_lamport_peers"] = {"dtype": "u64", "shape": [tp], "kind": "peer", "of": "idx_lamport",
                                          "group": "tp"}
             bufs["idx_state"] = {"dtype": "i32", "shape": [8], "kind": "carry"}
