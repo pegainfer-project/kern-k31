@@ -30,6 +30,12 @@ ALPHA, BETA = 4.0, 25.0
 GLUE, PGLUE, ROUTING, ROUTE = "k3_moe_prefill", "k3_prefill_glue", "flashinfer_moe_routing", "k3_moe_route"
 FC1, FC2 = "trtllm_bmm_mxe4m3_mxe2m1_mxe4m3", "trtllm_bmm_bf16_mxe2m1_mxe4m3"
 SHAPE = "k3-prefill-16k-ep4"
+# D's pair, 16-token tiles: a decode step routes a few rows to each expert, and k3_moe_front.cu's tables are built
+# for that tile; the index's picks for SHAPE are P's 128-token ones.
+DECODE = ("bmm_MxE4m3_MxE2m1MxE4m3_Fp32_Ab32_Bb32_Cb32_t128x16x256_s6_et128x16_m256x16x32_c2x1x1_rM_TN_transOut_"
+          "schPd2x1x2x3_biasFp32M_bN_tma_ldgstsSf_rgTma_clmp_siTuGlu_dynB_sm100f",
+          "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x16x256u2_s6_et128x16_m256x16x32_c2x1x1_rM_TN_transOut_"
+          "schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f")
 # k3_moe_route.cu: 16 warps a block, two blocks an SM resident for its grid barrier (2 x 144 fits 148-SM B300
 # and 152-SM GB300), a quarter of them up to 256 rows; its tables cover 8192 rows.
 ROUTE_WARPS, ROUTE_BLOCKS, ROUTE_BLOCKS_SMALL, ROUTE_ROWS = 16, 2 * 144, 64, 8192
@@ -170,7 +176,8 @@ def pieces(local, tokens, tokens_max, out_rows, prefix="", names=None, stride=No
             *([combine] if combined else []),
         ]
 
-    return {"buffers": buffers, "ops": ops, "route_step": route_step, "route_sync_words": sync_words, "steps": steps}
+    return {"buffers": buffers, "ops": ops, "route_step": route_step, "route_sync_words": sync_words, "steps": steps,
+            "tile": tile}
 
 
 def shuffles(local):
