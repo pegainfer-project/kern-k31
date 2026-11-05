@@ -8,7 +8,7 @@ and, with --base, the same bytes as the base build's. Calls rotate through the t
 build's µs a call: pack alone, and select (pack + select less pack), the mean over members.
 
     python3 harness/dsa/check_dcp_select.py <cubin> [--word 4|8] [--base <cubin> --base-word 8]
-        [--rows 1,64,128,256] [--keys 300,16384]
+        [--rows 1,64,128,256] [--keys 300,16384] [--dist ties|smooth]
 """
 import argparse
 import ctypes
@@ -22,8 +22,12 @@ from check import Launcher, ok
 W, TOPK, PAGE, SMS = 8, 2048, 64, 152
 
 
-def scores(R, n, g):
-    """[R, n] bf16 local logits on few distinct values (ties at every cut), some rows all equal, some -0.0."""
+def scores(R, n, g, dist="ties"):
+    """[R, n] bf16 local logits: `ties` on few distinct values (ties at every cut), some rows all equal, some
+    -0.0; `smooth` indexer-like, a slow drift along the position plus noise, few ties past bf16's own."""
+    if dist == "smooth":
+        drift = torch.nn.functional.interpolate(torch.randn(R, 1, n // 256 + 2, generator=g), size=n, mode="linear")
+        return (2 + drift[:, 0] + 0.3 * torch.randn(R, n, generator=g)).relu().bfloat16()
     x = torch.randn(R, n, generator=g) * 3
     x = torch.where(torch.rand(R, n, generator=g) < 0.3, x.round(), x)
     x[0::7] = 1.0
@@ -106,6 +110,7 @@ def main():
     ap.add_argument("--rows", default="1,64,128,256")
     ap.add_argument("--keys", default="300,16384", help="each member's local keys a row, at most")
     ap.add_argument("--calls", type=int, default=4)
+    ap.add_argument("--dist", default="ties", choices=("ties", "smooth"))
     ap.add_argument("--iters", type=int, default=20)
     a = ap.parse_args()
     rows = [int(x) for x in a.rows.split(",")]
@@ -125,7 +130,7 @@ def main():
                 members, host = [], []
                 for m in range(W):
                     nm = [max(1, x - (m * x) // (3 * W)) for x in n]  # members hold a little fewer keys
-                    v = scores(R, stride, g)
+                    v = scores(R, stride, g, a.dist)
                     vb = v.view(torch.int16).numpy()
                     vf = v.float().numpy()
                     ind = numpy.stack([local_topk(vf[r], nm[r]) for r in range(R)])
