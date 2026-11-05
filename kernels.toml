@@ -212,7 +212,7 @@ sha256 = "294904766b0a807501ef596c0698dfa819713085d5510981f427b30c8ef77920"
 source = "source/k3_mla_absorb_tc.cu"
 
 [kernels."k3_moe_front+EXPERTS=896+LDS=6016+SH=768+STRIDE=8"]
-sha256 = "84895f32468104ab424834a35151602d70c38bd23bd8bc63a657532ddd4430b3"
+sha256 = "9282dde7a1c56ee7d1bf3fcb1645057327555206be4fae1866f4bdb85eb52f1b"
 source = "source/k3_moe_front.cu"
 defines = { EXPERTS = 896, LDS = 6016, SH = 768, STRIDE = 8 }
 
