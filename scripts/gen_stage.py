@@ -232,8 +232,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     # tp-th one for every row, its combine over every row the flat MoE
     # all-reduce sums (`seqs_max`), writing zeros past `tokens`.
     epr = EXPERTS // tp
-    bp = (k3_moe_bmm.pieces(epr, T, seqs_max, seqs_max, prefix="moe.", names=moe_variants, stride=tp,
-                            pdl=True) if decode else
+    bp = (k3_moe_bmm.pieces(epr, T, seqs_max, seqs_max, prefix="moe.", names=moe_variants or k3_moe_bmm.DECODE,
+                            stride=tp, pdl=True) if decode else
           k3_moe_bmm.pieces(epr, T, chunk_max, {"mul": [T, 1]}, prefix="moe.", names=moe_variants))
     # This rank's KDA and MLA heads: whole, or a D member's shard (heads, the
     # per-head weights and the KDA state line all HEADS / tp wide; the kernels
@@ -257,6 +257,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     # columns of the f32 row. Its kernel holds the rank's shared down projection in shared memory, so a
     # group too small for that (TP4: 1536 columns) runs the three launches.
     front = EXPERTS + LATENT + 2 * sh_l if xchg and 1024 + 2 * sh_l * 128 + 64 * 64 * 2 <= SMEM_MAX else 0
+    assert not front or bp["tile"] == 16, \
+        f"k3_moe_front.cu builds the MoE GEMMs' tables for 16-token tiles, the variants' tile is {bp['tile']}"
     # P's projections land in their GEMM's epilogue (cuBLASLt, bf16 D); D's
     # KDA kernels read f32 projections.
     kpart = "bf16" if chunk else "f32"
