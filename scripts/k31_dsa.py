@@ -76,7 +76,7 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1):
                       {"param": 7 if chunk else 8}], **pdl)]},
         },
         # each row's top TOPK over [0, len) as ascending positions (k31_topk, vLLM's set, deterministic);
-        # D's few rows take one block an SM, a row of up to 32k keys read once into registers
+        # D's few rows take the held build, a row of up to 32k keys read once into registers
         "idx_topk": {
             "params": ["in buffer<bf16>", "in buffer<i32>", "out buffer<i32>", "i32"],
             "impl": {"launches": [launch(
