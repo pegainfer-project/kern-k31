@@ -250,7 +250,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     def residual(entry):
         return launch("k3_prefill_glue", entry, grid=[T, 1, 1], block=[448, 1, 1])
 
-    dcp_stage = tp * seqs_max * hl * (KV_LORA // 8 + 1) * 16
+    # bytes: one stage of the DCP exchange, `tp` slots of every row's local heads, a record of 16-byte vectors
+    # each: the latent o and its lse word, or under DSA the v-up'd o (k31_dsa.XCHG_REC)
+    dcp_stage = tp * seqs_max * hl * (k31_dsa.XCHG_REC if dsa else KV_LORA // 8 + 1) * 16
     g = types.SimpleNamespace(seqs_max=seqs_max, tp=tp, max_ctx=max_ctx, mla_split_max=mla_split_max, xchg=xchg,
                               mla_ours_from=mla_ours_from, max_pages=max_pages, dcp_stage=dcp_stage)
     ops = {
@@ -524,16 +526,13 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     if xchg:
         # The MLA partials change hands in one kernel (source/k3_dcp.cu): every
         # head's partial pushed into its owner's Lamport stage over NVLink, the
-        # members' partials of this member's heads merged by their LSE, expanded by v-up and gated.
+        # members' partials of this member's heads merged by their LSE, expanded by v-up and gated
+        # (under DSA every head's partial expanded by v-up before the push).
         tail = ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "inout buffer<u8>", "in buffer<u64>",
                 "inout buffer<i32>", "out buffer<i32>", "i32", "i32", "i64", "i64"]
         xg = lambda **extra: launch("k3_dcp", "kern_k3_dcp_exchange", grid=[DCP_GRID, 1, 1], block=[256, 1, 1],
                                     smem=HEAD_DIM // 2 * KV_LORA * 2, **extra)
-        ops["dcp_exchange"] = ({
-            # K3.1's sparse partials: one a row, (max, sum) a head, the row's live count on this member
-            "params": ["in buffer<bf16>", "in buffer<f32>", "in buffer<i32>", *tail],
-            "impl": {"launches": [xg(defines={"SPARSE": 1}, pdl=True)]},
-        } if dsa else flavor.d_exchange_op(g, xg, tail))
+        ops["dcp_exchange"] = k31_dsa.exchange_op(tail) if dsa else flavor.d_exchange_op(g, xg, tail)
         ops["dcp_init"] = {
             "params": ["inout buffer<u8>", "i64"],
             "impl": {"launches": [launch("peer_allreduce_bf16", "kern_peer_lamport_init_bf16", defines={"NRANKS": tp},
@@ -1220,8 +1219,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             weight(n + "w_kv_b", [HEADS * 256, KV_LORA], [seg(a + "kv_b_proj.weight")])
             if dsa:
                 k31_dsa.weights(weight, seg, a, n)
-            if xchg:
-                # the v-up's heads: this member's of kv_b, whole for the absorb above
+            if xchg and not dsa:
+                # the v-up's heads: this member's of kv_b, whole for the absorb above (DSA's exchange v-ups every head)
                 weight(n + "w_kv_b_l", [hl * 256, KV_LORA], [seg(a + "kv_b_proj.weight", rows=shard(hl * 256))])
             if chunk:
                 carry(n + "w_aug", [KV_EXP, KV_A])

@@ -94,7 +94,7 @@ source = "source/k3_dcp.cu"
 defines = { CAKE = 1 }
 
 [kernels."k3_dcp+SPARSE=1"]
-sha256 = "6a8ccf8cc6a7415381e0d4a090c6d39ee2c8ca12c20d6258fd6171501535779a"
+sha256 = "130a832df02487bd1fdd2ab70930993a1a665b6b091ccca8be7b8a494211f80d"
 source = "source/k3_dcp.cu"
 defines = { SPARSE = 1 }
 
