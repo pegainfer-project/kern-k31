@@ -1063,7 +1063,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                     gemm(L + "q_b", b("q_norm"), w("w_q_b"), b("q_partial"), Q_B, Q_LORA)
                     if dsa:
                         k31_dsa.steps(step, w, L, kv, f"idx.{i}", False, b("mla_gate"), max_pages, max_ctx // tp,
-                                      b("q_partial"), exchange=(
+                                      b("q_partial"), sched=i == mla_layers[0], exchange=(
                                           b("dcp_lamport"), b("dcp_lamport_peers"), b("dcp_state"), b("tp_err"),
                                           {"rank": "tp"}, B, i64(dcp_stage), i64(TP_TIMEOUT_NS)) if xchg else None,
                                       select=(b("tp_err"), i64(TP_TIMEOUT_NS),
