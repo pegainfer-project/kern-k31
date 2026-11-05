@@ -41,13 +41,14 @@
 // Landing points: q/k squares -> bf16 per term; the l2 sum -> bf16 before
 // +1e-6; rsqrt -> bf16; q*qr and k*kr -> bf16; ga -> bf16 before dt_bias;
 // attn -> bf16 once; the rms product -> bf16 once; the gate -> bf16 twice
-// (partial and sigmoid); the state stays f32 throughout.
+// (partial and sigmoid); the state is stored bf16 (vLLM's mamba_ssm_cache_dtype
+// bfloat16) and computed f32.
 //
-// State traffic is the whole point: rec is 96*128*128 f32 = 6.29 MB per row
+// State traffic is the whole point: rec is 96*128*128 bf16 = 3.15 MB per row
 // per layer, read once and written once.  The kernel therefore
 //   * splits k across 8 lanes (kl = tid & 7) and dv across 16 lane groups
-//     (dvl = tid >> 3), so one warp instruction covers 4 dv rows x 128 B of
-//     fully contiguous, 16-B-aligned float4 -- 100% sector utilisation on
+//     (dvl = tid >> 3), so one warp instruction covers 4 dv rows x 64 B of
+//     fully contiguous, 8-B-aligned uint2 -- 100% sector utilisation on
 //     both the load and the store;
 //   * holds one dv row's 16 k-values per lane in registers between the
 //     m-reduction and the write-back, so rec is touched exactly once for
@@ -186,12 +187,7 @@ typedef __nv_bfloat16 bf16;
 #define LDST(p) (*(p))
 #define STST(p, v) (*(p) = (v))
 #endif
-// -DKDA_STATE_BF16=1: rec is stored bf16 (vLLM's mamba_ssm_cache_dtype bfloat16) and computed f32, four k
-// values a lane's load either way (uint2 of bf16, float4 of f32); the same lane walk, half the bytes.
-#ifndef KDA_STATE_BF16
-#define KDA_STATE_BF16 0
-#endif
-#if KDA_STATE_BF16
+// rec: four k values a lane's load, a uint2 of bf16.
 typedef uint2 rec_t;
 #define REC_SLICE (KD * KD * 2)
 __device__ __forceinline__ float4 rec_unpack(uint2 v) {
@@ -203,12 +199,6 @@ __device__ __forceinline__ uint2 rec_pack(float4 f) {
   const __nv_bfloat162 lo = __floats2bfloat162_rn(f.x, f.y), hi = __floats2bfloat162_rn(f.z, f.w);
   return make_uint2(*reinterpret_cast<const unsigned*>(&lo), *reinterpret_cast<const unsigned*>(&hi));
 }
-#else
-typedef float4 rec_t;
-#define REC_SLICE (KD * KD * 4)
-__device__ __forceinline__ float4 rec_unpack(float4 v) { return v; }
-__device__ __forceinline__ float4 rec_pack(float4 f) { return f; }
-#endif
 
 __device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + __expf(-x)); }
 

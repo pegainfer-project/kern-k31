@@ -74,7 +74,7 @@
 #ifndef LDS
 #define LDS K2_KDA_FUSED
 #endif
-#define K2_REC_BYTES ((long long)HEADS * 128 * 128 * 4)
+#define K2_REC_BYTES ((long long)HEADS * 128 * 128 * 2)  // the line's bf16 recurrent state ahead of the windows
 #define K2_WIN_BYTES ((long long)3 * K2_INNER * 2)
 
 #if K2_VEC == 8

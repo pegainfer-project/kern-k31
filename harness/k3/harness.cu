@@ -166,6 +166,7 @@ struct Opt {
   int B = 1, ctx = 2048, nb = 4, snapshot = 1, two = 1, reps = 50;
   int nmla = 1, layer = 0;
   int span = 0;  // K2 / K3: rows [1, 1 + span) are a span the kernel must skip
+  int lds = KDA_FUSED;  // K3: the q | k | v | g partial's row stride
   uint64_t seed = 1234;
   int gx = -1, gy = -1, gz = -1, bx = -1, by = -1, bz = -1;
   long long smem = -1;
@@ -204,6 +205,8 @@ static CUfunction getfn(CUmodule m, const char* name) {
   return f;
 }
 static void launch(CUfunction f, const Geo& g, void** args) {
+  if (g.smem)
+    CU(cuFuncSetAttribute(f, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, (int)g.smem));
   CU(cuLaunchKernel(f, g.gx, g.gy, g.gz, g.bx, g.by, g.bz, g.smem, 0, args,
                     nullptr));
   CU(cuCtxSynchronize());
@@ -254,8 +257,8 @@ static Line make_lines(int B, Rng& r) {
   L.h.assign((size_t)B * LINE_BYTES, 0);
   for (int i = 0; i < B; ++i) {
     uint8_t* p = L.h.data() + (size_t)i * LINE_BYTES;
-    float* rec = (float*)p;
-    for (long long j = 0; j < REC_BYTES / 4; ++j) rec[j] = (float)(0.1 * r.normal());
+    bf16* rec = (bf16*)p;
+    for (long long j = 0; j < REC_BYTES / 2; ++j) rec[j] = f2b((float)(0.1 * r.normal()));
     bf16* win = (bf16*)(p + REC_BYTES);
     for (long long j = 0; j < 3 * WIN_BYTES / 2; ++j) win[j] = f2b((float)r.normal());
   }
@@ -263,6 +266,12 @@ static Line make_lines(int B, Rng& r) {
   L.d = dput(L.h.data(), L.h.size());
   L.dindex = dput(L.index.data(), sizeof(int) * B);
   return L;
+}
+// Bytes [off, off + 2 n) of every physical line, as one bf16 array.
+static auto line_bf16(const std::vector<uint8_t>& v, size_t off, size_t n) {
+  return [&v, off, n](size_t i) {
+    return (double)b2f(((const bf16*)(v.data() + (i / n) * LINE_BYTES + off))[i % n]);
+  };
 }
 
 // ---- K1a attnres_rms --------------------------------------------------
@@ -397,7 +406,7 @@ static void run_conv_silu(const Opt& o, CUmodule mod) {
   std::vector<uint8_t> line_ref = L.h;
   std::vector<bf16> cq_ref((size_t)B * INNER), ck_ref((size_t)B * INNER),
       cv_ref((size_t)B * INNER);
-  ref_conv_silu(partial.data(), cw.data(), line_ref.data(), L.index.data(),
+  ref_conv_silu(partial.data(), KDA_FUSED, cw.data(), line_ref.data(), L.index.data(),
                 LINE_BYTES, cq_ref.data(), ck_ref.data(), cv_ref.data(), B);
 
   CUdeviceptr dpart = dput(partial.data(), partial.size() * 4);
@@ -438,23 +447,8 @@ static void run_conv_silu(const Opt& o, CUmodule mod) {
     size_t off = (size_t)L.index[b] * LINE_BYTES;
     std::copy(line_got.begin() + off, line_got.begin() + off + LINE_BYTES, line_ref.begin() + off);
   }
-  {
-    size_t nwin = (size_t)B * 3 * 3 * INNER;
-    auto at = [&](std::vector<uint8_t>& v, size_t i) -> double {
-      size_t per = (size_t)3 * 3 * INNER;
-      int b = (int)(i / per);
-      size_t k = i % per;
-      int s = (int)(k / (3 * INNER));
-      size_t off = k % (3 * INNER);
-      bf16* w = (bf16*)(v.data() + (size_t)b * LINE_BYTES + REC_BYTES +
-                        (size_t)s * WIN_BYTES);
-      return (double)b2f(w[off]);
-    };
-    // NOTE: line index b here is the *physical* line, addressed directly, so
-    // both sides walk the same bytes.
-    cmp_gen("win(state)", nwin, [&](size_t i) { return at(line_got, i); },
-            [&](size_t i) { return at(line_ref, i); });
-  }
+  const size_t nwin = (size_t)3 * 3 * INNER;
+  cmp_gen("win(state)", B * nwin, line_bf16(line_got, REC_BYTES, nwin), line_bf16(line_ref, REC_BYTES, nwin));
 
   double roof = (double)B * 3 * INNER * 4          // partial bands 0..2
               + (double)3 * 4 * INNER * 4          // cw
@@ -464,19 +458,24 @@ static void run_conv_silu(const Opt& o, CUmodule mod) {
                                              g.smem, 0, args, nullptr)); }, roof);
 }
 
-// ---- K3 kda_core ------------------------------------------------------
+// ---- K3 kda_core (KDA_CONV) -------------------------------------------
+// `--lds` past 4*INNER is one fused GEMM's row: wsm rides in it at column 4*INNER (beta, then f_a after HEADS
+// columns); otherwise wsm is a WSM-wide partial of its own.
 static void run_kda_core(const Opt& o, CUmodule mod) {
-  const int B = o.B;
+  const int B = o.B, lds = o.lds;
+  const bool fused = lds > KDA_FUSED;
+  const int wsm_ld = fused ? lds : WSM, wsm_fa = fused ? HEADS : WSM_FA;
+  if (lds < KDA_FUSED || (fused && lds < KDA_FUSED + HEADS + 128)) {
+    fprintf(stderr, "--lds %d holds no q | k | v | g%s\n", lds, fused ? " | beta | f_a" : "");
+    exit(2);
+  }
   Rng r(o.seed);
-  std::vector<bf16> cq((size_t)B * INNER), ck((size_t)B * INNER),
-      cv((size_t)B * INNER), w_f_b((size_t)INNER * 128);
-  std::vector<float> wsm((size_t)B * WSM), gate((size_t)B * KDA_FUSED),
+  std::vector<float> partial((size_t)B * lds), cw((size_t)3 * 4 * INNER), wsm(fused ? 0 : (size_t)B * WSM),
       dt_bias(INNER), a_log(HEADS), gamma_o(128);
-  fill_bf16(cq, r, 0, 1.0);
-  fill_bf16(ck, r, 0, 1.0);
-  fill_bf16(cv, r, 0, 1.0);
+  std::vector<bf16> w_f_b((size_t)INNER * 128);
+  fill_f32(partial, r, 0, 2.0);
+  fill_f32(cw, r, 0, 0.3);
   fill_f32(wsm, r, 0, 2.0);
-  fill_f32(gate, r, 0, 2.0);
   fill_bf16(w_f_b, r, 0, 0.044);
   fill_f32(dt_bias, r, 0, 1.0);
   fill_f32(a_log, r, 0, 0.5);
@@ -485,15 +484,13 @@ static void run_kda_core(const Opt& o, CUmodule mod) {
 
   std::vector<uint8_t> line_ref = L.h;
   std::vector<bf16> out_ref((size_t)B * INNER);
-  ref_kda_core(cq.data(), ck.data(), cv.data(), wsm.data(), gate.data(),
-               w_f_b.data(), dt_bias.data(), a_log.data(), gamma_o.data(),
-               line_ref.data(), L.index.data(), LINE_BYTES, out_ref.data(), B);
+  ref_kda_core(partial.data(), lds, cw.data(), fused ? partial.data() + KDA_FUSED : wsm.data(), wsm_ld, wsm_fa,
+               w_f_b.data(), dt_bias.data(), a_log.data(), gamma_o.data(), line_ref.data(), L.index.data(),
+               LINE_BYTES, out_ref.data(), B);
 
-  CUdeviceptr dcq = dput(cq.data(), cq.size() * 2);
-  CUdeviceptr dck = dput(ck.data(), ck.size() * 2);
-  CUdeviceptr dcv = dput(cv.data(), cv.size() * 2);
-  CUdeviceptr dwsm = dput(wsm.data(), wsm.size() * 4);
-  CUdeviceptr dgate = dput(gate.data(), gate.size() * 4);
+  CUdeviceptr dpart = dput(partial.data(), partial.size() * 4);
+  CUdeviceptr dcw = dput(cw.data(), cw.size() * 4);
+  CUdeviceptr dwsm = fused ? dpart + (CUdeviceptr)KDA_FUSED * 4 : dput(wsm.data(), wsm.size() * 4);
   CUdeviceptr dwfb = dput(w_f_b.data(), w_f_b.size() * 2);
   CUdeviceptr ddt = dput(dt_bias.data(), dt_bias.size() * 4);
   CUdeviceptr dal = dput(a_log.data(), a_log.size() * 4);
@@ -503,8 +500,7 @@ static void run_kda_core(const Opt& o, CUmodule mod) {
   int b_ = B, span = o.span, at0 = span ? 1 : 0;
   if (at0 + span > B) { fprintf(stderr, "--span %d needs B >= %d\n", span, at0 + span); exit(1); }
   CUdeviceptr dat = dput(&at0, 4);
-  void* args[] = {&dcq, &dck, &dcv, &dwsm,     &dgate, &dwfb, &ddt,
-                  &dal, &dgo, &L.d, &L.dindex, &lb,    &dout, &b_, &dat, &span};
+  void* args[] = {&dpart, &dcw, &dwsm, &dwfb, &ddt, &dal, &dgo, &L.d, &L.dindex, &lb, &dout, &b_, &dat, &span};
   Geo g = geo(o, HEADS, 1, 128, 1, 1, 0);
   CUfunction f = getfn(mod, "kern_k3_kda_core");
   launch(f, g, args);
@@ -520,25 +516,16 @@ static void run_kda_core(const Opt& o, CUmodule mod) {
     std::copy(line_got.begin() + off, line_got.begin() + off + LINE_BYTES, line_ref.begin() + off);
   }
   cmp_bf16("out", out, out_ref);
-  {
-    size_t nrec = (size_t)B * (REC_BYTES / 4);
-    auto at = [&](std::vector<uint8_t>& v, size_t i) -> double {
-      size_t per = (size_t)REC_BYTES / 4;
-      int b = (int)(i / per);
-      float* rec = (float*)(v.data() + (size_t)b * LINE_BYTES);
-      return (double)rec[i % per];
-    };
-    cmp_gen("rec(state)", nrec, [&](size_t i) { return at(line_got, i); },
-            [&](size_t i) { return at(line_ref, i); });
-  }
+  const size_t nrec = (size_t)REC_BYTES / 2, nwin = (size_t)3 * 3 * INNER;
+  cmp_gen("rec(state)", B * nrec, line_bf16(line_got, 0, nrec), line_bf16(line_ref, 0, nrec));
+  cmp_gen("win(state)", B * nwin, line_bf16(line_got, REC_BYTES, nwin), line_bf16(line_ref, REC_BYTES, nwin));
 
-  double roof = (double)B * 3 * INNER * 2        // conv_q/k/v
-              + (double)B * WSM * 4              // wsm partial
-              + (double)B * INNER * 4            // gate band 3
-              + (double)INNER * 128 * 2          // w_f_b
+  double roof = (double)B * (4 * INNER + HEADS + 128) * 4  // q | k | v | g, beta, f_a
+              + (double)3 * 4 * INNER * 4                   // cw
+              + (double)INNER * 128 * 2                     // w_f_b
               + (double)INNER * 4 + HEADS * 4 + 128 * 4
-              + (double)B * REC_BYTES * 2        // rec read + write
-              + (double)B * INNER * 2;           // out
+              + (double)B * LINE_BYTES * 2                  // rec and windows read + write
+              + (double)B * INNER * 2;                      // out
   time_and_report(o, [&] { CU(cuLaunchKernel(f, g.gx, g.gy, g.gz, g.bx, g.by, g.bz,
                                              g.smem, 0, args, nullptr)); }, roof);
 }
@@ -972,8 +959,8 @@ static void run_span_state(const Opt& o, CUmodule mod) {
   Line L = make_lines(SPAN_AT + o.B, r);
   int at = SPAN_AT;
   CUdeviceptr dat = dput(&at, 4);
-  std::vector<float> buf_ref((size_t)REC_BYTES / 4), buf_in((size_t)REC_BYTES / 4);
-  fill_f32(buf_in, r, 0, 0.1);
+  std::vector<bf16> buf_ref((size_t)REC_BYTES / 2), buf_in((size_t)REC_BYTES / 2);
+  fill_bf16(buf_in, r, 0, 0.1);
   std::vector<uint8_t> line_ref = L.h;
   long long lb = LINE_BYTES;
   CUdeviceptr dbuf = dpoison(REC_BYTES);
@@ -984,8 +971,8 @@ static void run_span_state(const Opt& o, CUmodule mod) {
   void* args[] = {&L.d, &L.dindex, &lb, &dat, &dbuf, &to_line};
   ref_span_state(line_ref.data(), L.index.data(), LINE_BYTES, &at, buf_ref.data(), 0);
   launch(f, g, args);
-  std::vector<float> buf(buf_ref.size());
-  dget(buf.data(), dbuf, buf.size() * 4);
+  std::vector<bf16> buf(buf_ref.size());
+  dget(buf.data(), dbuf, buf.size() * 2);
   cmp_exact("buf = rec", buf, buf_ref);
 
   to_line = 1;
@@ -1053,6 +1040,7 @@ static void usage() {
       "  --grid gx,gy,gz  override the launch grid (gx must be B)\n"
       "  --block bx,by,bz override the block\n"
       "  --smem bytes     override the dynamic shared memory\n"
+      "  --lds N          K3: the q|k|v|g partial's row stride; past 4*INNER wsm rides in it, default 4*INNER\n"
       "kernels:");
   for (const char* k : kKernels) std::printf(" %s", k);
   std::printf("\n");
@@ -1077,6 +1065,7 @@ int main(int argc, char** argv) {
     else if (a == "--cubin") o.cubin = need();
     else if (a == "--B") o.B = std::atoi(need());
     else if (a == "--span") o.span = std::atoi(need());
+    else if (a == "--lds") o.lds = std::atoi(need());
     else if (a == "--ctx") o.ctx = std::atoi(need());
     else if (a == "--nb") o.nb = std::atoi(need());
     else if (a == "--snapshot") o.snapshot = std::atoi(need());

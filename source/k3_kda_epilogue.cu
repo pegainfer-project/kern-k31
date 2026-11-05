@@ -31,10 +31,7 @@
 #ifndef KE_LD
 #define KE_LD (4 * KE_INNER)
 #endif
-#ifndef KDA_STATE_BF16  // the line's recurrent state ahead of the windows: f32, or bf16
-#define KDA_STATE_BF16 0
-#endif
-#define KE_REC_BYTES ((long long)HEADS * 128 * 128 * (KDA_STATE_BF16 ? 2 : 4))
+#define KE_REC_BYTES ((long long)HEADS * 128 * 128 * 2)  // the line's bf16 recurrent state ahead of the windows
 #define KE_WIN_BYTES ((long long)3 * KE_INNER * 2)
 #define KE_THREADS 512
 #define KE_HEADS_A_BLOCK (KE_THREADS / 16)

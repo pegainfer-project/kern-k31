@@ -9,8 +9,8 @@ a hybrid MLA + KDA model, one per layer and kind:
   uint8 its fp8 cache stores, a manifest made with `--kv fp8`) read as
   64-row pages, the view `k3_vllm.py` binds; no MLA kernel changes.
 - `ssm.l<L>`: a KDA layer's recurrent state, SGLang's `[slots, heads,
-  128 v, 128 k]` f32: the base line's rec, byte for byte, at a stride of
-  its own size.
+  128 v, 128 k]` bf16 (`--mamba-ssm-dtype bfloat16`): the base line's rec,
+  byte for byte, at a stride of its own size.
 - `conv.l<L>`: its conv window, SGLang's `[slots, 3 taps, q | k | v]` bf16.
   The base keeps the window after rec in the line as `[q, k, v][tap]`, so
   `kda_core` becomes its CONV_TAP_MAJOR build, which takes the window as a
@@ -38,7 +38,7 @@ from k3_vllm import KERNEL_BLOCK, ROW, TOKEN_BYTES, check_mla, mla_host  # noqa:
 
 PINNED = tomllib.loads((pathlib.Path(__file__).resolve().parents[1] / "kernels.toml").read_text())["kernels"]
 KD, TAPS, STREAMS = 128, 3, 3
-REC_HEAD = KD * KD * 4
+REC_HEAD = KD * KD * 2
 CONV_HEAD = TAPS * STREAMS * KD * 2
 
 
@@ -51,7 +51,7 @@ def heads(line: int) -> int:
 
 def host_states(m: dict, h: int) -> dict:
     inner = h * KD
-    ssm = {"dtype": "f32", "shape": [0, h, KD, KD], "strides": [h * KD * KD, KD * KD, KD, 1]}
+    ssm = {"dtype": "bf16", "shape": [0, h, KD, KD], "strides": [h * KD * KD, KD * KD, KD, 1]}
     conv = {"dtype": "bf16", "shape": [0, TAPS, STREAMS * inner], "strides": [TAPS * STREAMS * inner, STREAMS * inner, 1]}
 
     def hosts(name, s):

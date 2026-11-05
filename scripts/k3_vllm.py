@@ -9,8 +9,8 @@ vLLM gives every layer of a hybrid model one page per block, the same size
 for the attention and the recurrent groups. An MLA layer's token is 576 bf16
 (the 512-wide latent, then the 64-wide rope part), 1152 B; vLLM rounds a
 hybrid MLA model's block to a multiple of 128 tokens big enough to hold one
-KDA line (814,080 B: the recurrent state, then the conv window), so a block
-is 768 tokens and a page 884,736 B. An MLA layer sees its page as 12 kernel
+KDA line (420,864 B: the recurrent state, then the conv window), so a block
+is 384 tokens and a page 442,368 B. An MLA layer sees its page as 6 kernel
 blocks of [64 tokens][1 head][576] (vLLM's LBNHC), the 64-token pages the
 kernels already read; a KDA layer sees one line at the start of its page.
 Only the line stride changes, and only `kda_core` bakes it in.

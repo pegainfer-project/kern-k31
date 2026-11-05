@@ -166,11 +166,11 @@ def is_mla(i):
 
 
 def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_variants=None, pack=16,
-          mla_short=128, kv="fp8", mla_ours_from=None, window=65536, kda_state="bf16", tiny_gemm=False):
+          mla_short=128, kv="fp8", mla_ours_from=None, window=65536, tiny_gemm=False):
     """P with `chunk_max`, else D over a `tp` group (see the module doc), of layers [0, `end`). `pack`: P's sequences a call; `window`: the cached keys a
     P's MLA layer expands and attends at once; `kv`: the MLA cache, SGLang's fp8 (e4m3, scale 1; D
-    attends it with the Cake kernel, P lifts it to bf16 for the expansion) or bf16; `kda_state`: the KDA
-    recurrent state's storage, bf16 or f32."""
+    attends it with the Cake kernel, P lifts it to bf16 for the expansion) or bf16. The KDA recurrent state is
+    stored bf16."""
     chunk = chunk_max > 0
     decode = not chunk
     assert 0 < end <= LAYERS
@@ -181,18 +181,15 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     # holding every expert, with nothing to exchange or sum.
     xchg = decode and tp > 1
     flavor = KV[kv]
-    assert kda_state in ("bf16", "f32")
-    assert decode or kda_state == "bf16", "P's KDA core (cudnn_kda_abi) is built for a bf16 state"
     # K3.1's MLA layers attend sparsely over the fp8 pages (k31_dsa.py); the bf16 flavor is K3's dense path
     dsa = kv == "fp8"
     flavor.check(decode, xchg, seqs_max, dsa)
     if chunk:
         mla_short = flavor.p_short(mla_short)
-    state_bytes = 2 if kda_state == "bf16" else 4
-    kda_state_defs = {"KDA_STATE_BF16": 1} if kda_state == "bf16" else {}
+    state_bytes = 2
     # the register build's state rows a lane holds a pass, packed, twice over (the next pass's in flight):
     # as many as 128 registers a thread hold without a spill
-    kda_pass_rows = 4 if kda_state == "bf16" else 1
+    kda_pass_rows = 4
     glue_defs_kv = flavor.P_GLUE
     # P's attention on e4m3 (q and the expanded k | v cast), the FMHA's fp8 builds
     fp8_attn = chunk and flavor.P_FP8_ATTN
@@ -338,7 +335,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             # an SM (k3_kda_core.cu)
             "impl": {"launches": [
                 launch("k3_kda_core", "kern_k3_kda_core", grid=[T, hl, 1], smem=smem, when={"var": T, **when},
-                       defines={"KDA_CONV": 1, **(kda_defs or {}), **defs, **kda_state_defs,
+                       defines={"KDA_CONV": 1, **(kda_defs or {}), **defs,
                                 **({"LDS": kfused, "WSM_LDS": kfused, "WSM_FA": hl} if kfused else {})}, **extra)
                 for defs, smem, when, extra in (
                     ({"KDA_SMEM_STATE": 1, "ROWS_PER_ITER": 1, "KDA_PDL": 1}, HEAD_DIM * HEAD_DIM * state_bytes,
@@ -393,7 +390,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 "impl": {"launches": [
                     launch("k3_span_gather", "kern_k3_span_gather_packed",
                            grid=[{"mul": [{"ceil_div": [T, 48]}, 3 * (inner_l // 1024) + 1]}, 1, 1],
-                           block=[128, 1, 1], defines={"PARTIAL_BF16": 1, "K9_LD": kfused, **kda_state_defs})]},
+                           block=[128, 1, 1], defines={"PARTIAL_BF16": 1, "K9_LD": kfused})]},
             },
             "kda_frost": cudnn_kda_abi.op(module("cudnn_frost_kda"), chunk_max, pack, line_l, kfused, T, "seqs"),
             "kda_epilogue": {
@@ -401,7 +398,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                            "i64", "in buffer<i64>", "i32", "i32"],
                 "impl": {"launches": [
                     launch("k3_kda_epilogue", "kern_k3_kda_epilogue", grid=[{"add": [T, "seqs"]}, 3, 1],
-                           block=[512, 1, 1], defines={"KE_LD": kfused, **kda_state_defs}, pdl=True)]},
+                           block=[512, 1, 1], defines={"KE_LD": kfused}, pdl=True)]},
             },
             # the own rows' causal pass and a round's dense pass, each writing its softmax stats
             "mla_fmha_own": (lambda mod, entry: varlen_abi.fmha_op(
@@ -1414,7 +1411,6 @@ def main():
     ap.add_argument("--kv", choices=tuple(KV), default="fp8",
                     help="the MLA cache: SGLang's fp8 (e4m3; D attends it with FlashInfer's Cake kernel, P lifts it to "
                          "bf16 for the expansion and has no absorbed short path) or bf16")
-    ap.add_argument("--kda-state", choices=("bf16", "f32"), default="bf16", help="the KDA recurrent state's storage")
     ap.add_argument("--tiny-gemm", action="store_true",
                     help="D: our split-K GEMM (K split evenly) for the f32 K = 7168 projections and rows where it beat "
                          "cuBLAS (TINY_GEMM)")
@@ -1429,7 +1425,7 @@ def main():
         ap.error("D absorbs on tensor cores for at most 64 rows (k3_mla_absorb_mma BMAX)")
     names = tuple(a.moe_variants.split(",")) if a.moe_variants else None
     json.dump(build(a.layers, a.max_ctx, a.seqs, a.tp, a.mla_split_max, a.chunk, names, a.pack,
-                    a.mla_short, a.kv, a.mla_ours_from, a.window, a.kda_state, a.tiny_gemm),
+                    a.mla_short, a.kv, a.mla_ours_from, a.window, a.tiny_gemm),
               sys.stdout, indent=1)
     print()
 
