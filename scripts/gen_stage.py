@@ -277,13 +277,13 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                        "i32", "i32", "out buffer<u32>", "i32", "i32"],
             "impl": {"launches": [residual("kern_k3g_attnres_rms_setup")]},
         }} if chunk else {}),
-        # ... and D's MLA split plan (k3_mla_split_plan) in the same launch, a row's per block
+        # ... and the bf16 cache's MLA split plan (k3_mla_split_plan) in the same launch, a row's per block
         **({"embed_rms_plan": {
             "params": ["in buffer<i64>", "in buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "in buffer<bf16>",
                        "out buffer<bf16>", "in buffer<i32>", "out buffer<i32>", "i32", "i32"],
             "impl": {"launches": [launch("k3_ar_fused", "kern_k3_embed_rms_plan", grid=[{"add": [T, 1]}, 1, 1],
                                                  block=[1024, 1, 1])]},
-        }} if decode and mla else {}),
+        }} if decode and mla and not dsa else {}),
         # The attention's landing is o_proj's bf16 output, the value the f32 form rounds to first.
         "land_add_attnres_rms_bf16": {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "in buffer<f32>", "in buffer<bf16>",
@@ -781,8 +781,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     if decode and mla:
         work("q_partial", Q_B, "f32")
         work("q_abs", HEADS * LATENT_ROW, flavor.Q_ABS)
-        buffers["mla_bsk"] = {"dtype": "i32", "shape": [T], "kind": "workspace"}
         if not dsa:
+            buffers["mla_bsk"] = {"dtype": "i32", "shape": [T], "kind": "workspace"}
             flavor.d_buffers(work, buffers, g)
     if chunk:
         work("normed_last", H, var="seqs")
@@ -978,7 +978,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                      w("gamma_in"), b("normed"), b("seq_lens"), b("cu_seqlens"), b("fmha_lens"), {"var": "seqs"},
                      i32(NS), i32(mla_short), i32(window), i32(rounds), b("moe.route_sync"),
                      i32(bp["route_sync_words"]), B)
-            elif i == 0 and decode and mla:
+            elif i == 0 and decode and mla and not dsa:
                 step(L + "res_in", "embed_rms_plan", b("token_ids"), b("embed"), b("hidden"), b("blocks"),
                      w("gamma_in"), b("normed"), b("seq_lens"), b("mla_bsk"), i32(mla_split_max), B)
             elif i == 0:
