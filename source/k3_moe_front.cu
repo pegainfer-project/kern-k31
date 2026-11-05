@@ -7,9 +7,11 @@
 //       i32* num_non_exiting, i32* total_padded, i32* route_map, i32* exp2perm,
 //       const bf16* wsh, bf16* sh_out, int first, int T)
 //   grid (T + NSH / 64, 1, 1)   block (1024, 1, 1)   shared SMEM_SH bytes   T <= ROWS_MAX
+//   or grid (T, 1, 1), shared 0: the row blocks alone, the shared down projection left to a GEMM after FC2
 //
 // Launched as a programmatic dependent of the front GEMM: every block waits for it at entry
-// (griddepcontrol.wait), then lets FC1 launch.
+// (griddepcontrol.wait), then lets FC1 launch. FC1 waits for the whole grid: past a few dozen rows the
+// shared blocks finish well after the routing tables (gen_stage.py launches the row blocks alone there).
 //
 // Row b's block (b < T):
 //   * the router top-k of columns [0, EXPERTS) (k3_router_argmax.cu's picks and
@@ -29,7 +31,8 @@
 // TILE-row CTAs, every expert's rows in the order of shared-memory atomics
 // (as FlashInfer's are; the GEMMs' rows do not depend on it), padding rows
 // routing token 0, exp2perm -1 for another rank's expert.
-// Blocks T + c: the shared expert's down projection of 64 output columns (shared_down, below).
+// Blocks T + c, when the grid has them: the shared expert's down projection of 64 output columns
+// (shared_down, below); the row blocks publish to them only then.
 //
 //   nvcc -cubin -arch=sm_103a -DEXPERTS=896 -DLDS=6016 -DSH=768 -DSTRIDE=8 k3_moe_front.cu
 #include <cuda_bf16.h>
@@ -469,11 +472,12 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
     // the row's activation published to the shared-expert blocks (release: cumulative
     // over the SiTU warps' stores, ordered before it by the barrier)
     asm volatile("bar.sync 3, %0;" ::"n"(THREADS - SORT_WARPS * 32));
-    for (int c = t - SORT_WARPS * 32; c < READERS; c += THREADS - SORT_WARPS * 32)  // a flag per reader CTA
+    const int readers = gridDim.x > T ? READERS : 0;
+    for (int c = t - SORT_WARPS * 32; c < readers; c += THREADS - SORT_WARPS * 32)  // a flag per reader CTA
       asm volatile("st.release.gpu.global.b32 [%0], %1;" ::"l"(ready + c * ROWS_MAX + b), "r"(1) : "memory");
     // then the row's lowest local pick to each shared-expert block's prefetcher
     asm volatile("bar.sync 4, %0;" ::"n"(32 + THREADS - SORT_WARPS * 32) : "memory");
-    for (int c = t - SORT_WARPS * 32; c < READERS; c += THREADS - SORT_WARPS * 32)
+    for (int c = t - SORT_WARPS * 32; c < readers; c += THREADS - SORT_WARPS * 32)
       asm volatile("st.relaxed.gpu.global.b32 [%0], %1;" ::"l"(ids + c * ROWS_MAX + b), "r"(s_jmin + 1) : "memory");
   }
 

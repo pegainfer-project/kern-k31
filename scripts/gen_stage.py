@@ -95,6 +95,12 @@ KV = {"fp8": k3_kv_fp8, "bf16": k3_kv_bf16}
 TP_AR_GRID = 144
 # the rows a D step takes at most: k3_head.cu's KEY_ROWS and k3_moe_front.cu's ROWS_MAX, its tables' strides
 D_SEQS_MAX = 256
+# From this many rows moe_front runs its row blocks alone and the shared expert's down projection is a cuBLAS GEMM
+# after FC2: FC1 waits for all of moe_front, whose shared blocks end 1 / 4 / 7 / 13 us past the routing tables at
+# 16 / 64 / 128 / 256 rows. The GEMM after FC2 does not overlap it (FC1 / FC2 hold every SM); in the step it gains
+# 0.26 / 0.44 ms at 128 / 256 rows and loses 0.07-0.2 ms at 16-64, where the shared blocks also prefetch FC1's
+# first experts into L2 while they wait.
+SH_TAIL_FROM = 97
 DCP_GRID = 2 * 144  # k3_dcp.cu bounds the exchange to two blocks an SM: every block resident on 148 and 152 SMs
 KDA_SLOTS = 3 * 152  # k3_kda_core.cu: three blocks an SM, every one resident, each walking a head's rows
 CAND_SMEM = NB_MAX * H * 2  # k3_ar_fused.cu: a row's snapshots prefetched into shared memory
@@ -439,10 +445,19 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                        "out buffer<u8>", "out buffer<u8>", "out buffer<bf16>", *["inout buffer<i32>"] * 3,
                        *["out buffer<i32>"] * 6, "in buffer<bf16>", "out buffer<bf16>", "in buffer<u8>", "in buffer<u8>",
                        "i32", "i32"],
-            "impl": {"launches": [{**launch("k3_moe_front", "kern_k3_moe_front", grid=[{"add": [T, H // 64]}, 1, 1],
-                                            block=[1024, 1, 1], smem=1024 + 2 * sh_l * 128 + 64 * 64 * 2,
+            "impl": {"launches": [{**launch("k3_moe_front", "kern_k3_moe_front", grid=grid, block=[1024, 1, 1],
+                                            smem=smem, when={"var": T, **when},
                                             defines={"EXPERTS": EXPERTS, "LDS": front, "SH": sh_l, "STRIDE": tp}),
-                                   "pdl": True}]},
+                                   "pdl": True}
+                                  for grid, smem, when in (
+                                      ([{"add": [T, H // 64]}, 1, 1], 1024 + 2 * sh_l * 128 + 64 * 64 * 2,
+                                       {"max": SH_TAIL_FROM - 1}),
+                                      ([T, 1, 1], 0, {"min": SH_TAIL_FROM})) if when.get("min", 0) <= t_max]},
+        },
+        # the shared expert's down projection when moe_front's grid has no shared blocks (SH_TAIL_FROM)
+        "sh_down_tail": {
+            "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32", "i32"],
+            "impl": {"launches": [{"entry": "extern:cublaslt_bf16_tn", "when": {"var": T, "min": SH_TAIL_FROM}}]},
         }} if front else {}),
         **({"rms": {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32"],
@@ -1136,16 +1151,18 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 if not front:
                     proj(L + "wsh", b("normed"), w("wsh"), b("shared_partial"), 2 * sh_l, H)
                     land_situ(L + "shared_situ", b("shared_partial"), b("shared_act"), sh_l)
-                if not front:
+                if front and t_max >= SH_TAIL_FROM:
+                    step(L + "sh_tail", "sh_down_tail", b("shared_act"), w("sh_down"), b("moe_flat", shared_at),
+                         rows8, i32(H), i32(sh_l), i32(H))
+                elif not front:
                     proj(L + "sh_down", b("shared_act"), w("sh_down"), b("moe_flat", shared_at), H, sh_l)
                 if xchg:
                     # the combine, the sum of both and the latent norm in one launch; fc2's partial read
-                    # before the grid wait unless fc2 is the kernel right before (it lets its dependents
-                    # launch before its output is out)
-                    early = b("moe.fc2_out") not in prog[-1]["args"]
+                    # past the grid wait (`early` 0): fc2 lets its dependents launch before its output is out,
+                    # and the shared GEMM may run between them
                     step(L + "reduce_mlp", "ar_finalize_rms", b("moe.fc2_out"), b("moe.exp2perm"),
                          b("topk_weight"), b("moe_flat", shared_at), *lamport(), w("gamma_lat"),
-                         b("routed_latent_norm"), b("moe_sum", shared_at), B, i32(int(early)), i64(ar_stage),
+                         b("routed_latent_norm"), b("moe_sum", shared_at), B, i32(0), i64(ar_stage),
                          i64(TP_TIMEOUT_NS))
                     moe = "moe_sum"
                 else:
