@@ -635,8 +635,8 @@ extern "C" __global__ void __launch_bounds__(NT, 2) k31_topk(const bf16* __restr
   topk<false>(logits, stride, lens, out);
 }
 
-// One block an SM, a row of at most HELD_MAX read once into registers: few rows, each as soon as can be.
-extern "C" __global__ void __launch_bounds__(NT, 1) k31_topk_held(const bf16* __restrict__ logits, int stride,
+// Two blocks an SM, within 64 registers a thread, so 256 rows go in one wave on 152 SMs.
+extern "C" __global__ void __launch_bounds__(NT, 2) k31_topk_held(const bf16* __restrict__ logits, int stride,
                                                                  const int* __restrict__ lens, int* __restrict__ out) {
   topk<true>(logits, stride, lens, out);
 }
