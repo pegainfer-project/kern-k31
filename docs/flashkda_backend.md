@@ -1,5 +1,7 @@
 # KDA chunked-prefill backends for K3.1 on GB300
 
+The FlashKDA sources and `k3_kda_rec` this study names have since been removed from the repository; P runs cuDNN FROST.
+
 This study covers what P's `span_kda` should run. Every claim comes from reading the backends' source and from measurements on one GB300 (sm_103a, 152 SMs). All timings are graph-replayed and given in µs.
 
 ## Shape and terms

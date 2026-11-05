@@ -3,9 +3,9 @@
 // conv taps of span row i are the sequence's window (the line of the span's
 // first row) for i < 3 and the span's own earlier rows after that; the window
 // leaves holding the span's last three inputs. The results land in the span's
-// own buffers, rows 0..span, where the FlashKDA span kernel's descriptors
-// (fixed at load) find them, together with what it wants transposed: beta as
-// [HEADS][span] and the f_a flow as bf16 [span][128] (the f_b GEMM's input).
+// own buffers, rows 0..span, where the span's KDA core reads them, together
+// with beta transposed to [HEADS][span] and the f_a flow as bf16 [span][128]
+// (the f_b GEMM's input).
 // Contract: docs/k3-kernel-abi.md section K9.
 //
 //   extern "C" __global__ void kern_k3_span_gather(

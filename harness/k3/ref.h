@@ -249,7 +249,7 @@ static inline void ref_land_add2(const float* p1, const float* p2,
 }
 
 // =========================================================================
-// K2  kern_k3_conv_silu
+// K2  the short conv + SiLU, which kda_core folds in (KDA_CONV)
 // =========================================================================
 // Line helpers: rec of row b is at its line, window s at line + REC_BYTES + s*WIN_BYTES,
 // bf16[3 tap][INNER] with tap 0 the oldest.
@@ -376,44 +376,6 @@ static inline void ref_kda_core(const float* partial, int lds, const float* cw,
       out[(size_t)b * INNER + (size_t)h * 128 + d] = bmul(o, gt);
     }
   });
-}
-
-// =========================================================================
-// K9  kern_k3_span_gather:  K2 applied to batch rows at..at+span one after
-//     another, all on row at's line, into the span's own rows 0..span;
-//     beta transposed [HEADS][span], flow bf16 [span][128]
-// =========================================================================
-static inline void ref_span_gather(const float* partial, const float* cw,
-                                   void* kda_base, const int* line_index,
-                                   long long line_bytes, const float* wsm,
-                                   bf16* span_q, bf16* span_k, bf16* span_v,
-                                   bf16* span_beta, bf16* span_flow,
-                                   const int* span_at, int span) {
-  const int at = *span_at;
-  partial += (size_t)at * KDA_FUSED;
-  wsm += (size_t)at * WSM;
-  line_index += at;
-  for (int i = 0; i < span; ++i)
-    ref_conv_silu(partial + (size_t)i * KDA_FUSED, KDA_FUSED, cw, kda_base, line_index,
-                  line_bytes, span_q + (size_t)i * INNER,
-                  span_k + (size_t)i * INNER, span_v + (size_t)i * INNER, 1);
-  for (int i = 0; i < span; ++i) {
-    for (int h = 0; h < HEADS; ++h)
-      span_beta[(size_t)h * span + i] = f2b(wsm[(size_t)i * WSM + h]);
-    for (int j = 0; j < 128; ++j)
-      span_flow[(size_t)i * 128 + j] = f2b(wsm[(size_t)i * WSM + WSM_FA + j]);
-  }
-}
-
-// =========================================================================
-// K10 kern_k3_span_state:  rec of row at's line <-> buf [HEADS][128][128] bf16
-// =========================================================================
-static inline void ref_span_state(void* kda_base, const int* line_index,
-                                  long long line_bytes, const int* span_at,
-                                  bf16* buf, int to_line) {
-  bf16* rec = rec_ptr(kda_base, line_index, line_bytes, *span_at);
-  if (to_line) std::memcpy(rec, buf, (size_t)REC_BYTES);
-  else std::memcpy(buf, rec, (size_t)REC_BYTES);
 }
 
 // =========================================================================

@@ -6,7 +6,7 @@
 //   kern_fill_bf16       p[i] = v (the router's unit scale)
 //   kern_k3_conv_taps    cw[s][t][j] = w_s[j][t]: the three conv1d weights
 //                        [inner, 1, 4] f32 transposed into the taps block
-//                        kern_k3_conv_silu / kern_k3_span_gather read
+//                        kern_k3_kda_core / kern_k3_span_gather read
 //   kern_k3_scoring      sw[j] = f32(norm[j]) * f32(proj[j]): the folded
 //                        attention-residual scoring vector
 //   kern_k3_wsm          the KDA small-projection block [256, h]: rows

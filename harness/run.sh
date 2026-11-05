@@ -57,7 +57,7 @@ cubin() {
 
 KDA_SMEM=k3_kda_core+HEADS=12+KDA_CONV=1+KDA_PDL=1+KDA_SMEM_STATE=1+LDS=6400+ROWS_PER_ITER=1+WSM_FA=12+WSM_LDS=6400
 KDA_REGS=k3_kda_core+HEADS=12+KDA_CONV=1+KDA_MINB=4+LDS=6400+ROWS_PER_ITER=4+WSM_FA=12+WSM_LDS=6400
-D1=(k3_conv_silu+HEADS=12 "$KDA_SMEM" "$KDA_REGS" k3_kda_out_gate+HEADS=12 k3_mla_vup_gate+HEADS=12
+D1=("$KDA_SMEM" "$KDA_REGS" k3_kda_out_gate+HEADS=12 k3_mla_vup_gate+HEADS=12
     k3_mla_prep+INNER=1536+MLA_FUSED=3648 k3_dcp k3_router_argmax)
 
 sass() {
@@ -83,7 +83,6 @@ tp8() {
   build "$h/harness.cu" "$h/harness"
   local run=(r "$h/harness" --reps "$reps")
   for B in 1 2 8 64; do
-    "${run[@]}" --kernel conv_silu --cubin "$(cubin k3_conv_silu+HEADS=12)" --B "$B" --grid "$B,3,3" --block 128,1,1
     "${run[@]}" --kernel kda_core --cubin "$(cubin "$KDA_SMEM")" --B "$B" --lds 6400 --smem 65536
     "${run[@]}" --kernel kda_core --cubin "$(cubin "$KDA_REGS")" --B "$B" --lds 6400
     "${run[@]}" --kernel kda_out_gate --cubin "$(cubin k3_kda_out_gate+HEADS=12)" --B "$B" --grid "$B,3,1"

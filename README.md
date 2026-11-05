@@ -85,7 +85,7 @@ shapes match.
 | [`scripts/deploy.sh`](scripts/deploy.sh) | P's stages and D's manifest of a deployment, verified |
 | [`scripts/k3_vllm.py`](scripts/k3_vllm.py), [`scripts/k3_sglang.py`](scripts/k3_sglang.py) | the D manifest as vLLM's or SGLang's model forward |
 | [`kernels.toml`](kernels.toml) | every module a manifest pins: SHA-256, source and defines, or prebuilt path and upstream |
-| [`source/`](source/) | handwritten CUDA and vendored FlashKDA, cuDNN's FROST KDA prefill (CuTe DSL), FlashInfer MoE routing and Cake MLA decode, each with its license and provenance |
+| [`source/`](source/) | handwritten CUDA, cuDNN's FROST KDA prefill (CuTe DSL), FlashInfer MoE routing and Cake MLA decode, each with its license and provenance |
 | [`prebuilt/`](prebuilt/) | cubins with no source recipe here; origins in [`prebuilt/README.md`](prebuilt/README.md) |
 | [`step/`](step/) | `k3_step`: a D manifest teacher-forced, one process per rank |
 | [`harness/`](harness/) | kernel acceptance runs |
@@ -135,7 +135,6 @@ at `76b0bdb`. Its handwritten kernels and generator began in kern's `tools/`
 at [`b5c7d14`](https://github.com/pegainfer-project/kern/tree/b5c7d14). K3's
 measurements and optimization records stay there.
 
-kern's sources keep their [Apache-2.0 license](source/LICENSE), FlashKDA its
-[MIT license](source/flash-kda/LICENSE), FlashInfer its
+kern's sources keep their [Apache-2.0 license](source/LICENSE), FlashInfer its
 [Apache-2.0 license](source/flashinfer-moe-routing/LICENSE), cuDNN frontend's FROST its
 [Apache-2.0](source/cudnn-frost-kda/LICENSE) and [MIT](source/cudnn-frost-kda/LICENSE-MIT) licenses.
