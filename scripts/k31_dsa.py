@@ -77,16 +77,18 @@ def absorb_tc(q=0, w=1, y=2, rows=3, **kw):
 def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1, fold=False):
     """The layer's ops; `rows_max` a call's rows (P) or the batch (D), `max_ctx` a row's keys at most (a
     member's, under DCP), `gate_stride` the gate's row stride in elements, `tp` D's DCP group. `fold`: the
-    indexer's key and head weights come f32 out of the wfu GEMM (idx_key / idx_q's _f32 entries)."""
+    indexer's key and head weights come f32 out of the wfu GEMM (mla_prep writes the key, idx_q takes its _f32
+    entry)."""
     kw_t, f32 = ("in buffer<f32>", "_f32") if fold else ("in buffer<bf16>", "")
     dsa = lambda entry, grid, block, **kw: launch("k31_dsa", entry, grid=grid, block=block, **kw)
     # D's chain from the prep to the exchange launches as programmatic dependents (each kernel waits)
     pdl = {} if chunk else {"pdl": True}
     o = {
-        "idx_key": {
-            "params": [kw_t, "i32", "in buffer<bf16>", "in buffer<bf16>", "in buffer<i64>", "inout state", "i32"],
-            "impl": {"launches": [dsa("k31_idx_key" + f32, [{"ceil_div": [T, 4]}, 1, 1], [128, 1, 1], **pdl)]},
-        },
+        **({} if fold else {"idx_key": {
+            "params": ["in buffer<bf16>", "i32", "in buffer<bf16>", "in buffer<bf16>", "in buffer<i64>", "inout state",
+                       "i32"],
+            "impl": {"launches": [dsa("k31_idx_key", [{"ceil_div": [T, 4]}, 1, 1], [128, 1, 1], **pdl)]},
+        }}),
         # (q, ldq, weights_proj, ldw, iq, sfq, w, rid, B); P has no request ids
         "idx_q": {
             "params": ["in buffer<bf16>", "i32", kw_t, "i32", "out buffer<u8>", "out buffer<u32>",
@@ -367,14 +369,15 @@ def steps(step, w, L, kv, idx, chunk, gate, max_pages, max_ctx, q, exchange=None
     `select` (err, timeout, stage bytes) is the candidates' exchange. D's paged logits read DeepGEMM's
     schedule, a function of seq_lens and the rows alone: `sched` false takes the one an earlier layer of
     the step left in `idx_sched`. `kw` (the f32 wk | weights_proj columns, their row stride) when the wfu
-    GEMM projected them, else idx_kw does, bf16."""
+    GEMM projected them (mla_prep has written the key), else idx_kw does, bf16."""
     if kw:
         kwo, ld = kw
         iw = dict(kwo, offset=kwo.get("offset", 0) + ID * 4)
     else:
         step(L + "idx_kw", "gemm_bf16", b("normed"), w("idx_kw"), b("idx_kwo"), B, i32(IDX_KW), i32(7168), i32(IDX_KW))
-        kwo, ld, iw = b("idx_kwo"), IDX_KW, b("idx_kwo", ID * 2)
-    step(L + "idx_key", "idx_key", kwo, i32(ld), w("idx_kn_w"), w("idx_kn_b"), b("slot_mapping"), {"state": idx}, B)
+        ld, iw = IDX_KW, b("idx_kwo", ID * 2)
+        step(L + "idx_key", "idx_key", b("idx_kwo"), i32(ld), w("idx_kn_w"), w("idx_kn_b"), b("slot_mapping"),
+             {"state": idx}, B)
     step(L + "idx_qb", "gemm_bf16", b("q_norm"), w("idx_qw"), b("idx_qb"), B, i32(IDX_Q), i32(Q_LORA), i32(IDX_Q))
     step(L + "idx_q", "idx_q", b("idx_qb"), i32(IDX_Q), iw, i32(ld), b("idx_iq"), b("idx_sfq"),
          b("idx_w"), *([] if chunk else [b("idx_rid")]), B)

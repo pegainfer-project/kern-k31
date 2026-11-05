@@ -66,6 +66,11 @@
 // slot is treated as "no slot" and the append is skipped; q_norm and
 // mla_gate are written in full regardless.
 //
+// -DIDX_KEY=<column>: K3.1's DSA indexer key rides in the same row, its 128 columns from `column` on (the
+// wfu GEMM's wk part), and the last warp of each row's last block lands them to bf16 and writes the key
+// into the row's slot of `idx_cache` (k31_idx_key.cuh; idx_key_w / idx_key_b the norm's weight and bias),
+// so D's k31_idx_key launch goes away. The parameters follow `B`.
+//
 // ---- landing points (pegainfer's chain: land_rms_norm_rbs + rms_norm_rbs)
 //   * every f32 partial column lands to bf16 *first*, x = f32(bf16(P[i])),
 //     including the copies that feed the sums of squares;
@@ -120,6 +125,9 @@ __device__ __forceinline__ unsigned mul2(unsigned a, unsigned g) {
                              *reinterpret_cast<const __nv_bfloat162*>(&g));
   return *reinterpret_cast<unsigned*>(&r);
 }
+#ifdef IDX_KEY
+#include "k31_idx_key.cuh"
+#endif
 #ifdef KV_FP8
 #include "k3_e4m3.cuh"
 typedef unsigned char kv_t;
@@ -148,7 +156,12 @@ extern "C" __global__ __launch_bounds__(MAXNT) void kern_k3_mla_prep(
     long long layer_off, long long page_stride,    // elements
     __nv_bfloat16* __restrict__ q_norm,            // [B, Q_LORA]
     __nv_bfloat16* __restrict__ mla_gate,          // [B, INNER]
-    int B) {
+    int B
+#ifdef IDX_KEY
+    , const __nv_bfloat16* __restrict__ idx_key_w, const __nv_bfloat16* __restrict__ idx_key_b,
+    unsigned char* __restrict__ idx_cache
+#endif
+    ) {
   // cuBLAS's GEMM behind this kernel launches as a programmatic dependent and waits on its own:
   // let it get its blocks onto the SMs now. D launches this kernel as one too.
   asm volatile("griddepcontrol.launch_dependents;");
@@ -158,6 +171,17 @@ extern "C" __global__ __launch_bounds__(MAXNT) void kern_k3_mla_prep(
   const int t = threadIdx.x;
   const int nt = blockDim.x;
   const float* __restrict__ P = partial + (long long)b * MLA_FUSED;
+#ifdef IDX_KEY
+  if (blockIdx.y == gridDim.y - 1 && t >= nt - 32) {
+    const long long s = slot_mapping[b];
+    if (s >= 0) {
+      const int l = t & 31;
+      const float4 v = *reinterpret_cast<const float4*>(P + IDX_KEY + 4 * l);
+      const float x[4] = {landf(v.x), landf(v.y), landf(v.z), landf(v.w)};
+      k31_key_row(x, idx_key_w, idx_key_b, idx_cache + s * 144, l);
+    }
+  }
+#endif
 
   __shared__ float xs[HEADC];     // generic path: landed head columns
   __shared__ uint2 gs[KU];        // generic path: gamma_q_a | gamma_kv_a
