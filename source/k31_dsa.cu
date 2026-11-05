@@ -20,6 +20,8 @@
 #include <cuda_fp8.h>
 #include <stdint.h>
 
+#include "k31_idx_key.cuh"
+
 typedef __nv_bfloat16 bf16;
 typedef unsigned char u8;
 
@@ -28,94 +30,34 @@ typedef unsigned char u8;
 #define IDX_ROW 144
 #define TOPK 2048
 #define PAGE 64
-#define K_EPS 1e-5f
 
 __device__ __forceinline__ float bf(bf16 x) { return __bfloat162float(x); }
 __device__ __forceinline__ void pdl_entry() {
   asm volatile("griddepcontrol.launch_dependents;");
   asm volatile("griddepcontrol.wait;" ::: "memory");
 }
-__device__ __forceinline__ float rnd(float x) { return __bfloat162float(__float2bfloat16(x)); }
+__device__ __forceinline__ void ld4(const bf16* p, float v[4]) { bf16x4(p, v); }
 
-__device__ __forceinline__ float warp_sum(float v) {
-#pragma unroll
-  for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-  return v;
-}
-__device__ __forceinline__ float warp_max(float v) {
-#pragma unroll
-  for (int o = 16; o; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
-  return v;
-}
-
-// 2^ceil(log2(max(amax, eps) / 448)), exact on the bits.
-__device__ __forceinline__ float ue8m0(float amax, float eps) {
-  const unsigned b = __float_as_uint(fmaxf(amax, eps) / 448.f);
-  const unsigned x = ((b >> 23) & 0xff) + ((b & 0x7fffff) != 0);
-  return __uint_as_float(x << 23);
-}
-
-__device__ __forceinline__ unsigned ue8m0x4(float sc) { return (__float_as_uint(sc) >> 23) * 0x01010101u; }
-
-__device__ __forceinline__ unsigned fp8x4(float a, float b, float c, float d) {
-  const __nv_fp8x4_e4m3 q(make_float4(a, b, c, d));
-  return *reinterpret_cast<const unsigned*>(&q);
-}
-
-__device__ __forceinline__ void ld4(const bf16* p, float v[4]) {
-  const uint2 u = *reinterpret_cast<const uint2*>(p);
-  const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&u);
-  const float2 a = __bfloat1622float2(h[0]), b = __bfloat1622float2(h[1]);
-  v[0] = a.x, v[1] = a.y, v[2] = b.x, v[3] = b.y;
-}
-
-// The key of row r (k [T, 128], lda apart) into its slot's cache row; a negative slot (a padding row, or
-// a position another member holds) writes nothing. k is bf16, or f32 (the _f32 entry: D's, a slice of the
-// wfu GEMM's output, rounded to bf16 as the bf16 GEMM's epilogue rounds it).
+// The key of row r (k [T, 128] bf16, lda apart) into its slot's cache row (k31_idx_key.cuh); a negative
+// slot (a padding row, or a position another member holds) writes nothing. D's DCP build writes its keys in
+// k3_mla_prep (IDX_KEY) instead.
 //   grid (ceil(T / 4)), block 128: a warp a row
-__device__ __forceinline__ void ld4(const float* p, float v[4]) {
-  const float4 u = *reinterpret_cast<const float4*>(p);
-  v[0] = rnd(u.x), v[1] = rnd(u.y), v[2] = rnd(u.z), v[3] = rnd(u.w);
-}
-__device__ __forceinline__ float in_bf(bf16 x) { return bf(x); }
-__device__ __forceinline__ float in_bf(float x) { return rnd(x); }
-
-template <class K>
-__device__ __forceinline__ void idx_key(const K* __restrict__ k, int lda, const bf16* __restrict__ w,
-                                        const bf16* __restrict__ b, const long long* __restrict__ slot,
-                                        u8* __restrict__ cache, int T) {
+extern "C" __global__ void __launch_bounds__(128) k31_idx_key(
+    const bf16* __restrict__ k, int lda, const bf16* __restrict__ w, const bf16* __restrict__ b,
+    const long long* __restrict__ slot, u8* __restrict__ cache, int T) {
   pdl_entry();
   const int r = blockIdx.x * 4 + (threadIdx.x >> 5), l = threadIdx.x & 31;
   if (r >= T) return;
   const long long s = slot[r];
   if (s < 0) return;
-  float x[4], g[4], c[4];
+  float x[4];
   ld4(k + (size_t)r * lda + l * 4, x);
-  ld4(w + l * 4, g);
-  ld4(b + l * 4, c);
-  const float mean = warp_sum(x[0] + x[1] + x[2] + x[3]) / ID;
-  float d2 = 0.f;
-#pragma unroll
-  for (int j = 0; j < 4; ++j) d2 += (x[j] - mean) * (x[j] - mean);
-  const float rstd = rsqrtf(warp_sum(d2) / ID + K_EPS);
-  float y[4];
-#pragma unroll
-  for (int j = 0; j < 4; ++j) y[j] = rnd((x[j] - mean) * rstd * g[j] + c[j]);
-  const float sc = ue8m0(warp_max(fmaxf(fmaxf(fabsf(y[0]), fabsf(y[1])), fmaxf(fabsf(y[2]), fabsf(y[3])))), 1e-4f);
-  u8* row = cache + s * IDX_ROW;
-  *reinterpret_cast<unsigned*>(row + l * 4) = fp8x4(y[0] / sc, y[1] / sc, y[2] / sc, y[3] / sc);
-  if (l == 0) *reinterpret_cast<unsigned*>(row + ID) = ue8m0x4(sc);
+  k31_key_row(x, w, b, cache + s * IDX_ROW, l);
 }
-extern "C" __global__ void __launch_bounds__(128) k31_idx_key(
-    const bf16* __restrict__ k, int lda, const bf16* __restrict__ w, const bf16* __restrict__ b,
-    const long long* __restrict__ slot, u8* __restrict__ cache, int T) {
-  idx_key(k, lda, w, b, slot, cache, T);
-}
-extern "C" __global__ void __launch_bounds__(128) k31_idx_key_f32(
-    const float* __restrict__ k, int lda, const bf16* __restrict__ w, const bf16* __restrict__ b,
-    const long long* __restrict__ slot, u8* __restrict__ cache, int T) {
-  idx_key(k, lda, w, b, slot, cache, T);
-}
+
+// A head weight as the bf16 its GEMM lands, from a bf16 output or an f32 one.
+__device__ __forceinline__ float in_bf(bf16 x) { return bf(x); }
+__device__ __forceinline__ float in_bf(float x) { return rnd(x); }
 
 // The indexer query of row r (q [T, 32 x 128] bf16, ldq apart) as e4m3 per head into iq [T, 32, 128]
 // with its scales into sfq [T, 32], each head's weight (iw [T, 32], ldw apart; bf16, or f32 under the _f32

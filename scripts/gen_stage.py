@@ -233,7 +233,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     kfused = fused_l + WSM if chunk or xchg else 0
     mla_fused_l = Q_LORA + KV_A + inner_l
     # A D member's wfu GEMM also projects DSA's indexer key and head weights (wk | weights_proj): the same
-    # input, one launch; idx_key and idx_q read their f32 columns past the gate.
+    # input, one launch; mla_prep writes the key (k3_mla_prep.cu IDX_KEY) and idx_q reads the head weights,
+    # their f32 columns past the gate.
     idx_fold = dsa and xchg
     wfu_l = mla_fused_l + (k31_dsa.IDX_KW if idx_fold else 0)
     # This rank's columns of the shared expert and the dense FFN.
@@ -419,10 +420,12 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         # source's generic path (any gridDim.y but the fast path's 4) over that width.
         "mla_prep": {
             "params": ["in buffer<f32>", "in buffer<bf16>", "in buffer<bf16>", "in buffer<i64>", "inout state",
-                       "i64", "i64", "out buffer<bf16>", "out buffer<bf16>", "i32"],
+                       "i64", "i64", "out buffer<bf16>", "out buffer<bf16>", "i32",
+                       *(["in buffer<bf16>", "in buffer<bf16>", "inout state"] if idx_fold else [])],
             # k3_mla_prep.cu's fast path: the norm / append block and a gate block per 4096 columns
             "impl": {"launches": [launch("k3_mla_prep", "kern_k3_mla_prep", grid=[T, 1 + -(-inner_l // 4096), 1],
-                                         defines={"INNER": inner_l, "MLA_FUSED": wfu_l, **flavor.D_PREP},
+                                         defines={"INNER": inner_l, "MLA_FUSED": wfu_l, **flavor.D_PREP,
+                                                  **({"IDX_KEY": mla_fused_l} if idx_fold else {})},
                                          pdl=True)
                                   if tp > 1
                                   else launch("k3_mla_prep", "kern_k3_mla_prep", defines=flavor.D_PREP or None,
@@ -1090,7 +1093,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                              i32(mla_short), B)
                 else:
                     step(L + "mla_prep", "mla_prep", b("mla_fused_partial"), w("gamma_q_a"), w("gamma_kv_a"),
-                         b("slot_mapping"), {"state": kv}, i64(0), i64(page_stride), b("q_norm"), b("mla_gate"), B)
+                         b("slot_mapping"), {"state": kv}, i64(0), i64(page_stride), b("q_norm"), b("mla_gate"), B,
+                         *((w("idx_kn_w"), w("idx_kn_b"), {"state": f"idx.{i}"}) if idx_fold else ()))
                     if dsa:
                         step(L + "q_b", "q_b", b("q_norm"), w("w_q_b"), b("q_partial"), b("q_bf16"), B, i32(Q_B),
                              i32(Q_LORA), i32(Q_B))
