@@ -188,25 +188,20 @@ extern "C" __global__ __launch_bounds__(K9_BLOCK) void kern_k3_span_gather(
   }
 }
 
-// The packed call's KDA prologue and epilogue around FlashKDA: rows
-// [cu_seqlens[j], cu_seqlens[j + 1]) are sequence j's, its KDA line
-// line_index[j]. FlashKDA's descriptors are fixed at load, so its inputs land
-// in the span buffers and its f32 state is staged in a flat buffer
-// ([nseq][HEADS][128][128]) on the way in and out.
+// The packed call's KDA prologue: rows [cu_seqlens[j], cu_seqlens[j + 1]) are
+// sequence j's, its KDA line line_index[j].
 //
 // `kern_k3_span_gather_packed`: K9's conv + SiLU of every row (each sequence
-// reads its own window, left untouched here: `kern_k3_kda_rec` advances it),
-// beta / flow transposed, and FlashKDA's tile prefix (16-row tiles per
-// sequence, upstream's `_flash_kda_build_tile_prefix`).
+// reads its own window, left untouched here: `kern_k3_kda_epilogue` advances
+// it after the core) and the f_a flow. The core reads beta where the
+// projection landed it.
 //
 //   kern_k3_span_gather_packed(partial, cw, kda_base, line_index, line_bytes, wsm_partial,
-//                              span_q, span_k, span_v, span_beta, span_flow,
-//                              const long long* cu_seqlens, int nseq, int span, int* tile_prefix,
-//                              int* progress);
-//   grid (37 * ceil(span / 48) + 1)   block 128
-//   block b < 37 * ceil(span / 48): rows 48 * (b / 37) ..; b % 37 < 36 is stream (b % 37) / 12,
-//   columns 1024 * (b % 12) + 8 * thread; b % 37 == 36 beta / flow. The last block writes
-//   the tile prefix and zeroes k3_kda_rec's progress counters ([nseq][HEADS], one a 128-byte line).
+//                              span_q, span_k, span_v, span_flow,
+//                              const long long* cu_seqlens, int nseq, int span);
+//   grid (37 * ceil(span / 48))   block 128
+//   block b: rows 48 * (b / 37) ..; b % 37 < 36 is stream (b % 37) / 12, columns 1024 * (b % 12) +
+//   8 * thread; b % 37 == 36 the flow.
 #ifdef PARTIAL_BF16
 #define K9_PROWS 48
 #define K9_PUNROLL 12
@@ -214,8 +209,6 @@ extern "C" __global__ __launch_bounds__(K9_BLOCK) void kern_k3_span_gather(
 #define K9_PCOLS (K9_BLOCK * K9_PVEC)
 #define K9_PCOL_BLOCKS (K9_INNER / K9_PCOLS)
 #define K9_PCONV (3 * K9_PCOL_BLOCKS + 1)
-#define K9_TILE 16
-#define K9_PROGRESS_STRIDE 32  // k3_kda_rec.cu K12_PROGRESS_STRIDE
 
 __device__ __forceinline__ int k9_seq_of(const long long* cu, int nseq, int i) {
   int j = 0;
@@ -309,35 +302,15 @@ extern "C" __global__ __launch_bounds__(K9_BLOCK) void kern_k3_span_gather_packe
     long long line_bytes,
     const part_t* __restrict__ wsm_partial,
     bf16* __restrict__ span_q, bf16* __restrict__ span_k, bf16* __restrict__ span_v,
-    bf16* __restrict__ span_beta,
     bf16* __restrict__ span_flow,
     const long long* __restrict__ cu_seqlens,
     int nseq,
-    int span,
-    int* __restrict__ tile_prefix,
-    int* __restrict__ progress) {
-  const int nconv = (span + K9_PROWS - 1) / K9_PROWS * K9_PCONV;
+    int span) {
   const int b = blockIdx.x;
-  if (b >= nconv) {
-    for (int i = threadIdx.x; i < nseq * HEADS; i += K9_BLOCK) progress[K9_PROGRESS_STRIDE * i] = 0;
-    if (threadIdx.x == 0) {
-      int acc = 0;
-      tile_prefix[0] = 0;
-      for (int j = 0; j < nseq; ++j) {
-        acc += (int(cu_seqlens[j + 1] - cu_seqlens[j]) + K9_TILE - 1) / K9_TILE;
-        tile_prefix[j + 1] = acc;
-      }
-    }
-    return;
-  }
   const int row0 = b / K9_PCONV * K9_PROWS, role = b % K9_PCONV;
   const int rows = min(K9_PROWS, span - row0);
   if (role == 3 * K9_PCOL_BLOCKS) {
-    // beta: 32 rows of a head per warp pass; flow: a row's 128 columns per 16 threads
-    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
-    for (int i = lane; i < rows; i += 32)
-      for (int h = w; h < HEADS; h += 4)
-        span_beta[(size_t)h * span + row0 + i] = k9_land(wsm_partial[(size_t)(row0 + i) * K9_LDW + h]);
+    // a row's 128 columns per 16 threads
     for (int r = threadIdx.x >> 4; r < rows; r += K9_BLOCK / 16) {
       const int k = threadIdx.x & 15;
       const part_t* row = wsm_partial + (size_t)(row0 + r) * K9_LDW + K9_WSM_FA + k * 8;

@@ -17,12 +17,13 @@ stage does not run.
 P (`--chunk N`): program `prefill` runs up to --pack sequences' chunks, packed
 back to back (`cu_seqlens`, at most N rows), on one GPU holding every expert,
 and the head on each sequence's last row: `next_token` is one token a
-sequence. A KDA layer runs FlashKDA's kernel 1 and source/k3_kda_rec.cu from
-and to each sequence's line. An MLA layer expands the context's latent rows
-by kv_b and runs TensorRT-LLM's context FMHA (docs/k3-kernel-abi.md K13), or,
-over bf16 pages, for a call of at most --mla-short rows, attends in the latent space. The MoE
-runs TRT-LLM gen's batched GEMMs over every expert (k3_moe_bmm.py), routed in
-one call (source/k3_moe_route.cu).
+sequence. A KDA layer runs cuDNN's FROST KDA prefill (scripts/cudnn_kda_abi.py)
+from and to each sequence's line in place, then source/k3_kda_epilogue.cu. An
+MLA layer expands the context's latent rows by kv_b and runs TensorRT-LLM's
+context FMHA (docs/k3-kernel-abi.md K13), or, over bf16 pages, for a call of at
+most --mla-short rows, attends in the latent space. The MoE runs TRT-LLM gen's
+batched GEMMs over every expert (k3_moe_bmm.py), routed in one call
+(source/k3_moe_route.cu).
 
 D (`--tp R`): the decode step as SGLang's TP / EP / DCP decode runs it
 (decode/sglang-tp8-dcp8-ep8), one batch replicated on the group's R ranks.
@@ -78,6 +79,7 @@ import k3_moe_bmm
 from pinned import module
 import trtllm_fmha_abi
 import varlen_abi
+import cudnn_kda_abi
 import kern_manifest
 from once import Once, buf, seg
 import k3_once  # noqa: F401  K3's load-time ops, which kern's `once` no longer carries
@@ -180,6 +182,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     xchg = decode and tp > 1
     flavor = KV[kv]
     assert kda_state in ("bf16", "f32")
+    assert decode or kda_state == "bf16", "P's KDA core (cudnn_kda_abi) is built for a bf16 state"
     # K3.1's MLA layers attend sparsely over the fp8 pages (k31_dsa.py); the bf16 flavor is K3's dense path
     dsa = kv == "fp8"
     flavor.check(decode, xchg, seqs_max, dsa)
@@ -376,22 +379,28 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             },
         }} if decode else {}),
         **({
-            # P's KDA: the gather (source/k3_span_gather.cu: conv, beta / flow,
-            # FlashKDA's tile prefix), then FlashKDA's kernel 1 and
-            # source/k3_kda_rec.cu, which runs the recurrence from and to every
-            # sequence's line (its column of the line table, its rows by
-            # `cu_seqlens`), gates the output rows and advances the conv windows.
+            # P's KDA: the gather (source/k3_span_gather.cu: conv, the f_a flow),
+            # then cuDNN's FROST KDA from and to every sequence's line in place
+            # (its column of the line table, its rows by `cu_seqlens`; beta read
+            # where the projection landed it), then source/k3_kda_epilogue.cu,
+            # which gates the output rows in place and advances the conv windows.
             "span_gather": {
                 "params": ["in buffer<bf16>", "in buffer<f32>", "in state", "in buffer<i32>", "i64", "in buffer<bf16>",
                            "out buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>", "out buffer<bf16>",
-                           "out buffer<bf16>", "in buffer<i64>", "i32", "i32", "out buffer<i32>", "out buffer<i32>"],
+                           "in buffer<i64>", "i32", "i32"],
                 "impl": {"launches": [
                     launch("k3_span_gather", "kern_k3_span_gather_packed",
-                           grid=[{"add": [{"mul": [{"ceil_div": [T, 48]}, 3 * (inner_l // 1024) + 1]}, 1]}, 1, 1],
+                           grid=[{"mul": [{"ceil_div": [T, 48]}, 3 * (inner_l // 1024) + 1]}, 1, 1],
                            block=[128, 1, 1], defines={"PARTIAL_BF16": 1, "K9_LD": kfused, **kda_state_defs})]},
             },
-            "flash_kda": varlen_abi.kda_op(hl, chunk_max, pack, module(varlen_abi.KDA_MODULE),
-                                           module("k3_kda_rec", K12_LD=kfused, **kda_state_defs), T, "seqs"),
+            "kda_frost": cudnn_kda_abi.op(module("cudnn_frost_kda"), chunk_max, pack, line_l, kfused, T, "seqs"),
+            "kda_epilogue": {
+                "params": ["inout buffer<bf16>", "in buffer<bf16>", "in buffer<f32>", "inout state", "in buffer<i32>",
+                           "i64", "in buffer<i64>", "i32", "i32"],
+                "impl": {"launches": [
+                    launch("k3_kda_epilogue", "kern_k3_kda_epilogue", grid=[{"add": [T, "seqs"]}, 3, 1],
+                           block=[512, 1, 1], defines={"KE_LD": kfused, **kda_state_defs}, pdl=True)]},
+            },
             # the own rows' causal pass and a round's dense pass, each writing its softmax stats
             "mla_fmha_own": (lambda mod, entry: varlen_abi.fmha_op(
                 HEADS, chunk_max, chunk_max + KV_PAD, mod, T, "seqs", entry=entry, fp8=fp8_attn))(
@@ -779,13 +788,10 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     buffers["span_at"] = {"dtype": "i32", "shape": [1], "kind": "carry"}
     once.call("fill_i32", [buf("span_at"), i32(1), i32(0)], 1)
     if chunk:
-        buffers["span_beta"] = {"dtype": "bf16", "shape": [hl, chunk_max], "kind": "workspace"}
         for n in ["span_q", "span_k", "span_v"]:
             work(n, inner_l, var=chunk_max)
-        buffers["span_progress"] = {"dtype": "i32", "shape": [pack * hl * 32], "kind": "workspace"}  # a 128-byte line each
         work("span_flow", HEAD_DIM, var=chunk_max)
         work("span_g", inner_l, var=chunk_max)
-        buffers.update(varlen_abi.kda_workspace(hl, chunk_max, pack))
     if mx:
         for q, k in (("normed", H), ("lat", LATENT)):
             work(q + "_q", k, "fp8e4m3", var=RW)
@@ -925,19 +931,17 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         return whole
 
     def kda_run(L, w, line, kda):
-        """P's KDA layer: conv taps + beta/flow gathered (K9), g by one GEMM, FlashKDA and the recurrence
-        over every sequence, the output gated (K11)."""
+        """P's KDA layer: conv taps + flow gathered (K9), g by one GEMM, FROST over every sequence from and to
+        its line, the output gated in place (K11) and the windows advanced."""
         N = {"var": "seqs"}
         step(L + "span_gather", "span_gather", b("kda_partial"), w("cw"), {"state": kda}, line, i64(line_l),
-             wsm_part, b("span_q"), b("span_k"), b("span_v"), b("span_beta"), b("span_flow"),
-             b("cu_seqlens"), N, B, b("span_tile_prefix"), b("span_progress"))
+             wsm_part, b("span_q"), b("span_k"), b("span_v"), b("span_flow"), b("cu_seqlens"), N, B)
         step(L + "span_g", "gemm_bf16", b("span_flow"), w("w_f_b"), b("span_g"), B, i32(inner_l), i32(HEAD_DIM),
              i32(inner_l))
-        step(L + "span_kda", "flash_kda", b("span_q"), b("span_k"), b("span_v"), b("span_g"), b("span_beta"),
-             w("dt_bias"), w("a_log"),
-             *(b(n) for n in ["span_ws_kd", "span_ws_qd", "span_ws_kr", "span_ws_gt", "span_ws_inv", "span_ws_mqk"]),
-             B, b("cu_seqlens"), b("span_tile_prefix"), N, {"state": kda}, line, i64(line_l), b("kda_partial"),
-             w("gamma_o"), b("gated"), b("span_at"), b("span_progress"))
+        step(L + "span_kda", "kda_frost", b("span_q"), b("span_k"), b("span_v"), b("span_g"), b("gated"), wsm_part,
+             w("dt_bias"), w("a_log"), B, b("cu_seqlens"), N, {"state": kda}, line)
+        step(L + "kda_epilogue", "kda_epilogue", b("gated"), b("kda_partial"), w("gamma_o"), {"state": kda}, line,
+             i64(line_l), b("cu_seqlens"), N, B)
 
     def emit():
         blocks, kda_k = 0, 0
