@@ -38,6 +38,11 @@ ABSORB_TC_SMEM = 1024 + 3 * (16384 + 4 * 8192) + 32768 + 16384 + 8192 + 256  # i
 VUP_SMEM = 3 * (64 + 128) * 72 * 2
 VUP_TC_SMEM = 1024 + 6 * 2 * 128 * 64 * 2 + 256  # k31_vup_gate_tc SMEM_BYTES
 TOPK_SMEM = 93408  # k31_topk_smem
+# k3_dcp.cu SPARSE: one block an SM (its SMEM_BYTES), every block resident on 148 and 152 SMs; a record is a
+# head's 128 v-up'd bf16 values and its lse word (REC 16-byte vectors)
+XCHG_GRID = 144
+XCHG_SMEM = 1024 + 4 * 2 * 128 * 64 * 2 + 128 * 136 * 2 + 128
+XCHG_REC = 128 // 8 + 1
 TMAP = "bytes<128>"
 HEADC_BYTES = (Q_LORA + KV_LORA + 64) * 2  # the gate's columns in P's fused projection (q_a | kv_a | rope | gate)
 
@@ -244,6 +249,21 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1):
     return o
 
 
+def exchange_op(tail):
+    """D's DCP exchange under DSA (k3_dcp.cu SPARSE): every head's sparse partial (o, (max, sum) a head, the
+    row's live count on this member) through W_UV on tcgen05, pushed to its owner, merged and gated there.
+    `tail` the parameters from the weight (the whole kv_b, read as W_UV by TMA) on."""
+    params = ["in buffer<bf16>", "in buffer<f32>", "in buffer<i32>", *tail]
+    return {"params": params, "impl": {"launches": [launch(
+        "k3_dcp", "kern_k3_dcp_exchange", grid=[XCHG_GRID, 1, 1], block=[256, 1, 1], smem=XCHG_SMEM,
+        defines={"SPARSE": 1}, pdl=True, params=[TMAP, *params[1:3], TMAP, *params[4:]],
+        args=[tmap(0, "bf16", [sparse.D_V, sparse.HEADS, 0], [sparse.D_V * 2, sparse.HEADS * sparse.D_V * 2],
+                   [64, 1, 128], 128),
+              {"param": 1}, {"param": 2},
+              tmap(3, "bf16", [KV_LORA, 0], [KV_LORA * 2], [64, 128], 128),
+              *({"param": i} for i in range(4, len(params)))])]}}
+
+
 def weights(weight, seg, a, n):
     """The layer's indexer weights, checkpoint prefix `a`, manifest prefix `n`."""
     weight(n + "idx_kw", [IDX_KW, 7168], [seg(a + "indexer.wk.weight"), seg(a + "indexer.weights_proj.weight")])
@@ -331,7 +351,7 @@ def steps(step, w, L, kv, idx, chunk, gate, max_pages, max_ctx, q, exchange=None
     step(L + "attn", "sparse_mla", b("mla_q_abs"), {"state": kv}, b("idx_ind"), b("idx_tlen"), b("mla_o"),
          b("mla_md"))
     if exchange:
-        step(L + "dcp", "dcp_exchange", b("mla_o"), b("mla_md"), b("idx_live"), w("w_kv_b_l"), gate, b("gated"),
+        step(L + "dcp", "dcp_exchange", b("mla_o"), b("mla_md"), b("idx_live"), w("w_kv_b"), gate, b("gated"),
              *exchange)
     else:
         step(L + "vup_gate", "vup_gate", b("mla_o"), w("w_kv_b"), gate, b("gated"), B)
