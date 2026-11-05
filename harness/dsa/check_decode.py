@@ -2,7 +2,7 @@
 """D's indexer under DCP on one GPU, W = 8 members emulated: every member's keys in its own 144-byte
 token-major pages (position p on member p % 8), its local logits by the paged MQA kernel
 (k31_paged_mqa_logits, bf16 out, with DeepGEMM's metadata kernel), its local top-k (k31_topk_held), its
-candidates pushed into every member's Lamport stage (k31_dcp_pack, the members' stages and states on one GPU),
+best 384 candidates pushed into every member's Lamport stage (k31_dcp_pack, the members' stages and states on one GPU),
 and every member's share of the group's top 2048 (k31_dcp_select). Checks the local logits against a torch reference and the union of the members' selections
 against the global top 2048 of the same logits, by value: bf16 ties may pick any of the equal positions.
 
@@ -18,7 +18,7 @@ from cuda.bindings import driver as cu
 from check import (BF16, IH, ID, PAGE, ROW, SPLIT_KV, TOPK, TOPK_SMEM, U8, U32, Launcher, module, ok, ref_key,
                    ref_logits, ref_q, tmap, topk_exact)
 
-W, SMS = 8, 152
+W, SMS, HOT = 8, 152, 384
 PAGED = ("_ZN9deep_gemm22sm100_paged_mqa_logitsILj32ELj128ELj64ELj4ELj128ELj3ELj3ELj3ELj384ELj8ELj128ELj384E"
          "N7cutlass12float_e4m3_tELj3EEEvjjjPKjP13__nv_bfloat16S4_S4_S4_14CUtensorMap_stS7_S7_S7_S7_")
 META = "_ZN9deep_gemm5sched31sm100_paged_mqa_logits_metadataILj384ELj152ELj4ELj256EEEvjPKjS3_Pj"
@@ -115,9 +115,11 @@ def main():
         times.setdefault("local_topk", []).append(L.time(a.iters, tk))
         members.append((bt, max_pages, logits, lens, stride, ind))
 
-    # every member's three stages of [W][R][2048] candidates, poisoned once, and its zeroed state
-    stage_bytes = W * R * TOPK * 8
+    # every member's three stages of [W][R][HOT] candidates, poisoned once, and its zeroed state; its logits
+    # and ind for a pull
+    stage_bytes = W * R * HOT * 8
     lam = [torch.empty(3 * stage_bytes, dtype=torch.uint8, device=dev) for _ in range(W)]
+    lists = [torch.tensor([x[k].data_ptr() for x in members], dtype=torch.int64, device=dev) for k in (2, 5)]
     state = [torch.zeros(8, dtype=torch.int32, device=dev) for _ in range(W)]
     late = torch.zeros(1, dtype=torch.int32, device=dev)
     peers = torch.tensor([x.data_ptr() for x in lam], dtype=torch.int64, device=dev)
@@ -128,13 +130,14 @@ def main():
 
     def exchange():
         for m, (bt, max_pages, logits, lens, stride, ind) in enumerate(members):
-            L(fn["k31_dcp_pack"], (R, 1, 1), (256, 1, 1), [logits, ctypes.c_int(stride), ind, ctypes.c_int(m),
+            L(fn["k31_dcp_pack"], (R, 1, 1), (1024, 1, 1), [logits, ctypes.c_int(stride), ind, ctypes.c_int(m),
               ctypes.c_int(W), ctypes.c_int(R), peers, state[m], ctypes.c_longlong(stage_bytes)])
         for m, (bt, max_pages, *_rest) in enumerate(members):
             sel, sl, live = outs[m]
             L(fn["k31_dcp_select"], (R, 1, 1), (1024, 1, 1),
               [lam[m], state[m], late, ctypes.c_longlong(stage_bytes), ctypes.c_longlong(10**9), ctypes.c_int(R),
-               ctypes.c_int(m), bt, ctypes.c_int(max_pages), sel, sl, live])
+               ctypes.c_int(m), bt, ctypes.c_int(max_pages), sel, sl, live, members[m][2], ctypes.c_int(members[m][4]),
+               members[m][5], *lists])
 
     times["pack + select"] = [L.time(a.iters, exchange) / W]
     exchange()

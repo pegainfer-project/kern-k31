@@ -21,6 +21,7 @@ from k3_common import B, CTX, HEADS, KV_LORA, Q_LORA, T, b, i32, i64, launch
 from pinned import module
 
 IH, ID, IDX_ROW, TOPK, PAGE = 32, 128, 144, 2048, 64
+HOT = 384  # k31_dsa.cu: the candidates a DCP member sends a row
 IDX_KW = ID + IH  # wk | weights_proj
 IDX_Q = IH * ID
 SMS = 152
@@ -216,28 +217,32 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1):
             raise SystemExit(f"k31_dcp_select keys a global position in 24 bits; a context of {max_ctx * tp} is past it")
         cand = {"defines": {"CAND32": 1}} if cand_bytes(max_ctx) == 4 else {}
         o.update({
-            # (logits, stride, ind, rows, peers, state, stage bytes): the local top-k as candidates, pushed into
-            # every member's stage
+            # (logits, stride, ind, rows, peers, state, stage bytes): the local top-k's best HOT as candidates,
+            # pushed into every member's stage
             "idx_pack": {
                 "params": ["in buffer<bf16>", "i32", "in buffer<i32>", "i32", "in buffer<u64>", "in buffer<i32>",
                            "i64"],
                 "impl": {"launches": [dsa(
-                    "k31_dcp_pack", [T, 1, 1], [256, 1, 1], **cand,
+                    "k31_dcp_pack", [T, 1, 1], [1024, 1, 1], **cand,
                     params=["in buffer<bf16>", "i32", "in buffer<i32>", "i32", "i32", "i32", "in buffer<u64>",
                             "in buffer<i32>", "i64"],
                     args=[{"param": 0}, {"param": 1}, {"param": 2}, {"rank": "tp"}, i32(tp),
                           *({"param": i} for i in range(3, 7))], **pdl)]},
             },
-            # (stages, state, err, stage bytes, timeout, rows, block_table, max_pages, ind, lens, live): the
-            # group's top TOPK once every member's candidates are in, this member's share of it as cache slots
+            # (stages, state, err, stage bytes, timeout, rows, block_table, max_pages, sel, lens, live, logits,
+            # stride, ind, logits peers, ind peers): the group's top TOPK once every member's candidates are in,
+            # this member's share of it as cache slots; a member's whole list pulled from its logits and ind when
+            # what it sent may not hold its share
             "idx_select": {
                 "params": ["inout buffer<u8>", "inout buffer<i32>", "out buffer<i32>", "i64", "i64", "i32",
-                           "in buffer<i32>", "i32", "out buffer<i32>", "out buffer<i32>", "out buffer<i32>"],
+                           "in buffer<i32>", "i32", "out buffer<i32>", "out buffer<i32>", "out buffer<i32>",
+                           "in buffer<bf16>", "i32", "in buffer<i32>", "in buffer<u64>", "in buffer<u64>"],
                 "impl": {"launches": [launch(
                     "k31_dsa", "k31_dcp_select", grid=[T, 1, 1], block=[1024, 1, 1], **cand,
                     params=["inout buffer<u8>", "inout buffer<i32>", "out buffer<i32>", "i64", "i64", "i32", "i32",
-                            "in buffer<i32>", "i32", "out buffer<i32>", "out buffer<i32>", "out buffer<i32>"],
-                    args=[*({"param": i} for i in range(6)), {"rank": "tp"}, *({"param": i} for i in range(6, 11))],
+                            "in buffer<i32>", "i32", "out buffer<i32>", "out buffer<i32>", "out buffer<i32>",
+                            "in buffer<bf16>", "i32", "in buffer<i32>", "in buffer<u64>", "in buffer<u64>"],
+                    args=[*({"param": i} for i in range(6)), {"rank": "tp"}, *({"param": i} for i in range(6, 16))],
                     **pdl)]},
             },
             # every stage of the candidates poisoned, once before the first step
@@ -280,9 +285,9 @@ def cand_bytes(max_ctx):
 
 
 def cand_stage(seqs_max, tp, max_ctx):
-    """Bytes of one stage of D's candidates under DCP: every member's rows, 2048 candidates each; `max_ctx`
+    """Bytes of one stage of D's candidates under DCP: every member's rows, HOT candidates each; `max_ctx`
     a member's keys at most."""
-    return tp * seqs_max * TOPK * cand_bytes(max_ctx)
+    return tp * seqs_max * HOT * cand_bytes(max_ctx)
 
 
 def buffers(work, bufs, chunk, max_ctx, seqs_max, tp=1):
@@ -315,6 +320,11 @@ def buffers(work, bufs, chunk, max_ctx, seqs_max, tp=1):
                                          "group": "tp"}
             bufs["idx_state"] = {"dtype": "i32", "shape": [8], "kind": "carry"}
             work("idx_live", 1, "i32")
+            work("idx_sel", TOPK, "i32")
+            # a member's local logits and top-k, read by the members that pull its list
+            for x in ("idx_logits", "idx_ind"):
+                bufs[x]["export"] = True
+                bufs[x + "_peers"] = {"dtype": "u64", "shape": [tp], "kind": "peer", "of": x, "group": "tp"}
 
 
 def steps(step, w, L, kv, idx, chunk, gate, max_pages, max_ctx, q, exchange=None, select=None, sched=True):
@@ -354,13 +364,14 @@ def steps(step, w, L, kv, idx, chunk, gate, max_pages, max_ctx, q, exchange=None
         step(L + "idx_pack", "idx_pack", b("idx_logits"), i32(stride(max_ctx)), b("idx_ind"), B,
              b("idx_lamport_peers"), b("idx_state"), stage)
         step(L + "idx_select", "idx_select", b("idx_lamport"), b("idx_state"), err, stage, timeout, B,
-             b("block_table"), i32(max_pages), b("idx_ind"), b("idx_tlen"), b("idx_live"))
+             b("block_table"), i32(max_pages), b("idx_sel"), b("idx_tlen"), b("idx_live"), b("idx_logits"),
+             i32(stride(max_ctx)), b("idx_ind"), b("idx_logits_peers"), b("idx_ind_peers"))
     else:
         step(L + "idx_slots", "idx_slots", b("idx_ind"), b("block_table"), i32(max_pages), b("seq_lens"),
              b("idx_tlen"), B)
     step(L + "absorb", "absorb", q, w("w_kv_b"), b("mla_q_abs"), B)
-    step(L + "attn", "sparse_mla", b("mla_q_abs"), {"state": kv}, b("idx_ind"), b("idx_tlen"), b("mla_o"),
-         b("mla_md"))
+    step(L + "attn", "sparse_mla", b("mla_q_abs"), {"state": kv}, b("idx_sel" if exchange else "idx_ind"),
+         b("idx_tlen"), b("mla_o"), b("mla_md"))
     if exchange:
         step(L + "dcp", "dcp_exchange", b("mla_o"), b("mla_md"), b("idx_live"), w("w_kv_b"), gate, b("gated"),
              *exchange)
