@@ -5,9 +5,11 @@ around the glue of source/k3_moe_prefill.cu: the pieces gen_stage.py lays
 out. A fork of kern's tools/k3_moe_bmm.py.
 
 One rank holds `local` of the model's 896 experts: every one (P) or every
-`stride`-th one (a D member: 112 of them, member r holding r, r + 8, ...). Its part of a layer: quantise the latent rows to
-mxfp8, build the routing tables of its experts, FC1 (gate | up, SiTU, mxfp8
-out), FC2 (bf16 out per permuted row), and the top-k combine into a bf16
+`stride`-th one (a D member: 448 of them, the members of expert group g holding g, g + 2, ...), each
+whole or an `inter`-wide slice of its intermediate width (a D member: 768 of 3072, FC1's gate and up
+rows and FC2's K columns; the members of a group sum their FC2 partials in the MoE all-reduce). Its
+part of a layer: quantise the latent rows to mxfp8, build the routing tables of its experts, FC1
+(gate | up, SiTU, mxfp8 out), FC2 (bf16 out per permuted row), and the top-k combine into a bf16
 partial whose rows past `tokens` are zero. P routes in one call with the
 router top-k, the quant and the shared activation (source/k3_moe_route.cu);
 a D member's tables come from FlashInfer's kernels
@@ -31,11 +33,22 @@ GLUE, PGLUE, ROUTING, ROUTE = "k3_moe_prefill", "k3_prefill_glue", "flashinfer_m
 FC1, FC2 = "trtllm_bmm_mxe4m3_mxe2m1_mxe4m3", "trtllm_bmm_bf16_mxe2m1_mxe4m3"
 SHAPE = "k3-prefill-16k-ep4"
 # D's pair, 16-token tiles: a decode step routes a few rows to each expert, and k3_moe_front.cu's tables are built
-# for that tile; the index's picks for SHAPE are P's 128-token ones.
-DECODE = ("bmm_MxE4m3_MxE2m1MxE4m3_Fp32_Ab32_Bb32_Cb32_t128x16x256_s6_et128x16_m256x16x32_c2x1x1_rM_TN_transOut_"
-          "schPd2x1x2x3_biasFp32M_bN_tma_ldgstsSf_rgTma_clmp_siTuGlu_dynB_sm100f",
-          "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x16x256u2_s6_et128x16_m256x16x32_c2x1x1_rM_TN_transOut_"
-          "schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f")
+# for that tile; the index's picks for SHAPE are P's 128-token ones. FC2 by its K: the 2x unrolled K loop wants K
+# in multiples of 512, so a quarter of I (768) takes the build without it (results/roofline/moe: FlashInfer's best
+# tactic for that split at 16-256 rows of real routing, or within 0.5% of it).
+DECODE_FC1 = ("bmm_MxE4m3_MxE2m1MxE4m3_Fp32_Ab32_Bb32_Cb32_t128x16x256_s6_et128x16_m256x16x32_c2x1x1_rM_TN_transOut_"
+              "schPd2x1x2x3_biasFp32M_bN_tma_ldgstsSf_rgTma_clmp_siTuGlu_dynB_sm100f")
+DECODE_FC2 = {I: "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x16x256u2_s6_et128x16_m256x16x32_c2x1x1_rM_TN_transOut_"
+                 "schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f",
+              I // 4: "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_Ab32_Bb32_t128x16x256_s6_et128x16_m256x16x32_c2x1x1_rM_TN_transOut_"
+                      "schPd2x1x2x3_biasFp32M_bN_rgTma_clmp_dynB_sm100f"}
+
+
+def decode(inter):
+    """D's (FC1, FC2) variant names for experts `inter` of I wide."""
+    return DECODE_FC1, DECODE_FC2[inter]
+
+
 # k3_moe_route.cu: 16 warps a block, two blocks an SM resident for its grid barrier (2 x 144 fits 148-SM B300
 # and 152-SM GB300), a quarter of them up to 256 rows; its tables cover 8192 rows.
 ROUTE_WARPS, ROUTE_BLOCKS, ROUTE_BLOCKS_SMALL, ROUTE_ROWS = 16, 2 * 144, 64, 8192
@@ -55,13 +68,14 @@ def variants(names=None):
 
 
 def glue(entry, grid, block=256, mod=None):
-    return {**(mod or index.variant(GLUE).module), "entry": entry, "grid": grid, "block": [block, 1, 1]}
+    return {**(mod or module(GLUE)), "entry": entry, "grid": grid, "block": [block, 1, 1]}
 
 
-def pieces(local, tokens, tokens_max, out_rows, prefix="", names=None, stride=None, pdl=False):
+def pieces(local, tokens, tokens_max, out_rows, prefix="", names=None, stride=None, pdl=False, inter=I):
     """The ops and workspace buffers for `local` of the experts over `tokens` rows (a var, at most
     `tokens_max`); the combine writes `out_rows` rows (an expression). `steps` lists the calls of one
-    layer. `stride`: the rank holds experts `rank + j * stride` (D), else every expert (P)."""
+    layer. `stride`: the rank holds experts `first + j * stride` (D), else every expert (P); `inter`: the
+    rank's width of each expert's intermediate dimension."""
     v1, v2 = variants(names)
     # The combine + latent norm (source/k3_prefill_glue.cu).
     pglue = module(PGLUE)
@@ -87,8 +101,8 @@ def pieces(local, tokens, tokens_max, out_rows, prefix="", names=None, stride=No
         n("total_padded"): {"dtype": "i32", "shape": [1], "kind": "workspace"},
         n("route_map"): {"dtype": "i32", "shape": [padded_max], "kind": "workspace"},
         n("exp2perm"): {"dtype": "i32", "shape": [tokens_max, TOPK], "kind": "workspace"},
-        n("fc1_out"): {"dtype": "u8", "shape": [padded_max, I], "kind": "workspace"},
-        n("fc1_sf"): {"dtype": "u8", "shape": [ceil_div(padded_max, 128) * 128, I // 32], "kind": "workspace"},
+        n("fc1_out"): {"dtype": "u8", "shape": [padded_max, inter], "kind": "workspace"},
+        n("fc1_sf"): {"dtype": "u8", "shape": [ceil_div(padded_max, 128) * 128, inter // 32], "kind": "workspace"},
         n("fc2_out"): {"dtype": "bf16", "shape": [padded_max, H], "kind": "workspace"},
     }
     ops = {
@@ -115,8 +129,8 @@ def pieces(local, tokens, tokens_max, out_rows, prefix="", names=None, stride=No
             "impl": {"launches": [{**module(ROUTE), "entry": "kern_k3g_moe_finalize_rms", "block": [H // 8, 1, 1],
                                    "grid": [out_rows, 1, 1]}]},
         }} if fused else {}),
-        "moe_fc1": trtllm_bmm.op(v1, 2 * I, H, local, tokens, tokens_max, ctas, ctas_max),
-        "moe_fc2": trtllm_bmm.op(v2, H, I, local, tokens, tokens_max, ctas, ctas_max),
+        "moe_fc1": trtllm_bmm.op(v1, 2 * inter, H, local, tokens, tokens_max, ctas, ctas_max),
+        "moe_fc2": trtllm_bmm.op(v2, H, inter, local, tokens, tokens_max, ctas, ctas_max),
         "moe_finalize": {
             "params": ["in buffer<bf16>", "in buffer<i32>", "in buffer<f32>", "out buffer<bf16>", "i32", "i32"],
             # one 16-byte column vector per thread: at 256 a row took two passes over its 16 picks
@@ -180,12 +194,14 @@ def pieces(local, tokens, tokens_max, out_rows, prefix="", names=None, stride=No
             "tile": tile}
 
 
-def shuffles(local):
-    """The four weight-prep calls of one layer as (op, args after the buffers, threads): FC1's [up; gate] rows
-    and scales with the gated interleave, FC2's plain."""
+def shuffles(local, inter=I, slices=1):
+    """The four weight-prep calls of one layer as (op, name, args after the buffers but the rank, threads): FC1's
+    [up; gate] rows and scales with the gated interleave, FC2's plain; each expert `inter` of I wide. FC1's slice
+    is its bind's rows; FC2's sources are whole rows, `slices` of `inter` each, the rank's column block taken by
+    the shuffle."""
     return [
-        ("k3_moe_w_shuffle", "w13", [local, 2 * I, H // 2, 1], local * 2 * I * (H // 2) // 16),
-        ("k3_moe_sf_shuffle", "w13_sf", [local, 2 * I, H // 32, 1], local * 2 * I * (H // 32)),
-        ("k3_moe_w_shuffle", "w2", [local, H, I // 2, 0], local * H * (I // 2) // 16),
-        ("k3_moe_sf_shuffle", "w2_sf", [local, H, I // 32, 0], local * H * (I // 32)),
+        ("k3_moe_w_shuffle", "w13", [local, 2 * inter, H // 2, 1, 1], local * 2 * inter * (H // 2) // 16),
+        ("k3_moe_sf_shuffle", "w13_sf", [local, 2 * inter, H // 32, 1, 1], local * 2 * inter * (H // 32)),
+        ("k3_moe_w_shuffle", "w2", [local, H, inter // 2, 0, slices], local * H * (inter // 2) // 16),
+        ("k3_moe_sf_shuffle", "w2_sf", [local, H, inter // 32, 0, slices], local * H * (inter // 32)),
     ]

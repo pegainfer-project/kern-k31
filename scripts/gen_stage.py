@@ -37,13 +37,16 @@ as it does in a KDA layer (`kda.<l>` shards `by: heads`): v-up, gate and
 o_proj over its heads, the o_proj partial summed over the group by the
 Lamport one-shot (source/peer_allreduce_bf16.cu), each sum fused with its
 neighbours (source/k3_ar_fused.cu).
-The MoE routes every row through the member's experts — every R-th one from
-its index, so the routing's first expert is `{"rank": "tp"}` and the slice a
-stride, no rank arithmetic in the manifest — with FlashInfer's routing and
-the batched GEMMs, and the routed latent's partial and the shared expert's
-(column-split) go through one bf16 all-reduce side by side; the dense FFN's
-down partial likewise. Router, lat_down / lat_up, the norms, the embedding
-and the LM head (vocab-parallel) are replicated. `--tp 1` is the same step
+The MoE runs its experts EP2 x TP4: member r holds expert group r // 4 (every
+second expert from it, 448) and the slice r % 4 of each one's intermediate
+width (FC1's gate and up rows, FC2's K columns, 768 of 3072), so every member
+carries about the mean of the experts a step touches whatever the routing. Its
+moe_front takes `{"rank": "tp"}` and finds the group itself, no rank
+arithmetic in the manifest. The routed latent's partial (a quarter of an
+expert's K a member) and the shared expert's (column-split) go through one
+bf16 all-reduce side by side; the dense FFN's down partial likewise. Router,
+lat_down / lat_up, the norms, the embedding and the LM head (vocab-parallel)
+are replicated. `--tp 1` is the same step
 on one GPU holding every expert, with nothing to exchange or sum: the oracle
 the group is checked against (step/, scripts/compare_steps.py). `--layers 2`
 (one KDA layer, one MoE layer) has no MLA layer and no paged state.
@@ -90,6 +93,11 @@ import k31_dsa
 
 KV = {"fp8": k3_kv_fp8, "bf16": k3_kv_bf16}
 
+# D's expert groups: expert e in group e % D_EP, held by the tp / D_EP members r with r // (tp / D_EP) == that
+# group, each a slice of every expert's intermediate width. EP8 left the step waiting at the MoE all-reduce for
+# the rank with the most active experts (1.09-1.29x the mean on real routing, results/roofline/moe.md); a quarter
+# of I costs FC1 / FC2 the same per byte, where TP8's eighth (FC2 at K = 384) does not.
+D_EP = 2
 # k3_ar_fused.cu's KGRID, one block an SM: every block resident on 148 and 152 SMs, a multiple of the cluster of 8
 # and under the 256-row flag table
 TP_AR_GRID = 144
@@ -218,12 +226,14 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     t_max = chunk_max if chunk else seqs_max
     RW = chunk_max if chunk else T
     # The MoE: TRT-LLM gen's batched GEMMs (k3_moe_bmm: the fp8 latent, its
-    # scales and the routing) over every expert in P; over a D member's every
-    # tp-th one for every row, its combine over every row the flat MoE
-    # all-reduce sums (`seqs_max`), writing zeros past `tokens`.
-    epr = EXPERTS // tp
-    bp = (k3_moe_bmm.pieces(epr, T, seqs_max, seqs_max, prefix="moe.", names=moe_variants or k3_moe_bmm.DECODE,
-                            stride=tp, pdl=True) if decode else
+    # scales and the routing) over every expert in P; over a D member's group
+    # (every ep-th expert, an il-wide slice of each) for every row, its combine
+    # over every row the flat MoE all-reduce sums (`seqs_max`), writing zeros past `tokens`.
+    ep = D_EP if xchg else 1
+    mt = tp // ep
+    epr, il = EXPERTS // ep, k3_moe_bmm.I // mt
+    bp = (k3_moe_bmm.pieces(epr, T, seqs_max, seqs_max, prefix="moe.", names=moe_variants or k3_moe_bmm.decode(il),
+                            stride=ep, pdl=True, inter=il) if decode else
           k3_moe_bmm.pieces(epr, T, chunk_max, {"mul": [T, 1]}, prefix="moe.", names=moe_variants))
     # This rank's KDA and MLA heads: whole, or a D member's shard (heads, the
     # per-head weights and the KDA state line all HEADS / tp wide; the kernels
@@ -472,7 +482,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                        "i64"],
             "impl": {"launches": [{**launch("k3_moe_front", "kern_k3_moe_front", grid=grid, block=[1024, 1, 1],
                                             smem=smem, when={"var": T, **when},
-                                            defines={"EXPERTS": EXPERTS, "LDS": front, "SH": sh_l, "STRIDE": tp,
+                                            defines={"EXPERTS": EXPERTS, "LDS": front, "SH": sh_l, "STRIDE": ep,
                                                      "NRANKS": tp}),
                                    "pdl": True}
                                   for grid, smem, when in (
@@ -762,19 +772,24 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         bound per expert (FC1 as [up; gate]) that the derive program shuffles into the GEMMs' layout while the
         weights load, so device memory never holds both; the gate's alpha and beta."""
         hf = lambda e, t: f"{HF}model.layers.{layer}.block_sparse_moe.experts.{e}.{t}"
-        # Member r's j-th expert: every tp-th from r (the routing's stride).
-        src = lambda t, j: ({"group": "tp", "tensors": [hf(r + tp * j, t) for r in range(tp)]} if tp > 1
+        # Member r's j-th expert: every ep-th from its group r // mt (the routing's stride), and of it the
+        # slice r % mt of I: rows of w1 / w3 (and their scales) by the bind, columns of w2 by its shuffle (a
+        # column bind is read a row at a time: 7168 reads an expert).
+        src = lambda t, j: ({"group": "tp", "tensors": [hf(r // mt + ep * j, t) for r in range(tp)]} if tp > 1
                             else hf(j, t))
-        raw = {"w13": [seg(src(f"{t}.weight_packed", j)) for j in range(epr) for t in ("w3", "w1")],
-               "w13_sf": [seg(src(f"{t}.weight_scale", j)) for j in range(epr) for t in ("w3", "w1")],
+        part = {"group": "tp", "ranges": [[r % mt * il, (r % mt + 1) * il] for r in range(tp)]} if mt > 1 else None
+        raw = {"w13": [seg(src(f"{t}.weight_packed", j), rows=part) for j in range(epr) for t in ("w3", "w1")],
+               "w13_sf": [seg(src(f"{t}.weight_scale", j), rows=part) for j in range(epr) for t in ("w3", "w1")],
                "w2": [seg(src("w2.weight_packed", j)) for j in range(epr)],
                "w2_sf": [seg(src("w2.weight_scale", j)) for j in range(epr)]}
-        for op, name, scalars, threads in k3_moe_bmm.shuffles(epr):
-            _, n, kg, _ = scalars
-            weight(prefix + name + ".raw", [epr * n * kg], raw[name], "u8")
+        rank = {"rank": "tp"} if tp > 1 else i32(0)
+        for op, name, scalars, threads in k3_moe_bmm.shuffles(epr, il, mt):
+            _, n, kg, _, slices = scalars
+            weight(prefix + name + ".raw", [epr * n * kg * slices], raw[name], "u8")
             buffers[prefix + name + ".raw"]["kind"] = "source"
             carry(prefix + name + "s", [epr * n * kg], "u8")
-            derive.call(op, [buf(prefix + name + ".raw"), buf(prefix + name + "s"), *map(i32, scalars)], threads)
+            derive.call(op, [buf(prefix + name + ".raw"), buf(prefix + name + "s"), *map(i32, scalars), rank],
+                        threads)
         for name, value in (("alpha", k3_moe_bmm.ALPHA), ("beta", k3_moe_bmm.BETA)):
             carry(prefix + name, [epr], "f32")
             once.call("fill_f32", [buf(prefix + name), i32(epr), {"f32": value}], epr)
@@ -1434,7 +1449,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         programs["tp_init"] = kern_manifest.program(init, once=True)
     m = {
         "schema_version": kern_manifest.SCHEMA_VERSION,
-        "model": f"kimi-k3/{end}l/ep{tp}" + (f"-tp{tp}" if tp > 1 else "")
+        "model": f"kimi-k3/{end}l/ep{ep}" + (f"-tp{tp}" if tp > 1 else "")
                  + ("-dcp" if decode else "-prefill"),
         "vars": {T: {"max": t_max, "axis": "rows"}, "seqs": {"max": seqs_max, "axis": "groups"},
                  **({ROWS: {"max": chunk_max, "axis": "ranks"}, CTX: {"max": max_ctx}} if chunk else {})},
@@ -1471,8 +1486,9 @@ def main():
                     help="P: a call of at most this many rows attends in the latent space (absorbed MLA) "
                          "instead of expanding its context")
     ap.add_argument("--tp", type=int, choices=(1, 8), default=1,
-                    help="D: the group the batch is replicated over: KV dealt by position, KDA by heads, every "
-                         "tp-th expert a member; 1 is the group's one-GPU oracle")
+                    help="D: the group the batch is replicated over: KV dealt by position, KDA by heads, the "
+                         "experts EP2 x TP4 (a member: half the experts, a quarter of each one's I); 1 is the group's "
+                         "one-GPU oracle")
     ap.add_argument("--seqs", type=int, default=64, help="D: sequences a step (the `tokens` / `seqs` bound)")
     ap.add_argument("--mla-split-max", type=int, default=16,
                     help="D: KV splits a row's attention may run as; the workspace is tokens x this x 256 KiB")

@@ -5,7 +5,7 @@
 //   kern_k3_moe_front(const f32* S, const f32* bias, const bf16* rs, i32* idx, f32* wts,
 //       u8* q, u8* sf, bf16* act, i32* ready, i32* ids, i32* done, i32* cta_batch, i32* cta_limit,
 //       i32* num_non_exiting, i32* total_padded, i32* route_map, i32* exp2perm,
-//       const bf16* wsh, bf16* sh_out, const u8* w13, const u8* w13_sf, int first, int T,
+//       const bf16* wsh, bf16* sh_out, const u8* w13, const u8* w13_sf, int rank, int T,
 //       u8* stage, const u64* peers, i32* lstate, i32* err, i64 timeout_ns)
 //   grid (T + NSH / 64, 1, 1)   block (1024, 1, 1)   shared SMEM_SH bytes   T <= ROWS_MAX
 //   or grid (T, 1, 1), shared 0: the row blocks alone, the shared down projection left to a GEMM after FC2
@@ -24,12 +24,13 @@
 //     gate | up (the SH columns after the latent) and publish the row to each
 //     shared-expert block T + c (ready[c * ROWS_MAX + b] = 1, st.release.gpu); once the
 //     candidates are in, warps 26..27 land this rank's slice of the latent (columns
-//     EXPERTS + [0, LATL), the latent's [first * LATL, (first + 1) * LATL); `first` is
-//     the rank) to bf16 and quantise it to mxfp8 as k3_moe_prefill.cu's kern_k3_moe_quant
+//     EXPERTS + [0, LATL), the latent's [rank * LATL, (rank + 1) * LATL)) to bf16 and
+//     quantise it to mxfp8 as k3_moe_prefill.cu's kern_k3_moe_quant
 //     (four threads per 32-element group), and warps 1..8 trade the slices of row b
 //     with the group (gather, below) into the whole row's q | sf;
 // then the last row block to finish (`done`, a zeroed carry it re-zeroes) builds
-// the routing tables of this rank's experts `first + j * STRIDE` (j < LOCAL)
+// the routing tables of this rank's experts `first + j * STRIDE` (j < LOCAL; `first` is the rank's
+// expert group, rank / (NRANKS / STRIDE), each of its NRANKS / STRIDE ranks holding a slice of MOE_I)
 // over all T rows: what FlashInfer's routing writes for the batched GEMMs'
 // TILE-row CTAs, every expert's rows in the order of shared-memory atomics
 // (as FlashInfer's are; the GEMMs' rows do not depend on it), padding rows
@@ -37,7 +38,7 @@
 // Blocks T + c, when the grid has them: the shared expert's down projection of 64 output columns
 // (shared_down, below); the row blocks publish to them only then.
 //
-//   nvcc -cubin -arch=sm_103a -DEXPERTS=896 -DLDS=2880 -DNRANKS=8 -DSH=768 -DSTRIDE=8 k3_moe_front.cu
+//   nvcc -cubin -arch=sm_103a -DEXPERTS=896 -DLDS=2880 -DNRANKS=8 -DSH=768 -DSTRIDE=2 k3_moe_front.cu
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cstdint>
@@ -52,7 +53,7 @@
 #define SH 768
 #endif
 #ifndef STRIDE
-#define STRIDE 8
+#define STRIDE 2
 #endif
 #define LATENT 3584
 #ifndef NRANKS
@@ -64,7 +65,8 @@
 #endif
 #define ROWS_MAX 256         // the rows a step may take (gen_stage.py's D_SEQS_MAX): the flag tables' stride
 #define READERS (NSH / 64)  // the shared-expert blocks: ready[c * ROWS_MAX + b] is row b's flag for block T + c
-#define MOE_I 3072           // an expert's intermediate width: FC1 is [2 MOE_I, LATENT] mxfp4 + UE8M0 per 32
+#define MOE_I (3072 / (NRANKS / STRIDE))  // a rank's slice of an expert's intermediate width: FC1 is
+                                         // [2 MOE_I, LATENT] mxfp4 + UE8M0 per 32
 #define FC1_W (2 * MOE_I * (LATENT / 2))
 #define FC1_SF (2 * MOE_I * (LATENT / 32))
 static_assert(FC1_W % (READERS * 16) == 0 && FC1_SF % (READERS * 16) == 0, "16-byte shares");
@@ -76,7 +78,7 @@ static_assert(FC1_W % (READERS * 16) == 0 && FC1_SF % (READERS * 16) == 0, "16-b
 #define SITU_THREADS (SH / 4)
 static_assert(QUANT_THREADS % 4 == 0 && SH % 4 == 0, "whole 32-column groups");
 #define IDS_PER ((ROWS_MAX * TOPK + THREADS - 1) / THREADS)  // the expanded ids a thread routes at most
-static_assert(LOCAL <= THREADS, "an expert a thread");
+static_assert(LOCAL <= THREADS && NRANKS % STRIDE == 0, "an expert a thread, whole expert groups");
 
 typedef unsigned int u32;
 
@@ -295,7 +297,7 @@ __device__ __forceinline__ void umma_rows(uint32_t sw, uint32_t sa, uint32_t tm,
 }
 
 // FC1's first CTAs take the touched experts of the lowest local indices: row b publishes its two lowest
-// local picks j_b < j2_b (ids[c * ROWS_MAX + b] = 1 + j_b + 256 j2_b, LOCAL for none; the value is the message,
+// local picks j_b < j2_b (ids[c * ROWS_MAX + b] = 1 + j_b + (LOCAL + 1) j2_b, LOCAL for none; the value is the message,
 // relaxed); warp 31 of block T + c, apart from the projection from the start, takes the two least over the
 // rows (clearing the flags) and pulls its share of those experts' FC1 weights and scales into L2 while HBM
 // is otherwise idle.
@@ -309,7 +311,7 @@ __device__ __forceinline__ void prefetch_first(int* __restrict__ ids, int T, int
     asm volatile("ld.relaxed.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(flag) : "memory");
     while (v == 0) asm volatile("ld.relaxed.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(flag) : "memory");
     *flag = 0;
-    const int j1 = (v - 1) % 256, j2 = (v - 1) / 256;
+    const int j1 = (v - 1) % (LOCAL + 1), j2 = (v - 1) / (LOCAL + 1);
     if (j1 < a) { b2 = min(a, j2); a = j1; } else b2 = min(b2, j1 == a ? j2 : j1);
   }
   const int j = __reduce_min_sync(0xffffffffu, a);
@@ -469,7 +471,7 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
     int* __restrict__ cta_batch,
     int* __restrict__ cta_limit, int* __restrict__ num_non_exiting, int* __restrict__ total_padded,
     int* __restrict__ route_map, int* __restrict__ exp2perm, const __nv_bfloat16* __restrict__ wsh,
-    __nv_bfloat16* __restrict__ sh_out, const uint8_t* __restrict__ w13, const uint8_t* __restrict__ w13_sf, int first,
+    __nv_bfloat16* __restrict__ sh_out, const uint8_t* __restrict__ w13, const uint8_t* __restrict__ w13_sf, int rank,
     int T, uint4* stage, const unsigned long long* __restrict__ peers, int* __restrict__ lstate, int* err,
     long long timeout_ns) {
   __shared__ float s_sig[EXPERTS];
@@ -477,7 +479,7 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
   __shared__ u32 s_max[32], s_tau;
   __shared__ int s_n, s_last, s_jmin, s_count[LOCAL];
 
-  const int b = blockIdx.x, t = threadIdx.x, warp = t / 32, lane = t % 32;
+  const int b = blockIdx.x, t = threadIdx.x, warp = t / 32, lane = t % 32, first = rank / (NRANKS / STRIDE);
   asm volatile("griddepcontrol.wait;" ::: "memory");
   asm volatile("griddepcontrol.launch_dependents;");
   if (b >= T) {
@@ -528,7 +530,7 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
       }
       const int d = (int)~(u32)top - first, mine = lane < TOPK && d >= 0 && d % STRIDE == 0 ? d / STRIDE : LOCAL;
       const int j = __reduce_min_sync(0xffffffffu, mine), j2 = __reduce_min_sync(0xffffffffu, mine == j ? LOCAL : mine);
-      if (lane == 0) s_jmin = j + 256 * j2;
+      if (lane == 0) s_jmin = j + (LOCAL + 1) * j2;
       asm volatile("bar.arrive 4, %0;" ::"n"(32 + THREADS - SORT_WARPS * 32) : "memory");  // to the SiTU warps
     } else {
       // this rank's latent slice to shared memory (the lanes past it quantise columns nobody reads), then to
@@ -539,7 +541,7 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
       if (warp >= QUANT_WARP0) quant8(row + EXPERTS, s_q, s_sf, t - QUANT_WARP0 * 32);
       asm volatile("bar.sync 5, %0;" ::"n"(GTHREADS) : "memory");
       if (t - 32 < NRANKS * GVEC)
-        gather(s_q, s_sf, stage, peers, phase_at, first, b, t - 32, q, sf, err, timeout_ns);
+        gather(s_q, s_sf, stage, peers, phase_at, rank, b, t - 32, q, sf, err, timeout_ns);
     }
   } else {
     // every pass's gate | up loads in flight before the first is used
