@@ -94,7 +94,7 @@ KV = {"fp8": k3_kv_fp8, "bf16": k3_kv_bf16}
 # and under the 256-row flag table
 TP_AR_GRID = 144
 DCP_GRID = 2 * 144  # k3_dcp.cu bounds the exchange to two blocks an SM: every block resident on 148 and 152 SMs
-KDA_SMEM_BLOCKS = 2 * 152  # ... and two of its blocks an SM: the batches of one wave of them
+KDA_SLOTS = 3 * 152  # k3_kda_core.cu: three blocks an SM, every one resident, each walking a head's rows
 CAND_SMEM = NB_MAX * H * 2  # k3_ar_fused.cu: a row's snapshots prefetched into shared memory
 LAND_CL = 4  # k3_ar_fused.cu: the closing add's row over a cluster of 4 blocks
 PF_PARAMS = ["in buffer<bf16>", "i64"]  # k3_ar_fused.cu: the next GEMM's weight, prefetched into L2
@@ -168,9 +168,6 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     if chunk:
         mla_short = flavor.p_short(mla_short)
     state_bytes = 2
-    # the register build's state rows a lane holds a pass, packed, twice over (the next pass's in flight):
-    # as many as 128 registers a thread hold without a spill
-    kda_pass_rows = 4
     glue_defs_kv = flavor.P_GLUE
     # P's attention on e4m3 (q and the expanded k | v cast), the FMHA's fp8 builds
     fp8_attn = chunk and flavor.P_FP8_ATTN
@@ -220,7 +217,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     inner_l, fused_l = hl * HEAD_DIM, 4 * hl * HEAD_DIM
     line_l = hl * HEAD_DIM * HEAD_DIM * state_bytes + 3 * (3 * inner_l * 2)
     kda_defs = {"HEADS": hl} if tp > 1 else None
-    kda_smem_rows = KDA_SMEM_BLOCKS // hl
+    kda_rows = KDA_SLOTS // hl
     # P's KDA projections, and a D member's, are one GEMM: its heads' q | k |
     # v | g, then beta's columns and f_a's, the wsm partial read from the same
     # row, padded to WSM columns with f_a's first rows again (nobody reads
@@ -309,20 +306,14 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             "params": ["in buffer<f32>", "in buffer<f32>", "in buffer<f32>", "in buffer<bf16>", "in buffer<f32>",
                        "in buffer<f32>", "in buffer<f32>", "inout state", "in buffer<i32>", "i64", "out buffer<bf16>",
                        "i32", "in buffer<i32>", "i32"],
-            # a batch whose blocks fit two an SM takes the build that copies the state into shared memory
-            # at entry, a programmatic dependent of the projection (ours there, which lets it on at entry): its
-            # cache and weight loads go out under the projection's tail; a larger one the register build, four
-            # an SM (k3_kda_core.cu)
+            # a programmatic dependent of the projection; a batch past one row a slot takes the slots it has
+            # and pipelines its rows through them (k3_kda_core.cu)
             "impl": {"launches": [
-                launch("k3_kda_core", "kern_k3_kda_core", grid=[T, hl, 1], smem=smem, when={"var": T, **when},
-                       defines={"KDA_CONV": 1, **(kda_defs or {}), **defs,
-                                **({"LDS": kfused, "WSM_LDS": kfused, "WSM_FA": hl} if kfused else {})}, **extra)
-                for defs, smem, when, extra in (
-                    ({"KDA_SMEM_STATE": 1, "ROWS_PER_ITER": 1, "KDA_PDL": 1}, HEAD_DIM * HEAD_DIM * state_bytes,
-                     {"max": kda_smem_rows},
-                     {"pdl": True}),
-                    ({"KDA_MINB": 4, "ROWS_PER_ITER": kda_pass_rows, "KDA_PDL": 1}, 0, {"min": kda_smem_rows + 1},
-                     {"pdl": True}))]},
+                launch("k3_kda_core", "kern_k3_kda_core", grid=[slots, hl, 1],
+                       smem=HEAD_DIM * HEAD_DIM * (2 + state_bytes), when={"var": T, **when}, pdl=True,
+                       defines={**(kda_defs or {}),
+                                **({"LDS": kfused, "WSM_LDS": kfused, "WSM_FA": hl} if kfused else {})})
+                for slots, when in ((T, {"max": kda_rows}), (kda_rows, {"min": kda_rows + 1}))]},
         },
         "mla_attn": flavor.d_attn_op(g),
         } if decode else {}),
