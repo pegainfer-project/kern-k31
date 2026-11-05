@@ -186,17 +186,24 @@ extern "C" __global__ void k31_topk_slots(int* __restrict__ ind, const int* __re
 
 // D, under DCP: a member's local top-k (local positions, -1 past its count) as candidates for the
 // group's merge, pushed into slot `rank` of every member's stage (a TensorRT-LLM Lamport one-shot on
-// kern's peer ABI, as peer_allreduce_bf16.cu runs it): a stage is [W][R][2048] candidates, member-major,
-// a candidate two words, the score's ordered bf16 bits (16 wide) and its global position + 1 (0: an
-// empty slot). Neither word is ever 0xffffffff, the poison that says "not arrived". Local position l of
-// member `rank` is global position l * W + rank (dealt one position a member). Stages rotate through
-// state[2], which k31_dcp_select advances; every stage is poisoned once by k31_dcp_poison.
-//   grid (R), block 256: a thread pushes two adjacent candidates as one 16-byte word
+// kern's peer ABI, as peer_allreduce_bf16.cu runs it): a stage is [W][R][2048] candidates, member-major.
+// Local position l of member `rank` is global position l * W + rank (dealt one position a member). A
+// candidate is two words, the score's ordered bf16 bits (16 wide) and its global position + 1 (0: an
+// empty slot); the CAND32 build, for a member of fewer than 65534 positions, packs it into one, the
+// ordered bits over local position + 1 (the member is its slot in the stage). Either way no word is ever
+// 0xffffffff, the poison that says "not arrived": a position + 1 is below 2^24, a local one + 1 below
+// 0xffff. Stages rotate through state[2], which k31_dcp_select advances; every stage is poisoned once by
+// k31_dcp_poison.
+//   grid (R), block 256: a thread pushes two (CAND32: four) adjacent candidates as one 16-byte word
 #define DCP_POISON 0xffffffffu
-__device__ __forceinline__ uint2 dcp_word(const bf16* __restrict__ row, int l, int W, int rank) {
-  if (l < 0) return make_uint2(0u, 0u);
+#ifndef CAND32
+#define CAND32 0
+#endif
+#define CAND_BYTES (CAND32 ? 4 : 8)
+#define CAND_VEC (16 / CAND_BYTES)
+__device__ __forceinline__ unsigned dcp_ordered(const bf16* __restrict__ row, int l) {
   const unsigned u = __bfloat16_as_ushort(row[l]);
-  return make_uint2(u & 0x8000u ? ~u & 0xffffu : u | 0x8000u, (unsigned)(l * W + rank) + 1u);
+  return u & 0x8000u ? ~u & 0xffffu : u | 0x8000u;
 }
 
 extern "C" __global__ void k31_dcp_pack(const bf16* __restrict__ logits, int stride, const int* __restrict__ ind,
@@ -204,13 +211,22 @@ extern "C" __global__ void k31_dcp_pack(const bf16* __restrict__ logits, int str
                                         const int* __restrict__ state, long long stage_bytes) {
   pdl_entry();
   const int r = blockIdx.x;
-  const long long at = (long long)(state[2] % 3) * stage_bytes + (((long long)rank * R + r) * TOPK) * 8;
+  const long long at = (long long)(state[2] % 3) * stage_bytes + (((long long)rank * R + r) * TOPK) * CAND_BYTES;
   const bf16* row = logits + (size_t)r * stride;
-  for (int i = 2 * threadIdx.x; i < TOPK; i += 2 * blockDim.x) {
-    const uint2 a = dcp_word(row, ind[(size_t)r * TOPK + i], W, rank),
-                b = dcp_word(row, ind[(size_t)r * TOPK + i + 1], W, rank);
+  for (int i = CAND_VEC * threadIdx.x; i < TOPK; i += CAND_VEC * blockDim.x) {
+#if CAND32
+    const int4 l = *reinterpret_cast<const int4*>(ind + (size_t)r * TOPK + i);
+    const auto word = [&](int l) { return l < 0 ? 0u : dcp_ordered(row, l) << 16 | (unsigned)(l + 1); };
+    const uint4 v = make_uint4(word(l.x), word(l.y), word(l.z), word(l.w));
+#else
+    const auto word = [&](int l) {
+      return l < 0 ? make_uint2(0u, 0u) : make_uint2(dcp_ordered(row, l), (unsigned)(l * W + rank) + 1u);
+    };
+    const uint2 a = word(ind[(size_t)r * TOPK + i]), b = word(ind[(size_t)r * TOPK + i + 1]);
     const uint4 v = make_uint4(a.x, a.y, b.x, b.y);
-    for (int q = 0; q < W; ++q) *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(peers[q]) + at + (long long)i * 8) = v;
+#endif
+    for (int q = 0; q < W; ++q)
+      *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(peers[q]) + at + (long long)i * CAND_BYTES) = v;
   }
 }
 
@@ -225,9 +241,33 @@ extern "C" __global__ void k31_dcp_poison(uint4* __restrict__ buf, long long byt
 // global position among equal scores; an empty candidate is 0, below everything. A global position is
 // below 2^24, so the key is the score's 16 ordered bits over 24 of position: 40 bits, five radix digits.
 #define KEY_POS 24
-__device__ __forceinline__ unsigned long long stable_key(uint2 w) {
-  return w.y ? ((unsigned long long)w.x << KEY_POS) | ((1u << KEY_POS) - w.y) : 0ull;
+__device__ __forceinline__ unsigned long long stable_key(unsigned score, unsigned g1) {
+  return g1 ? ((unsigned long long)score << KEY_POS) | ((1u << KEY_POS) - g1) : 0ull;
 }
+
+// A candidate as the stage holds it, and its key given its member m of W.
+#if CAND32
+typedef unsigned cand;
+__device__ __forceinline__ cand ld_cand(const uint8_t* p) {
+  cand w;
+  asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(w) : "l"(p));
+  return w;
+}
+__device__ __forceinline__ bool arrived(cand w) { return w != DCP_POISON; }
+__device__ __forceinline__ unsigned long long cand_key(cand w, int W, int m) {
+  const unsigned l1 = w & 0xffffu;
+  return stable_key(w >> 16, l1 ? (l1 - 1) * W + m + 1 : 0u);
+}
+#else
+typedef uint2 cand;
+__device__ __forceinline__ cand ld_cand(const uint8_t* p) {
+  cand w;
+  asm volatile("ld.volatile.global.v2.u32 {%0, %1}, [%2];" : "=r"(w.x), "=r"(w.y) : "l"(p));
+  return w;
+}
+__device__ __forceinline__ bool arrived(cand w) { return w.x != DCP_POISON && w.y != DCP_POISON; }
+__device__ __forceinline__ unsigned long long cand_key(cand w, int, int) { return stable_key(w.x, w.y); }
+#endif
 
 #ifndef DCP_W
 #define DCP_W 8  // the DCP group k31_dcp_select merges
@@ -262,28 +302,26 @@ extern "C" __global__ void __launch_bounds__(SEL_THREADS) k31_dcp_select(
   const long long clear_count = *clear_ptr;
   __syncthreads();
   if (t == 0) atomicAdd(state, 1);
-  const uint2* stage = reinterpret_cast<const uint2*>(lamport + (long long)(flag % 3) * stage_bytes);
+  const uint8_t* stage = lamport + (long long)(flag % 3) * stage_bytes;
   unsigned long long key[SEL_PER];
   int fail = 0;
 #pragma unroll
   for (int i = 0; i < SEL_PER; ++i) {
-    const int c = t + i * SEL_THREADS;  // candidate c of the row: member c / 2048, slot c % 2048
-    const uint2* p = stage + ((size_t)(c / TOPK) * R + r) * TOPK + c % TOPK;
-    uint2 w;
+    const int c = t + i * SEL_THREADS, m = c / TOPK;  // candidate c of the row: member m, slot c % 2048
+    const uint8_t* p = stage + (((size_t)m * R + r) * TOPK + c % TOPK) * CAND_BYTES;
+    cand w;
     unsigned long long t0 = 0;
-    while (true) {
-      asm volatile("ld.volatile.global.v2.u32 {%0, %1}, [%2];" : "=r"(w.x), "=r"(w.y) : "l"(p));
-      if (w.x != DCP_POISON && w.y != DCP_POISON) break;
+    while (!arrived(w = ld_cand(p))) {
       unsigned long long now;
       asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
       if (t0 == 0) {
         t0 = now;
       } else if ((long long)(now - t0) > timeout_ns) {
-        fail = 1 + c / TOPK, w = make_uint2(0u, 0u);
+        fail = 1 + m, w = cand{};
         break;
       }
     }
-    key[i] = stable_key(w);
+    key[i] = cand_key(w, W, m);
   }
   if (fail) {
     atomicMax(err, fail);
@@ -382,7 +420,7 @@ extern "C" __global__ void __launch_bounds__(SEL_THREADS) k31_dcp_select(
     while (*reinterpret_cast<volatile int*>(state) != (int)gridDim.x) {
     }
     state[2] = (flag + 1) % 3;
-    *clear_ptr = (long long)W * R * TOPK * 8;
+    *clear_ptr = (long long)W * R * TOPK * CAND_BYTES;
     state[0] = 0;
   }
 }

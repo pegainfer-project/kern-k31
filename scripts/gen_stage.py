@@ -1067,7 +1067,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                                           b("dcp_lamport"), b("dcp_lamport_peers"), b("dcp_state"), b("tp_err"),
                                           {"rank": "tp"}, B, i64(dcp_stage), i64(TP_TIMEOUT_NS)) if xchg else None,
                                       select=(b("tp_err"), i64(TP_TIMEOUT_NS),
-                                              i64(k31_dsa.cand_stage(seqs_max, tp))) if xchg else None)
+                                              i64(k31_dsa.cand_stage(seqs_max, tp, max_ctx // tp))) if xchg else None)
                     else:
                         step(L + "absorb", "mla_absorb", b("q_partial"), w("w_kv_b"), b("q_abs"), B)
                         flavor.d_attn_steps(step, w, L, kv, g)
@@ -1340,7 +1340,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
             if xchg else []) + (
         [{"label": "dcp_init", "op": "dcp_init", "args": [b("dcp_lamport"), i64(3 * dcp_stage)]}] if xchg and mla else []) + (
         [{"label": "idx_init", "op": "idx_init",
-          "args": [b("idx_lamport"), i64(3 * k31_dsa.cand_stage(seqs_max, tp))]}] if xchg and mla and dsa else [])
+          "args": [b("idx_lamport"), i64(3 * k31_dsa.cand_stage(seqs_max, tp, max_ctx // tp))]}] if xchg and mla and dsa else [])
     if init:
         programs["tp_init"] = kern_manifest.program(init, once=True)
     m = {
