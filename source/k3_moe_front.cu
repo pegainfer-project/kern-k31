@@ -6,7 +6,7 @@
 //       u8* q, u8* sf, bf16* act, i32* ready, i32* done, i32* cta_batch, i32* cta_limit,
 //       i32* num_non_exiting, i32* total_padded, i32* route_map, i32* exp2perm,
 //       const bf16* wsh, bf16* sh_out, int first, int T)
-//   grid (T + NSH / 64, 1, 1)   block (1024, 1, 1)   shared SMEM_SH bytes   T <= 64
+//   grid (T + NSH / 64, 1, 1)   block (1024, 1, 1)   shared SMEM_SH bytes   T <= ROWS_MAX
 //
 // Launched as a programmatic dependent of the front GEMM: every block waits for it at entry
 // (griddepcontrol.wait), then lets FC1 launch.
@@ -19,7 +19,7 @@
 //     time into a running top 16 (below);
 //   * meanwhile warps 28..31 run k3_land.cu's land_situ on the shared expert's
 //     gate | up (the SH columns after the latent) and publish the row to each
-//     shared-expert block T + c (ready[c * 64 + b] = 1, st.release.gpu); once the
+//     shared-expert block T + c (ready[c * ROWS_MAX + b] = 1, st.release.gpu); once the
 //     candidates are in, warps 14..27 land the latent (columns EXPERTS + [0, LATENT))
 //     to bf16 and quantise it to mxfp8 as k3_moe_prefill.cu's kern_k3_moe_quant
 //     (four threads per 32-element group);
@@ -52,7 +52,8 @@
 #ifndef NSH
 #define NSH 7168  // the shared expert's output width (the hidden size)
 #endif
-#define READERS (NSH / 64)  // the shared-expert blocks: ready[c * 64 + b] is row b's flag for block T + c
+#define ROWS_MAX 256         // the rows a step may take (gen_stage.py's D_SEQS_MAX): the flag tables' stride
+#define READERS (NSH / 64)  // the shared-expert blocks: ready[c * ROWS_MAX + b] is row b's flag for block T + c
 #define MOE_I 3072           // an expert's intermediate width: FC1 is [2 MOE_I, LATENT] mxfp4 + UE8M0 per 32
 #define FC1_W (2 * MOE_I * (LATENT / 2))
 #define FC1_SF (2 * MOE_I * (LATENT / 32))
@@ -64,7 +65,8 @@ static_assert(FC1_W % (READERS * 16) == 0 && FC1_SF % (READERS * 16) == 0, "16-b
 #define QUANT_THREADS (LATENT / 8)
 #define SITU_THREADS (SH / 4)
 static_assert(QUANT_THREADS % 32 == 0 && SH % 4 == 0, "whole warps");
-static_assert(LOCAL <= THREADS && TOPK * 64 <= THREADS, "one expanded id per thread");
+#define IDS_PER ((ROWS_MAX * TOPK + THREADS - 1) / THREADS)  // the expanded ids a thread routes at most
+static_assert(LOCAL <= THREADS, "an expert a thread");
 
 typedef unsigned int u32;
 
@@ -113,21 +115,27 @@ __device__ __forceinline__ void quant8(const float* __restrict__ x, uint8_t* __r
   reinterpret_cast<uint2*>(q)[u] = *reinterpret_cast<const uint2*>(o);
 }
 
-// The last block's routing tables over T rows' ids, thread i one expanded id: its slot within its
-// expert claimed by a shared-memory atomic (an expert's rows in arrival order, as FlashInfer's atomics
-// leave them; the GEMMs compute every row on its own and the combine gathers by exp2perm).
+// The last block's routing tables over T rows' ids, thread t the expanded ids t + k THREADS: each one's
+// slot within its expert claimed by a shared-memory atomic (an expert's rows in arrival order, as
+// FlashInfer's atomics leave them; the GEMMs compute every row on its own and the combine gathers by exp2perm).
 __device__ __forceinline__ void route(const int* __restrict__ idx, int first, int T, int* count,
                                       int* __restrict__ cta_batch, int* __restrict__ cta_limit,
                                       int* __restrict__ num_non_exiting, int* __restrict__ total_padded,
                                       int* __restrict__ route_map, int* __restrict__ exp2perm) {
   __shared__ int off[LOCAL + 1];
   const int i = threadIdx.x, lane = i % 32;
-  int j = -1;
-  if (i < T * TOPK) {
-    const int d = __ldcg(idx + i) - first;
-    if (d >= 0 && d % STRIDE == 0) j = d / STRIDE;
+  int js[IDS_PER], slots[IDS_PER];
+#pragma unroll
+  for (int k = 0; k < IDS_PER; ++k) {
+    const int e = i + k * THREADS;
+    int j = -1;
+    if (e < T * TOPK) {
+      const int d = __ldcg(idx + e) - first;
+      if (d >= 0 && d % STRIDE == 0) j = d / STRIDE;
+    }
+    js[k] = j;
+    slots[k] = j >= 0 ? atomicAdd_block(count + j, 1) : 0;
   }
-  const int slot = j >= 0 ? atomicAdd_block(count + j, 1) : 0;
   __syncthreads();
   if (i < 32) {  // off = exclusive scan of the experts' CTA counts
     constexpr int EPL = (LOCAL + 31) / 32;
@@ -165,13 +173,17 @@ __device__ __forceinline__ void route(const int* __restrict__ idx, int first, in
     }
     for (int r = off[i] * TILE + count[i]; r < off[i + 1] * TILE; ++r) route_map[r] = 0;
   }
-  if (i < T * TOPK) {
-    int row = -1;
-    if (j >= 0) {
-      row = off[j] * TILE + slot;
-      route_map[row] = i / TOPK;
+#pragma unroll
+  for (int k = 0; k < IDS_PER; ++k) {
+    const int e = i + k * THREADS;
+    if (e < T * TOPK) {
+      int row = -1;
+      if (js[k] >= 0) {
+        row = off[js[k]] * TILE + slots[k];
+        route_map[row] = e / TOPK;
+      }
+      exp2perm[e] = row;
     }
-    exp2perm[i] = row;
   }
 }
 
@@ -209,8 +221,9 @@ static_assert(EXPERTS % 32 == 0 && TOPK <= SORT_WARPS && SORT_WARPS <= 31 && QUA
 // ---- blocks T .. T + NSH / 64 - 1: the shared expert's down projection ----
 // out[t, n] = bf16(sum_k act[t, k] * Wsh[n, k]) for t < T, n < H, k < SH, act the row blocks' SiTU rows.
 // Block T + c takes Wsh's rows [64 c, 64 c + 64): they land in shared memory by cp.async at entry
-// (warps 8-30), the T activation rows once published (ready[64 c + b] = 1 by row block b, polled by
-// warps 0-1; each block clears its own flags for the next layer), both K-major in 128-byte swizzle atoms.
+// (warps 8-30), then the T activation rows SROWS at a time once published (ready[c ROWS_MAX + b] = 1 by row
+// block b, polled by warps 0-1; each block clears its own flags for the next layer), both K-major in 128-byte
+// swizzle atoms. The weight stays put while a chunk of rows after another goes through the same projection.
 // One thread issues tcgen05.mma M = 64, N = the rows rounded to 8, K = 16, 48 in a row into TMEM (~25 ns
 // each whatever N), every warp moves tiles out. Each output is one chain over k = 0, 16, 32, ... in
 // order, f32 accumulators: the order and instruction cuBLASLt's kernels for this shape sum in (nvjet tst
@@ -239,7 +252,7 @@ __device__ __forceinline__ uint64_t umma_desc(uint32_t at) {
 // TMEM columns [0, 8 tiles), then warp w < 31 moves tiles w / 4, w / 4 + 8 (7 in lane quarter 3, whose
 // warp 31 prefetches) .. of its lane quarter (rows 16 (w % 4) + [0, 16)).
 __device__ __forceinline__ void umma_rows(uint32_t sw, uint32_t sa, uint32_t tm, uint64_t* bar, int tiles,
-                                          __nv_bfloat16* tile) {
+                                          int parity, __nv_bfloat16* tile) {
   const int t = threadIdx.x, warp = t / 32, lane = t % 32;
   if (t == 0) {
     // kind::f16: D f32, A and B bf16, both K-major, N = 8 tiles, M = 64
@@ -257,8 +270,8 @@ __device__ __forceinline__ void umma_rows(uint32_t sw, uint32_t sa, uint32_t tm,
   }
   const int q = warp % 4;
   for (int j = warp / 4; j < tiles; j += q == 3 ? WORKERS / 128 : WORKERS / 128 + 1) {
-    asm volatile("{\n.reg .pred p;\nW: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], 0;\n@!p bra W;\n}"
-                 ::"r"(smem_at(bar)) : "memory");
+    asm volatile("{\n.reg .pred p;\nW: mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n@!p bra W;\n}"
+                 ::"r"(smem_at(bar)), "r"(parity) : "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
     uint32_t v[8];
     asm volatile("tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
@@ -272,7 +285,7 @@ __device__ __forceinline__ void umma_rows(uint32_t sw, uint32_t sa, uint32_t tm,
 }
 
 // FC1's first CTAs take the touched experts of the lowest local indices: row b publishes its two lowest
-// local picks j_b < j2_b (ids[c * 64 + b] = 1 + j_b + 256 j2_b, LOCAL for none; the value is the message,
+// local picks j_b < j2_b (ids[c * ROWS_MAX + b] = 1 + j_b + 256 j2_b, LOCAL for none; the value is the message,
 // relaxed); warp 31 of block T + c, apart from the projection from the start, takes the two least over the
 // rows (clearing the flags) and pulls its share of those experts' FC1 weights and scales into L2 while HBM
 // is otherwise idle.
@@ -282,7 +295,7 @@ __device__ __forceinline__ void prefetch_first(int* __restrict__ ids, int T, int
   int a = LOCAL, b2 = LOCAL;  // the lane's two least
   for (int r = lane; r < T; r += 32) {
     int v;
-    int* flag = ids + c * 64 + r;
+    int* flag = ids + c * ROWS_MAX + r;
     asm volatile("ld.relaxed.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(flag) : "memory");
     while (v == 0) asm volatile("ld.relaxed.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(flag) : "memory");
     *flag = 0;
@@ -304,7 +317,7 @@ __device__ __forceinline__ void shared_down(const __nv_bfloat16* __restrict__ ac
                                             const __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ out,
                                             int T, int c, int* __restrict__ ids, const uint8_t* __restrict__ w13,
                                             const uint8_t* __restrict__ w13_sf) {
-  extern __shared__ __align__(128) uint8_t sm[];  // the weight rows, T activation rows, the bf16 tile [T][64]
+  extern __shared__ __align__(128) uint8_t sm[];  // the weight rows, SROWS activation rows, the bf16 tile [SROWS][64]
   __shared__ __align__(8) uint64_t s_bar;
   __shared__ uint32_t s_tmem;
   const int t = threadIdx.x, warp = t / 32, n0 = c * SROWS;
@@ -325,34 +338,40 @@ __device__ __forceinline__ void shared_down(const __nv_bfloat16* __restrict__ ac
     asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;" ::: "memory");
   }
   if (t == 64) asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(smem_at(&s_bar)) : "memory");
-  if (t < T) {
-    int v;
-    int* flag = ready + c * 64 + t;
-    asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(flag) : "memory");
-    while (v != 1) {
-      __nanosleep(64);
+  // a chunk's operand, tile and accumulators are reused by the next only past the barriers after its stores
+  for (int r0 = 0, k = 0; r0 < T; r0 += SROWS, ++k) {
+    const int n = min(SROWS, T - r0);
+    if (t < n) {
+      int v;
+      int* flag = ready + c * ROWS_MAX + r0 + t;
       asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(flag) : "memory");
+      while (v != 1) {
+        __nanosleep(64);
+        asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(flag) : "memory");
+      }
+      *flag = 0;
     }
-    *flag = 0;
+    work_sync();
+    const __nv_bfloat16* a = act + (size_t)r0 * SH;
+    for (int i = t; i < n * (SH / 8); i += WORKERS)
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+                   ::"r"(smem_at(sa + swizzled(i / (SH / 8), i % (SH / 8)))), "l"(a + i * 8) : "memory");
+    asm volatile("cp.async.commit_group;" ::: "memory");
+    asm volatile("cp.async.wait_group 0;" ::: "memory");
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // the operands, to the tensor cores' reads
+    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+    work_sync();
+    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+    umma_rows(smem_at(sw), smem_at(sa), s_tmem, &s_bar, (n + 7) / 8, k & 1, tile);
+    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+    work_sync();
+    for (int i = t; i < n * (SROWS / 8); i += WORKERS) {
+      const int r = i / (SROWS / 8), col = i % (SROWS / 8);
+      reinterpret_cast<uint4*>(out + (size_t)(r0 + r) * NSH + n0)[col] =
+          reinterpret_cast<const uint4*>(tile + r * SROWS)[col];
+    }
   }
-  work_sync();
-  for (int i = t; i < T * (SH / 8); i += WORKERS)
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
-                 ::"r"(smem_at(sa + swizzled(i / (SH / 8), i % (SH / 8)))), "l"(act + i * 8) : "memory");
-  asm volatile("cp.async.commit_group;" ::: "memory");
-  asm volatile("cp.async.wait_group 0;" ::: "memory");
-  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");  // the operands, to the tensor cores' reads
-  asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
-  work_sync();
-  asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
-  umma_rows(smem_at(sw), smem_at(sa), s_tmem, &s_bar, (T + 7) / 8, tile);
-  asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
-  work_sync();
   if (warp == 2) asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, 64;" ::"r"(s_tmem) : "memory");
-  for (int i = t; i < T * (SROWS / 8); i += WORKERS) {
-    const int r = i / (SROWS / 8), col = i % (SROWS / 8);
-    reinterpret_cast<uint4*>(out + (size_t)r * NSH + n0)[col] = reinterpret_cast<const uint4*>(tile + r * SROWS)[col];
-  }
 }
 
 extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
@@ -451,11 +470,11 @@ extern "C" __global__ void __launch_bounds__(THREADS, 1) kern_k3_moe_front(
     // over the SiTU warps' stores, ordered before it by the barrier)
     asm volatile("bar.sync 3, %0;" ::"n"(THREADS - SORT_WARPS * 32));
     for (int c = t - SORT_WARPS * 32; c < READERS; c += THREADS - SORT_WARPS * 32)  // a flag per reader CTA
-      asm volatile("st.release.gpu.global.b32 [%0], %1;" ::"l"(ready + c * 64 + b), "r"(1) : "memory");
+      asm volatile("st.release.gpu.global.b32 [%0], %1;" ::"l"(ready + c * ROWS_MAX + b), "r"(1) : "memory");
     // then the row's lowest local pick to each shared-expert block's prefetcher
     asm volatile("bar.sync 4, %0;" ::"n"(32 + THREADS - SORT_WARPS * 32) : "memory");
     for (int c = t - SORT_WARPS * 32; c < READERS; c += THREADS - SORT_WARPS * 32)
-      asm volatile("st.relaxed.gpu.global.b32 [%0], %1;" ::"l"(ids + c * 64 + b), "r"(s_jmin + 1) : "memory");
+      asm volatile("st.relaxed.gpu.global.b32 [%0], %1;" ::"l"(ids + c * ROWS_MAX + b), "r"(s_jmin + 1) : "memory");
   }
 
   __syncthreads();
