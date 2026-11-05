@@ -11,6 +11,11 @@ K3's 96 heads ride as 128, the pad heads' q zero.
 The kernel leaves a row's softmax as (max, sum) per head, max already scaled by bmm1; its base-2 LSE is
 log2(e) * max + log2(sum) (FlashInfer's ComputeLSEFromMD). A row's count must be at least 1: a row with
 nothing selected attends one dummy index and its result is discarded by whoever reads it.
+
+Never a PDL launch: the kernel loads `lens` (ptrSeqLensKv) before its griddepcontrol.wait. Behind a
+predecessor that lets it launch early (D's DCP select triggers on entry) it reads the previous layer's
+count, which differs once a context passes the top-k (a DCP rank's share of it changes layer to layer):
+the tokens move from there, and a 64-row 128k TP8 step hung.
 """
 from pinned import module
 
@@ -24,7 +29,7 @@ SCALE_LOG2 = 0.10411754995584488  # 192^-0.5 * log2(e), as FlashInfer rounds it
 SCRATCH = 1 << 20
 
 
-def op(rows_max, rows, kv="in state", pdl=False):
+def op(rows_max, rows, kv="in state"):
     """Interface: q (e4m3 [rows, 128, 576]) | kv (the layer's fp8 pages, [., 64, 576]) | ind (i32 [rows, 2048],
     cache rows, -1 past the count) | lens (i32 [rows], each >= 1) | o (bf16 [rows, 128, 512]) |
     stats (f32 [rows, 128, 2]: max, sum). `rows` is the call's row count (a var name or an expression); `kv` the
@@ -65,7 +70,7 @@ def op(rows_max, rows, kv="in state", pdl=False):
     launch = {
         **module(MODULE), "entry": ENTRY, "block": [512, 1, 1], "grid": [2, 1, n.get("var", n.get("expr"))],
         "cluster": [2, 1, 1], "shared_mem": SMEM, "params": [f"bytes<{PARAMS}>"],
-        "args": [{"pack": {"size": PARAMS, "fields": fields}}], **({"pdl": True} if pdl else {}),
+        "args": [{"pack": {"size": PARAMS, "fields": fields}}],
     }
     return {
         "params": ["in buffer<fp8e4m3>", kv, "in buffer<i32>", "in buffer<i32>", "out buffer<bf16>",

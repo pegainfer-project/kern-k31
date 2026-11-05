@@ -136,7 +136,7 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1, fold=F
                  "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32", "i32"],
                  "args": [{"param": i} for i in (0, 1, 3, 4, 5, 6, 7)]}]},
         }}),
-        "sparse_mla": sparse.op(rows_max, T, pdl=not chunk),
+        "sparse_mla": sparse.op(rows_max, T),
         # (o_lat, w_kv_b, gate, gated, B): P's chunk on tcgen05, D's batch on mma.sync
         "vup_gate": {
             "params": ["in buffer<bf16>", "in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32"],
