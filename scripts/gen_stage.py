@@ -808,8 +808,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     if front:
         work("front_partial", front, "f32", var=RW)
         buffers["moe_done"] = {"dtype": "i32", "shape": [1], "kind": "carry"}
-        buffers["sh_ready"] = {"dtype": "i32", "shape": [H // 64, 64], "kind": "carry"}  # moe_front's shared-expert flags
-        buffers["sh_ids"] = {"dtype": "i32", "shape": [H // 64, 64], "kind": "carry"}  # and its rows' ids, to them
+        # moe_front's shared-expert flags and its rows' ids, to them
+        buffers["sh_ready"] = {"dtype": "i32", "shape": [H // 64, D_SEQS_MAX], "kind": "carry"}
+        buffers["sh_ids"] = {"dtype": "i32", "shape": [H // 64, D_SEQS_MAX], "kind": "carry"}
     else:
         work("router_partial", EXPERTS, "f32", var=RW)
     work("topk_idx", TOPK, "i32", var=RW)
