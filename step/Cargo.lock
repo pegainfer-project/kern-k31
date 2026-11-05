@@ -98,9 +98,9 @@ dependencies = [
 
 [[package]]
 name = "cudarc"
-version = "0.19.7"
+version = "0.19.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1cea5f10a99e025c1b44ae2354c2d8326b25ddbd0baf76bde8e55cfd4018a2cc"
+checksum = "7359bf1de037ddada72729c3acec9b040f3468400c6e9e740b01ba0cd2e89562"
 dependencies = [
  "half",
  "libloading",
@@ -228,7 +228,7 @@ dependencies = [
 [[package]]
 name = "kern-manifest"
 version = "0.3.1"
-source = "git+https://github.com/pegainfer-project/kern?rev=5d0910c5e5beef5b1b204853ad65f3e1fe994777#5d0910c5e5beef5b1b204853ad65f3e1fe994777"
+source = "git+https://github.com/pegainfer-project/kern?rev=50175a237cca4295ed6d9ffc3a7d6d5248adddcc#50175a237cca4295ed6d9ffc3a7d6d5248adddcc"
 dependencies = [
  "half",
  "schemars",
@@ -240,7 +240,7 @@ dependencies = [
 [[package]]
 name = "kern-pool"
 version = "0.3.1"
-source = "git+https://github.com/pegainfer-project/kern?rev=5d0910c5e5beef5b1b204853ad65f3e1fe994777#5d0910c5e5beef5b1b204853ad65f3e1fe994777"
+source = "git+https://github.com/pegainfer-project/kern?rev=50175a237cca4295ed6d9ffc3a7d6d5248adddcc#50175a237cca4295ed6d9ffc3a7d6d5248adddcc"
 dependencies = [
  "hex",
  "kern-manifest",
@@ -252,7 +252,7 @@ dependencies = [
 [[package]]
 name = "kern-runtime"
 version = "0.3.1"
-source = "git+https://github.com/pegainfer-project/kern?rev=5d0910c5e5beef5b1b204853ad65f3e1fe994777#5d0910c5e5beef5b1b204853ad65f3e1fe994777"
+source = "git+https://github.com/pegainfer-project/kern?rev=50175a237cca4295ed6d9ffc3a7d6d5248adddcc#50175a237cca4295ed6d9ffc3a7d6d5248adddcc"
 dependencies = [
  "cudarc",
  "half",

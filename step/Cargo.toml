@@ -13,7 +13,7 @@ path = "src/main.rs"
 # kern pinned by commit; the generator's KERN checkout is the same commit.
 [dependencies]
 anyhow = "1"
-cudarc = { version = "=0.19.7", features = ["cuda-13000", "f16", "nccl"] }
-kern-manifest = { git = "https://github.com/pegainfer-project/kern", rev = "5d0910c5e5beef5b1b204853ad65f3e1fe994777" }
-kern-pool = { git = "https://github.com/pegainfer-project/kern", rev = "5d0910c5e5beef5b1b204853ad65f3e1fe994777" }
-kern-runtime = { git = "https://github.com/pegainfer-project/kern", rev = "5d0910c5e5beef5b1b204853ad65f3e1fe994777" }
+cudarc = { version = "=0.19.10", features = ["cuda-13030", "f16", "nccl"] }
+kern-manifest = { git = "https://github.com/pegainfer-project/kern", rev = "50175a237cca4295ed6d9ffc3a7d6d5248adddcc" }
+kern-pool = { git = "https://github.com/pegainfer-project/kern", rev = "50175a237cca4295ed6d9ffc3a7d6d5248adddcc" }
+kern-runtime = { git = "https://github.com/pegainfer-project/kern", rev = "50175a237cca4295ed6d9ffc3a7d6d5248adddcc" }
