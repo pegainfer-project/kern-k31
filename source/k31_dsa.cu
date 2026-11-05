@@ -303,25 +303,30 @@ extern "C" __global__ void __launch_bounds__(SEL_THREADS) k31_dcp_select(
   __syncthreads();
   if (t == 0) atomicAdd(state, 1);
   const uint8_t* stage = lamport + (long long)(flag % 3) * stage_bytes;
+  // every candidate's load in flight at once, then a spin on those not yet arrived
+  const auto slot = [&](int i) {  // candidate c = t + 1024 i of the row: member c / 2048, slot c % 2048
+    const int c = t + i * SEL_THREADS;
+    return stage + (((size_t)(c / TOPK) * R + r) * TOPK + c % TOPK) * CAND_BYTES;
+  };
+  cand w[SEL_PER];
+#pragma unroll
+  for (int i = 0; i < SEL_PER; ++i) w[i] = ld_cand(slot(i));
   unsigned long long key[SEL_PER];
   int fail = 0;
 #pragma unroll
   for (int i = 0; i < SEL_PER; ++i) {
-    const int c = t + i * SEL_THREADS, m = c / TOPK;  // candidate c of the row: member m, slot c % 2048
-    const uint8_t* p = stage + (((size_t)m * R + r) * TOPK + c % TOPK) * CAND_BYTES;
-    cand w;
-    unsigned long long t0 = 0;
-    while (!arrived(w = ld_cand(p))) {
+    const int m = (t + i * SEL_THREADS) / TOPK;
+    for (unsigned long long t0 = 0; !arrived(w[i]); w[i] = ld_cand(slot(i))) {
       unsigned long long now;
       asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
       if (t0 == 0) {
         t0 = now;
       } else if ((long long)(now - t0) > timeout_ns) {
-        fail = 1 + m, w = cand{};
+        fail = 1 + m, w[i] = cand{};
         break;
       }
     }
-    key[i] = cand_key(w, W, m);
+    key[i] = cand_key(w[i], W, m);
   }
   if (fail) {
     atomicMax(err, fail);
