@@ -10,6 +10,9 @@
 //     it as the query's UE8M0 scale gives the same logits.
 // Neither has a position encoding (dsa_config.index_rope_dim 0).
 //
+// D launches the decode entries as programmatic dependents (pdl_entry): each lets the next kernel
+// onto the SMs at once and reads nothing before the kernel before it is done, its own state included.
+//
 // A UE8M0 scale travels as DeepGEMM's packed word: four equal exponent bytes, one a 32-element block.
 // The key cache is token-major, 144 bytes a token: 128 e4m3, the scale's word, 12 bytes of padding,
 // so a row is a multiple of 16 bytes as kern's P -> D push and TMA require. A page is 64 tokens.
@@ -28,6 +31,10 @@ typedef unsigned char u8;
 #define K_EPS 1e-5f
 
 __device__ __forceinline__ float bf(bf16 x) { return __bfloat162float(x); }
+__device__ __forceinline__ void pdl_entry() {
+  asm volatile("griddepcontrol.launch_dependents;");
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+}
 __device__ __forceinline__ float rnd(float x) { return __bfloat162float(__float2bfloat16(x)); }
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -68,6 +75,7 @@ __device__ __forceinline__ void ld4(const bf16* p, float v[4]) {
 extern "C" __global__ void __launch_bounds__(128) k31_idx_key(
     const bf16* __restrict__ k, int lda, const bf16* __restrict__ w, const bf16* __restrict__ b,
     const long long* __restrict__ slot, u8* __restrict__ cache, int T) {
+  pdl_entry();
   const int r = blockIdx.x * 4 + (threadIdx.x >> 5), l = threadIdx.x & 31;
   if (r >= T) return;
   const long long s = slot[r];
@@ -97,6 +105,7 @@ extern "C" __global__ void __launch_bounds__(128) k31_idx_key(
 extern "C" __global__ void __launch_bounds__(256) k31_idx_q(
     const bf16* __restrict__ q, int ldq, const bf16* __restrict__ iw, int ldw, u8* __restrict__ iq,
     unsigned* __restrict__ sfq, bf16* __restrict__ wout, unsigned* __restrict__ rid, int T) {
+  pdl_entry();
   const int r = blockIdx.x, w = threadIdx.x >> 5, l = threadIdx.x & 31;
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
@@ -193,6 +202,7 @@ __device__ __forceinline__ uint2 dcp_word(const bf16* __restrict__ row, int l, i
 extern "C" __global__ void k31_dcp_pack(const bf16* __restrict__ logits, int stride, const int* __restrict__ ind,
                                         int rank, int W, int R, const unsigned long long* __restrict__ peers,
                                         const int* __restrict__ state, long long stage_bytes) {
+  pdl_entry();
   const int r = blockIdx.x;
   const long long at = (long long)(state[2] % 3) * stage_bytes + (((long long)rank * R + r) * TOPK) * 8;
   const bf16* row = logits + (size_t)r * stride;
@@ -239,6 +249,7 @@ extern "C" __global__ void __launch_bounds__(SEL_THREADS) k31_dcp_select(
     const uint8_t* __restrict__ lamport, int* state, int* err, long long stage_bytes, long long timeout_ns,
     int R, int rank, const int* __restrict__ block_table, int max_pages,
     int* __restrict__ ind, int* __restrict__ lens, int* __restrict__ live) {
+  pdl_entry();
   constexpr int W = DCP_W;
   __shared__ unsigned whist[SEL_THREADS / 32][256];  // a warp's own: the top digit is mostly one bin
   __shared__ unsigned hist[256];

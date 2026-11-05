@@ -359,6 +359,16 @@ extern "C" __global__ void __launch_bounds__(256, 2) kern_k3_dcp_exchange(
     const bf16* __restrict__ mla_gate, bf16* __restrict__ gated, uint8_t* lamport,
     const unsigned long long* __restrict__ peers, int* state, int* err,
     int rank, int R, long long stage_bytes, long long timeout_ns) {
+  // o_proj's GEMM behind this kernel launches as a programmatic dependent and waits on its own; the
+  // trigger fires once every block has run it, so every block is resident before a GEMM block lands.
+  asm volatile("griddepcontrol.launch_dependents;");
+  extern __shared__ uint4 sw[];  // [2][QROWS][LAT / 8]
+  // a merge item is (row group, local head j, half of j's dv): `it` = (rows * HL + j) * 2 + half
+  const int items = (R + RB - 1) / RB * HL * 2;
+  if (blockIdx.x < items) stage_w(sw, w_kv_b, blockIdx.x / 2 % HL, blockIdx.x % 2 * 2), stage_w(sw, w_kv_b, blockIdx.x / 2 % HL, blockIdx.x % 2 * 2 + 1);
+  // D launches this kernel as a programmatic dependent of the attention: only the weight is read
+  // before the wait, the state the previous call left included after it.
+  asm volatile("griddepcontrol.wait;" ::: "memory");
   const int flag = state[2];
   long long* clear_ptr = reinterpret_cast<long long*>(state + 4);
   const long long clear_count = *clear_ptr;
@@ -368,13 +378,6 @@ extern "C" __global__ void __launch_bounds__(256, 2) kern_k3_dcp_exchange(
   uint4* clear_buf = reinterpret_cast<uint4*>(lamport + ((flag + 2) % 3) * stage_bytes);
   __syncthreads();
   if (threadIdx.x == 0) atomicAdd(state, 1);
-  // o_proj's GEMM behind this kernel launches as a programmatic dependent and waits on its own; the
-  // trigger fires once every block has run it, so every block is resident before a GEMM block lands.
-  asm volatile("griddepcontrol.launch_dependents;");
-  extern __shared__ uint4 sw[];  // [2][QROWS][LAT / 8]
-  // a merge item is (row group, local head j, half of j's dv): `it` = (rows * HL + j) * 2 + half
-  const int items = (R + RB - 1) / RB * HL * 2;
-  if (blockIdx.x < items) stage_w(sw, w_kv_b, blockIdx.x / 2 % HL, blockIdx.x % 2 * 2), stage_w(sw, w_kv_b, blockIdx.x / 2 % HL, blockIdx.x % 2 * 2 + 1);
 
   const int lane = threadIdx.x % LANES, sub = threadIdx.x / LANES;
   for (int it = blockIdx.x; it < R * (HEADS / HPB); it += gridDim.x) {
