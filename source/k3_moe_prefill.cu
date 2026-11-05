@@ -40,16 +40,20 @@
 //   out[t] = sum over k of wts[t][k] * fc2[exp2perm[16 t + k]] in f32, the
 //   local experts only; rows t >= T (the gathered chunk's tail) are zero.
 //
-//   kern_k3_moe_w_shuffle(const u8* src, u8* dst, int experts, int n, int row_bytes, int gated)
+//   kern_k3_moe_w_shuffle(const u8* src, u8* dst, int experts, int n, int row_bytes, int gated, int slices,
+//       int rank)
 //   grid (ceil(experts * n * row_bytes / 16 / 256), 1, 1)   block (256, 1, 1)
 //   dst row r of every expert = src row shuffle(r): the GEMM's 32-row epilogue
 //   permutation (trtllm-gen shuffleMatrixA, epilogue tile 128), after, when
 //   `gated`, the gated-activation interleave that pairs src row j with row
-//   n/2 + j (row 2j and 2j + 1 of the pair layout): src = [up; gate].
+//   n/2 + j (row 2j and 2j + 1 of the pair layout): src = [up; gate]. A src row
+//   is `slices` dst rows wide and dst takes its column block rank % slices: a
+//   rank's K slice of whole checkpoint rows, which the loader reads in one pass
+//   where a strided bind would read a row at a time.
 //
-//   kern_k3_moe_sf_shuffle(const u8* src, u8* dst, int experts, int n, int kg, int gated)
+//   kern_k3_moe_sf_shuffle(const u8* src, u8* dst, int experts, int n, int kg, int gated, int slices, int rank)
 //   grid (ceil(experts * n * kg / 256), 1, 1)   block (256, 1, 1)
-//   The same row shuffle on the [n, kg] UE8M0 scales, re-laid in the 128x4
+//   The same row shuffle (and column block) on the [n, kg] UE8M0 scales, re-laid in the 128x4
 //   block layout (R128c4: 512 B per 128 rows x 4 columns, row r column c at
 //   ((r/128) * (kg/4) + c/4) * 512 + (r%32) * 16 + ((r%128)/32) * 4 + c%4).
 //
@@ -240,20 +244,20 @@ __device__ __forceinline__ int shuffle(int r, int n, int gated) {
 }
 
 extern "C" __global__ void kern_k3_moe_w_shuffle(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst, int experts,
-                                                 int n, int row_bytes, int gated) {
+                                                 int n, int row_bytes, int gated, int slices, int rank) {
   const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
   const int per_row = row_bytes / 16;
   if (i >= (long long)experts * n * per_row) return;
   const int c = (int)(i % per_row), r = (int)(i / per_row % n), e = (int)(i / per_row / n);
-  reinterpret_cast<uint4*>(dst)[i] =
-      reinterpret_cast<const uint4*>(src + ((long long)e * n + shuffle(r, n, gated)) * row_bytes)[c];
+  reinterpret_cast<uint4*>(dst)[i] = reinterpret_cast<const uint4*>(
+      src + ((long long)e * n + shuffle(r, n, gated)) * row_bytes * slices + (long long)(rank % slices) * row_bytes)[c];
 }
 
 extern "C" __global__ void kern_k3_moe_sf_shuffle(const uint8_t* __restrict__ src, uint8_t* __restrict__ dst, int experts,
-                                                  int n, int kg, int gated) {
+                                                  int n, int kg, int gated, int slices, int rank) {
   const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= (long long)experts * n * kg) return;
   const int c = (int)(i % kg), r = (int)(i / kg % n), e = (int)(i / kg / n);
   const long long at = ((long long)(r / 128) * (kg / 4) + c / 4) * 512 + (r % 32) * 16 + ((r % 128) / 32) * 4 + c % 4;
-  dst[(long long)e * n * kg + at] = src[((long long)e * n + shuffle(r, n, gated)) * kg + c];
+  dst[(long long)e * n * kg + at] = src[((long long)e * n + shuffle(r, n, gated)) * kg * slices + (rank % slices) * kg + c];
 }

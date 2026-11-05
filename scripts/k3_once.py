@@ -3,8 +3,13 @@ checkpoint does not hold (`source/k3_weight_prep.cu`, `k3_moe_prefill.cu`).
 kern dropped them when the K3 line moved to this repository; importing this
 module registers them again, before any generator calls `Once.call`.
 """
-import once
+import types
 
+import once
+from pinned import module
+
+# Their modules as the step's own launches resolve theirs: this repository's pin first (pinned.py), then the index.
+once.variant = lambda family, **defines: types.SimpleNamespace(module=module(family, **defines))
 once.KERNELS.update({
     "fill_bf16": ("k3_weight_prep", "kern_fill_bf16", ["out buffer<bf16>", "i32", "f32"]),
     "k3_conv_taps": ("k3_weight_prep", "kern_k3_conv_taps",
@@ -13,8 +18,8 @@ once.KERNELS.update({
     "k3_wsm": ("k3_weight_prep", "kern_k3_wsm", ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32"]),
     "k3_kvb_aug": ("k3_weight_prep", "kern_k3_kvb_aug", ["in buffer<bf16>", "out buffer<bf16>", "i32"]),
     "k3_moe_w_shuffle": ("k3_moe_prefill", "kern_k3_moe_w_shuffle",
-                         ["in buffer<u8>", "out buffer<u8>", "i32", "i32", "i32", "i32"]),
+                         ["in buffer<u8>", "out buffer<u8>", *["i32"] * 6]),
     "k3_moe_sf_shuffle": ("k3_moe_prefill", "kern_k3_moe_sf_shuffle",
-                          ["in buffer<u8>", "out buffer<u8>", "i32", "i32", "i32", "i32"]),
+                          ["in buffer<u8>", "out buffer<u8>", *["i32"] * 6]),
 })
 once.FILL["bf16"] = ("fill_bf16", "f32")
