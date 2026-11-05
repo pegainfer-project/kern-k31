@@ -78,8 +78,9 @@ def d_absorb_op():
     """mma.sync's kernel, whose e4m3 casts (software, no saturation) go two at a time."""
     return {
         "params": ["in buffer<f32>", "in buffer<bf16>", "out buffer<fp8e4m3>", "i32"],
-        "impl": {"launches": [launch("k3_mla_absorb_mma", "kern_k3_mla_absorb_mma", grid=[1, HEADS, 4],
-                                     block=[256, 1, 1], defines={"Q_FP8": 1})]},
+        "impl": {"launches": [launch("k3_mla_absorb_mma", "kern_k3_mla_absorb_mma",
+                                     grid=[{"ceil_div": [T, 64]}, HEADS, 4], block=[256, 1, 1],
+                                     defines={"Q_FP8": 1})]},
     }
 
 

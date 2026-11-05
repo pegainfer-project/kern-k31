@@ -186,13 +186,13 @@ source = "source/peer_allreduce_bf16.cu"
 defines = { NRANKS = 8 }
 
 [kernels."k3_mla_absorb_mma+Q_FP8=1"]
-sha256 = "2c5ba09f971561547e148f2075a4288da3af41725438beeac55ee0c6043c3bbe"
+sha256 = "bacd83011397223d278632318dfd821614e6a466adf63396729f5d7b776dac92"
 source = "source/k3_mla_absorb_mma.cu"
 defines = { Q_FP8 = 1 }
 
 
 [kernels."k3_mla_absorb_mma+OUT_HEADS=128+Q_FP8=1"]
-sha256 = "d0d06d0ca048ffbb7e5aa3f6dd8de0524d99644f0dd560926934bac1f3b537a5"
+sha256 = "e55f3af41358292a03ab8c133a90aa5dcf8a6fb3114a4b27915729dc9c8c4e7a"
 source = "source/k3_mla_absorb_mma.cu"
 defines = { Q_FP8 = 1, OUT_HEADS = 128 }
 

@@ -1,14 +1,18 @@
 // K3 MLA decode, absorb on tensor cores: the same contract as k3_mla_absorb.cu
-// (docs/k3-kernel-abi.md K5a), for a decode batch of at most 64 rows.
+// (docs/k3-kernel-abi.md K5a), for a decode batch of any size, 64 rows a block column.
 //
 //   extern "C" __global__ void kern_k3_mla_absorb_mma(
 //       const f32*  q_partial,   // [B, HEADS*192]  f32 partial, nope 128 | rope 64
 //       const bf16* w_kv_b,      // [HEADS*256, 512]  W_UK = rows h*256+0..128
 //       bf16*       q_abs,       // [B, HEADS, 576]  latent 512 | rope 64 (e4m3 bytes under Q_FP8)
-//       int B);                  // B <= 64
+//       int B);
 //
-//   grid  (1, HEADS, LAT / CS = 4)   block (2 * CS = 256, 1, 1)   smem 0 dynamic (52 KB static)
-//   3 blocks an SM (80 registers): the 384 blocks are one wave
+//   grid  (ceil(B / 64), HEADS, LAT / CS = 4)   block (2 * CS = 256, 1, 1)   smem 0 dynamic (52 KB static)
+//   3 blocks an SM (80 registers): the 384 blocks of up to 64 rows are one wave
+//
+// Block x takes rows [64 x, 64 x + 64) as if they were the whole batch: a row's MMA chain never
+// involves another row, so every row's bits are those of a batch of at most 64 (W_UK is read once
+// a block column).
 //
 // Block (h, cs) owns columns cs*CS .. +CS of head h for every row: W_UK's
 // 128 x CS slice is read once (the scalar kernel re-read it per 8-row group,
@@ -70,6 +74,9 @@ typedef __nv_bfloat16 q_t;
 extern "C" __global__ void __launch_bounds__(THREADS, 3) kern_k3_mla_absorb_mma(const float* __restrict__ q_partial,
                                                                         const __nv_bfloat16* __restrict__ w_kv_b,
                                                                         q_t* __restrict__ q_abs, int B) {
+  q_partial += (size_t)blockIdx.x * BMAX * (HEADS * QW);
+  q_abs += (size_t)blockIdx.x * BMAX * OUT_HEADS * ROW;
+  B = min(BMAX, B - (int)blockIdx.x * BMAX);
   __shared__ __align__(32) __nv_bfloat16 qs[BMAX][QP];
   __shared__ __align__(32) __nv_bfloat16 ws[NOPE][WP];
   const int h = blockIdx.y, c0 = blockIdx.z * CS, t = threadIdx.x, warp = t / 32, lane = t % 32;
