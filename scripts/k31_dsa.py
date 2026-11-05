@@ -99,7 +99,8 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1):
                                   [64, 1, 128], 0),
                              {"param": 3}])
                 if chunk else
-                launch("k3_mla_absorb_mma", "kern_k3_mla_absorb_mma", grid=[1, HEADS, 4], block=[256, 1, 1],
+                launch("k3_mla_absorb_mma", "kern_k3_mla_absorb_mma", grid=[{"ceil_div": [T, 64]}, HEADS, 4],
+                       block=[256, 1, 1],
                        defines={"Q_FP8": 1, "OUT_HEADS": sparse.HEADS})]},
         },
         "sparse_mla": sparse.op(rows_max, T, pdl=not chunk),
