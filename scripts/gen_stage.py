@@ -1396,8 +1396,8 @@ def main():
     a = ap.parse_args()
     if a.chunk and a.tp > 1:
         ap.error("--tp is D's; P runs on one GPU")
-    if not a.chunk and a.seqs > 64:
-        ap.error("D absorbs on tensor cores for at most 64 rows (k3_mla_absorb_mma BMAX)")
+    if not a.chunk and a.seqs > D_SEQS_MAX:
+        ap.error(f"D takes at most {D_SEQS_MAX} rows (k3_head.cu's and k3_moe_front.cu's tables)")
     names = tuple(a.moe_variants.split(",")) if a.moe_variants else None
     json.dump(build(a.layers, a.max_ctx, a.seqs, a.tp, a.mla_split_max, a.chunk, names, a.pack,
                     a.mla_short, a.kv, a.mla_ours_from, a.window),
