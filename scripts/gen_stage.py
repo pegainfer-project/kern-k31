@@ -944,8 +944,9 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
     # ---- program
     prog = []
 
-    def step(label, op, *args):
-        prog.append({"label": label, "op": op, "args": list(args)})
+    def step(label, op, *args, lane=0, after=()):
+        prog.append({"label": label, "op": op, "args": list(args),
+                     **({"lane": lane} if lane else {}), **({"after": list(after)} if after else {})})
 
     def f32_op(n, k):
         """D's own split-K GEMM (gemm_t_op) for its shapes, else cuBLAS."""
@@ -1149,13 +1150,14 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                          b("slot_mapping"), {"state": kv}, i64(0), i64(page_stride), b("q_norm"), b("mla_gate"), B,
                          *((w("idx_kn_w"), w("idx_kn_b"), {"state": f"idx.{i}"}) if idx_fold else ()))
                     if dsa:
+                        # q_b and the absorb read only q_norm: lane 1 runs them beside the indexer chain
                         step(L + "q_b", "q_b", b("q_norm"), w("w_q_b"), b("q_partial"), b("q_bf16"), B, i32(Q_B),
-                             i32(Q_LORA), i32(Q_B))
+                             i32(Q_LORA), i32(Q_B), lane=1, after=[0])
                     else:
                         gemm(L + "q_b", b("q_norm"), w("w_q_b"), b("q_partial"), Q_B, Q_LORA)
                     if dsa:
                         k31_dsa.steps(step, w, L, kv, f"idx.{i}", False, b("mla_gate"), max_pages, max_ctx // tp,
-                                      (b("q_partial"), b("q_bf16")), sched=i == mla_layers[0],
+                                      (b("q_partial"), b("q_bf16")), sched=i == mla_layers[0], side=1,
                                       kw=(b("mla_fused_partial", mla_fused_l * 4), wfu_l) if idx_fold else None,
                                       exchange=(
                                           b("dcp_lamport"), b("dcp_lamport_peers"), b("dcp_state"), b("tp_err"),

@@ -362,14 +362,19 @@ def buffers(work, bufs, chunk, max_ctx, seqs_max, tp=1, fold=False):
                 bufs[x + "_peers"] = {"dtype": "u64", "shape": [tp], "kind": "peer", "of": x, "group": "tp"}
 
 
-def steps(step, w, L, kv, idx, chunk, gate, max_pages, max_ctx, q, exchange=None, select=None, sched=True, kw=None):
+def steps(step, w, L, kv, idx, chunk, gate, max_pages, max_ctx, q, exchange=None, select=None, sched=True, kw=None,
+          side=0):
     """The layer from its input projections to `gated`: `gate` the gate's columns (at ops' stride), `q` the
     q_b output (P's bf16, D's f32 and bf16 pair), the latent row and q_norm already in place. Under DCP, `exchange`
     (the dcp_exchange call's trailing args) merges the members' partials into this member's heads, and
     `select` (err, timeout, stage bytes) is the candidates' exchange. D's paged logits read DeepGEMM's
     schedule, a function of seq_lens and the rows alone: `sched` false takes the one an earlier layer of
     the step left in `idx_sched`. `kw` (the f32 wk | weights_proj columns, their row stride) when the wfu
-    GEMM projected them (mla_prep has written the key), else idx_kw does, bf16."""
+    GEMM projected them (mla_prep has written the key), else idx_kw does, bf16. `side` a lane the absorb runs on
+    beside the indexer chain, after the q_b already there; the attention joins it."""
+    absorb = (L + "absorb", "absorb", *(q if isinstance(q, tuple) else (q,)), w("w_kv_b"), b("mla_q_abs"), B)
+    if side:
+        step(*absorb, lane=side)
     if kw:
         kwo, ld = kw
         iw = dict(kwo, offset=kwo.get("offset", 0) + ID * 4)
@@ -410,9 +415,10 @@ def steps(step, w, L, kv, idx, chunk, gate, max_pages, max_ctx, q, exchange=None
     else:
         step(L + "idx_slots", "idx_slots", b("idx_ind"), b("block_table"), i32(max_pages), b("seq_lens"),
              b("idx_tlen"), B)
-    step(L + "absorb", "absorb", *(q if isinstance(q, tuple) else (q,)), w("w_kv_b"), b("mla_q_abs"), B)
+    if not side:
+        step(*absorb)
     step(L + "attn", "sparse_mla", b("mla_q_abs"), {"state": kv}, b("idx_sel" if exchange else "idx_ind"),
-         b("idx_tlen"), b("mla_o"), b("mla_md"))
+         b("idx_tlen"), b("mla_o"), b("mla_md"), **({"after": [side]} if side else {}))
     if exchange:
         step(L + "dcp", "dcp_exchange", b("mla_o"), b("mla_md"), b("idx_live"), w("w_kv_b"), gate, b("gated"),
              *exchange)
