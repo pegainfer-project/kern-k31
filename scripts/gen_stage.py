@@ -809,6 +809,8 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         work("q_norm", Q_LORA)
     if decode and mla:
         work("q_partial", Q_B, "f32")
+        if dsa:
+            work("q_bf16", Q_B)
         work("q_abs", HEADS * LATENT_ROW, flavor.Q_ABS)
         if not dsa:
             buffers["mla_bsk"] = {"dtype": "i32", "shape": [T], "kind": "workspace"}
@@ -1089,10 +1091,14 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                 else:
                     step(L + "mla_prep", "mla_prep", b("mla_fused_partial"), w("gamma_q_a"), w("gamma_kv_a"),
                          b("slot_mapping"), {"state": kv}, i64(0), i64(page_stride), b("q_norm"), b("mla_gate"), B)
-                    gemm(L + "q_b", b("q_norm"), w("w_q_b"), b("q_partial"), Q_B, Q_LORA)
+                    if dsa:
+                        step(L + "q_b", "q_b", b("q_norm"), w("w_q_b"), b("q_partial"), b("q_bf16"), B, i32(Q_B),
+                             i32(Q_LORA), i32(Q_B))
+                    else:
+                        gemm(L + "q_b", b("q_norm"), w("w_q_b"), b("q_partial"), Q_B, Q_LORA)
                     if dsa:
                         k31_dsa.steps(step, w, L, kv, f"idx.{i}", False, b("mla_gate"), max_pages, max_ctx // tp,
-                                      b("q_partial"), sched=i == mla_layers[0],
+                                      (b("q_partial"), b("q_bf16")), sched=i == mla_layers[0],
                                       kw=(b("mla_fused_partial", mla_fused_l * 4), wfu_l) if idx_fold else None,
                                       exchange=(
                                           b("dcp_lamport"), b("dcp_lamport_peers"), b("dcp_state"), b("tp_err"),

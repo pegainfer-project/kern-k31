@@ -34,6 +34,9 @@ PAGED_SMEM = 218112
 META = "_ZN9deep_gemm5sched31sm100_paged_mqa_logits_metadataILj384ELj152ELj4ELj256EEEvjPKjS3_Pj"
 META_THREADS = 256
 SPLIT_KV = 384  # DeepGEMM's KV split: the paged kernel's logits rows are whole splits
+# D's absorb from this many rows on runs P's tcgen05 build over a bf16 q_b, below it the mma.sync build over
+# the f32 one (absorb_bench: equal at 64 rows, 9.4 against 15.4 us at 128)
+ABSORB_TC_MIN = 65
 # k31_absorb_tc's grid is odd so a block's items alternate halves (the rope rides on the first)
 ABSORB_TC_SMEM = 1024 + 3 * (16384 + 4 * 8192) + 32768 + 16384 + 8192 + 256  # its SMEM_BYTES
 VUP_SMEM = 3 * (64 + 128) * 72 * 2
@@ -56,6 +59,19 @@ def stride(ctx):
 def tmap(param, dtype, dims, strides, box, swizzle):
     return {"pack": {"size": 128, "fields": [{"at": 0, "tensormap": {
         "param": param, "dtype": dtype, "dims": dims, "strides": strides, "box": box, "swizzle": swizzle}}]}}
+
+
+def absorb_tc(q=0, w=1, y=2, rows=3, **kw):
+    """k31_absorb_tc's launch, its q, w_kv_b and q_abs maps over the op's params `q`, `w`, `y`."""
+    return launch("k31_absorb_tc", "kern_k31_absorb_tc", grid=[SMS - 1, 1, 1], block=[384, 1, 1],
+                  smem=ABSORB_TC_SMEM, params=[*[TMAP] * 4, "i32"],
+                  args=[tmap(q, "bf16", [192, HEADS, 0], [192 * 2, HEADS * 192 * 2], [64, 1, 128], 128),
+                        tmap(w, "bf16", [KV_LORA, 0], [KV_LORA * 2], [64, 64], 128),
+                        tmap(y, "u8", [sparse.D_QK, sparse.HEADS, 0], [sparse.D_QK, sparse.HEADS * sparse.D_QK],
+                             [128, 1, 128], 128),
+                        tmap(y, "u8", [sparse.D_QK, sparse.HEADS, 0], [sparse.D_QK, sparse.HEADS * sparse.D_QK],
+                             [64, 1, 128], 0),
+                        {"param": rows}], **kw)
 
 
 def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1, fold=False):
@@ -93,23 +109,31 @@ def ops(chunk, rows_max, seqs_max, max_ctx, max_pages, gate_stride, tp=1, fold=F
                 args=[{"param": 0}, {"param": 3}, {"param": 1}, {"param": 2}], **pdl)]},
         },
         "absorb": {
-            "params": ["in buffer<bf16>" if chunk else "in buffer<f32>", "in buffer<bf16>", "out buffer<fp8e4m3>",
+            "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<fp8e4m3>", "i32"],
+            "impl": {"launches": [absorb_tc()]},
+        } if chunk else {
+            # (q f32, q bf16, w_kv_b, q_abs, B): each build over its own q_b output (the q_b op)
+            "params": ["in buffer<f32>", "in buffer<bf16>", "in buffer<bf16>", "out buffer<fp8e4m3>", "i32"],
+            "impl": {"launches": [
+                launch("k3_mla_absorb_mma", "kern_k3_mla_absorb_mma", grid=[{"ceil_div": [T, 64]}, HEADS, 4],
+                       block=[256, 1, 1], defines={"Q_FP8": 1, "OUT_HEADS": sparse.HEADS},
+                       params=["in buffer<f32>", "in buffer<bf16>", "out buffer<fp8e4m3>", "i32"],
+                       args=[{"param": 0}, {"param": 2}, {"param": 3}, {"param": 4}],
+                       when={"var": T, "max": ABSORB_TC_MIN - 1}),
+                absorb_tc(q=1, w=2, y=3, rows=4, when={"var": T, "min": ABSORB_TC_MIN})]},
+        },
+        # D's q_b: f32 below ABSORB_TC_MIN rows, bf16 from it on, each for its absorb build
+        **({} if chunk else {"q_b": {
+            "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "out buffer<bf16>", "i32", "i32", "i32",
                        "i32"],
             "impl": {"launches": [
-                launch("k31_absorb_tc", "kern_k31_absorb_tc", grid=[SMS - 1, 1, 1], block=[384, 1, 1],
-                       smem=ABSORB_TC_SMEM, params=[*[TMAP] * 4, "i32"],
-                       args=[tmap(0, "bf16", [192, HEADS, 0], [192 * 2, HEADS * 192 * 2], [64, 1, 128], 128),
-                             tmap(1, "bf16", [KV_LORA, 0], [KV_LORA * 2], [64, 64], 128),
-                             tmap(2, "u8", [sparse.D_QK, sparse.HEADS, 0], [sparse.D_QK, sparse.HEADS * sparse.D_QK],
-                                  [128, 1, 128], 128),
-                             tmap(2, "u8", [sparse.D_QK, sparse.HEADS, 0], [sparse.D_QK, sparse.HEADS * sparse.D_QK],
-                                  [64, 1, 128], 0),
-                             {"param": 3}])
-                if chunk else
-                launch("k3_mla_absorb_mma", "kern_k3_mla_absorb_mma", grid=[{"ceil_div": [T, 64]}, HEADS, 4],
-                       block=[256, 1, 1],
-                       defines={"Q_FP8": 1, "OUT_HEADS": sparse.HEADS})]},
-        },
+                {"entry": "extern:cublas_bf16_tn_f32", "when": {"var": T, "max": ABSORB_TC_MIN - 1},
+                 "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<f32>", "i32", "i32", "i32", "i32"],
+                 "args": [{"param": i} for i in (0, 1, 2, 4, 5, 6, 7)]},
+                {"entry": "extern:cublaslt_bf16_tn", "when": {"var": T, "min": ABSORB_TC_MIN},
+                 "params": ["in buffer<bf16>", "in buffer<bf16>", "out buffer<bf16>", "i32", "i32", "i32", "i32"],
+                 "args": [{"param": i} for i in (0, 1, 3, 4, 5, 6, 7)]}]},
+        }}),
         "sparse_mla": sparse.op(rows_max, T, pdl=not chunk),
         # (o_lat, w_kv_b, gate, gated, B): P's chunk on tcgen05, D's batch on mma.sync
         "vup_gate": {
@@ -338,7 +362,7 @@ def buffers(work, bufs, chunk, max_ctx, seqs_max, tp=1, fold=False):
 
 def steps(step, w, L, kv, idx, chunk, gate, max_pages, max_ctx, q, exchange=None, select=None, sched=True, kw=None):
     """The layer from its input projections to `gated`: `gate` the gate's columns (at ops' stride), `q` the
-    q_b output (P's bf16, D's f32), the latent row and q_norm already in place. Under DCP, `exchange`
+    q_b output (P's bf16, D's f32 and bf16 pair), the latent row and q_norm already in place. Under DCP, `exchange`
     (the dcp_exchange call's trailing args) merges the members' partials into this member's heads, and
     `select` (err, timeout, stage bytes) is the candidates' exchange. D's paged logits read DeepGEMM's
     schedule, a function of seq_lens and the rows alone: `sched` false takes the one an earlier layer of
@@ -383,7 +407,7 @@ def steps(step, w, L, kv, idx, chunk, gate, max_pages, max_ctx, q, exchange=None
     else:
         step(L + "idx_slots", "idx_slots", b("idx_ind"), b("block_table"), i32(max_pages), b("seq_lens"),
              b("idx_tlen"), B)
-    step(L + "absorb", "absorb", q, w("w_kv_b"), b("mla_q_abs"), B)
+    step(L + "absorb", "absorb", *(q if isinstance(q, tuple) else (q,)), w("w_kv_b"), b("mla_q_abs"), B)
     step(L + "attn", "sparse_mla", b("mla_q_abs"), {"state": kv}, b("idx_sel" if exchange else "idx_ind"),
          b("idx_tlen"), b("mla_o"), b("mla_md"))
     if exchange:
