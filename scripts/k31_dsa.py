@@ -317,11 +317,13 @@ def buffers(work, bufs, chunk, max_ctx, seqs_max, tp=1):
             work("idx_live", 1, "i32")
 
 
-def steps(step, w, L, kv, idx, chunk, gate, max_pages, max_ctx, q, exchange=None, select=None):
+def steps(step, w, L, kv, idx, chunk, gate, max_pages, max_ctx, q, exchange=None, select=None, sched=True):
     """The layer from its input projections to `gated`: `gate` the gate's columns (at ops' stride), `q` the
     q_b output (P's bf16, D's f32), the latent row and q_norm already in place. Under DCP, `exchange`
     (the dcp_exchange call's trailing args) merges the members' partials into this member's heads, and
-    `select` (err, timeout, stage bytes) is the candidates' exchange."""
+    `select` (err, timeout, stage bytes) is the candidates' exchange. D's paged logits read DeepGEMM's
+    schedule, a function of seq_lens and the rows alone: `sched` false takes the one an earlier layer of
+    the step left in `idx_sched`."""
     step(L + "idx_kw", "gemm_bf16", b("normed"), w("idx_kw"), b("idx_kwo"), B, i32(IDX_KW), i32(7168), i32(IDX_KW))
     step(L + "idx_key", "idx_key", b("idx_kwo"), i32(IDX_KW), w("idx_kn_w"), w("idx_kn_b"), b("slot_mapping"),
          {"state": idx}, B)
@@ -337,7 +339,8 @@ def steps(step, w, L, kv, idx, chunk, gate, max_pages, max_ctx, q, exchange=None
              b("idx_ks"), b("idx_ke"), b("idx_logits"), B, {"var": CTX})
         ends = b("idx_klen")
     else:
-        step(L + "idx_sched", "idx_sched", b("seq_lens"), b("idx_rid"), b("idx_sched"), B)
+        if sched:
+            step(L + "idx_sched", "idx_sched", b("seq_lens"), b("idx_rid"), b("idx_sched"), B)
         step(L + "idx_logits", "idx_logits", b("idx_iq"), b("idx_sfq"), b("idx_w"), {"state": idx},
              {"state": idx, "offset": ID}, b("seq_lens"), b("block_table"), b("idx_rid"), b("idx_sched"),
              b("idx_logits"), B)
