@@ -462,6 +462,10 @@ __device__ __forceinline__ void exact(Smem& s, const bf16* row, unsigned n) {
 template <bool HELD>
 __device__ __forceinline__ void topk(const bf16* __restrict__ logits, int stride, const int* __restrict__ lens,
                                      int* __restrict__ out) {
+  // D launches the held build as a programmatic dependent: the next kernel onto the SMs at once, the
+  // logits read once the kernel before is done
+  asm volatile("griddepcontrol.launch_dependents;");
+  asm volatile("griddepcontrol.wait;" ::: "memory");
   extern __shared__ __align__(16) unsigned char raw[];
   Smem& s = *reinterpret_cast<Smem*>(raw);
   const int t = threadIdx.x;

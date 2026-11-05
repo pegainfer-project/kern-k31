@@ -24,7 +24,7 @@ SCALE_LOG2 = 0.10411754995584488  # 192^-0.5 * log2(e), as FlashInfer rounds it
 SCRATCH = 1 << 20
 
 
-def op(rows_max, rows, kv="in state"):
+def op(rows_max, rows, kv="in state", pdl=False):
     """Interface: q (e4m3 [rows, 128, 576]) | kv (the layer's fp8 pages, [., 64, 576]) | ind (i32 [rows, 2048],
     cache rows, -1 past the count) | lens (i32 [rows], each >= 1) | o (bf16 [rows, 128, 512]) |
     stats (f32 [rows, 128, 2]: max, sum). `rows` is the call's row count (a var name or an expression); `kv` the
@@ -65,7 +65,7 @@ def op(rows_max, rows, kv="in state"):
     launch = {
         **module(MODULE), "entry": ENTRY, "block": [512, 1, 1], "grid": [2, 1, n.get("var", n.get("expr"))],
         "cluster": [2, 1, 1], "shared_mem": SMEM, "params": [f"bytes<{PARAMS}>"],
-        "args": [{"pack": {"size": PARAMS, "fields": fields}}],
+        "args": [{"pack": {"size": PARAMS, "fields": fields}}], **({"pdl": True} if pdl else {}),
     }
     return {
         "params": ["in buffer<fp8e4m3>", kv, "in buffer<i32>", "in buffer<i32>", "out buffer<bf16>",

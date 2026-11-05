@@ -36,7 +36,7 @@ includes = ["deepgemm"]
 # K3.1's DSA glue: the indexer key into its cache, the query and head weights, the key stream the
 # MQA logits read, the top-k as cache slots. Ours, after vLLM's K3.1 math.
 [kernels."k31_dsa"]
-sha256 = "f3561294f18d18b493ed846129bec6cdb53ebbf4b1b716f4a9060aeef835a396"
+sha256 = "b74f4779e6228aea5dfae28b2d7661dbcee7f82940f69458ea0343dffeefcc61"
 source = "source/k31_dsa.cu"
 flags = "plain"
 
@@ -46,7 +46,7 @@ source = "source/vllm-topk/topk.cu"
 flags = "plain"
 
 [kernels."k31_topk"]
-sha256 = "ed47c9b4930305e51376972dea02679ccacfa437d4d5cd40e6f7aae5719a6d97"
+sha256 = "6612a807685e947696a81341e39a64248a1e661599f959d51dee59e33cbb4be6"
 source = "source/k31_topk.cu"
 flags = "plain"
 
@@ -85,16 +85,16 @@ source = "source/flashinfer-moe-routing/kern_moe_routing.cu"
 build = "source/flashinfer-moe-routing/build.sh"
 
 [kernels."k3_dcp"]
-sha256 = "88ad388058c3907de8adbe553667f29f134977d2115e705e2ca75fddc5c95890"
+sha256 = "7b0a967cb51887770ab9b841d7a7f46d3c124fa8f45e95d2db94997673af4964"
 source = "source/k3_dcp.cu"
 
 [kernels."k3_dcp+CAKE=1"]
-sha256 = "e6f36607ab035880774036b15471c647c5277ab55aa6d81962d3b23cf568638c"
+sha256 = "4ccf5f144e0a1e8bce4ecfe5151d8d215b2ac8eaf6fa5df11eb098f2250364b0"
 source = "source/k3_dcp.cu"
 defines = { CAKE = 1 }
 
 [kernels."k3_dcp+SPARSE=1"]
-sha256 = "079c0615ec11db9e3b66929ee4ab255c74784fba786b555a0fdf7b347b27f3d2"
+sha256 = "6a8ccf8cc6a7415381e0d4a090c6d39ee2c8ca12c20d6258fd6171501535779a"
 source = "source/k3_dcp.cu"
 defines = { SPARSE = 1 }
 
@@ -108,16 +108,16 @@ sha256 = "2cd68c79bf3243f37d2f1406880060f610b4028f9e843bb356ea8ef0a0352fcc"
 source = "source/k3_land.cu"
 
 [kernels."k3_mla_prep"]
-sha256 = "e2637887194ef0ce631f85716b7ce919654edf3b9c6f41e70049d3c86e26e62e"
+sha256 = "64cae4d6c66ee3afb62808e1dc36c086afce98cac002d2504e599bfbff8fa927"
 source = "source/k3_mla_prep.cu"
 
 [kernels."k3_mla_prep+INNER=1536+MLA_FUSED=3648"]
-sha256 = "69a1277dced71841680c57c7928d497406e84a8ac709dbcf21c9c705942e47a5"
+sha256 = "250c46a5658be234f3291303845550d2b840143f187c66873d185ffedfb3f88e"
 source = "source/k3_mla_prep.cu"
 defines = { INNER = 1536, MLA_FUSED = 3648 }
 
 [kernels."k3_mla_prep+INNER=1536+KV_FP8=1+MLA_FUSED=3648"]
-sha256 = "ed18f10e6aaa61fdd32f130cc703dfd3e70be828abe28848ce3e256eeac14953"
+sha256 = "79b9eb0233f6158ab36db5f6405bb84565d5e51fdf2cddc5130f049e5f8d9882"
 source = "source/k3_mla_prep.cu"
 defines = { INNER = 1536, KV_FP8 = 1, MLA_FUSED = 3648 }
 
@@ -330,7 +330,7 @@ source = "source/k31_absorb_tc.cu"
 flags = "plain"
 
 [kernels."k3_mla_prep+KV_FP8=1"]
-sha256 = "53306380a16f1a15ef46fbb0ec0890e8cea478584a95010c2c0d7f36febd333f"
+sha256 = "5a50200ed653db5de782f6cc2023df0521c834965e33c04771f93a9e15a7ca7b"
 source = "source/k3_mla_prep.cu"
 defines = { KV_FP8 = 1 }
 

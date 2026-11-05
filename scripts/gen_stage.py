@@ -413,9 +413,11 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
                        "i64", "i64", "out buffer<bf16>", "out buffer<bf16>", "i32"],
             # k3_mla_prep.cu's fast path: the norm / append block and a gate block per 4096 columns
             "impl": {"launches": [launch("k3_mla_prep", "kern_k3_mla_prep", grid=[T, 1 + -(-inner_l // 4096), 1],
-                                         defines={"INNER": inner_l, "MLA_FUSED": mla_fused_l, **flavor.D_PREP})
+                                         defines={"INNER": inner_l, "MLA_FUSED": mla_fused_l, **flavor.D_PREP},
+                                         pdl=True)
                                   if tp > 1
-                                  else launch("k3_mla_prep", "kern_k3_mla_prep", defines=flavor.D_PREP or None)]},
+                                  else launch("k3_mla_prep", "kern_k3_mla_prep", defines=flavor.D_PREP or None,
+                                              pdl=True)]},
         },
         # every member absorbs the whole batch's 96 heads, at most `seqs` rows
         "mla_absorb": flavor.d_absorb_op(),
@@ -537,7 +539,7 @@ def build(end, max_ctx, seqs_max, tp=1, mla_split_max=16, chunk_max=0, moe_varia
         ops["dcp_exchange"] = ({
             # K3.1's sparse partials: one a row, (max, sum) a head, the row's live count on this member
             "params": ["in buffer<bf16>", "in buffer<f32>", "in buffer<i32>", *tail],
-            "impl": {"launches": [xg(defines={"SPARSE": 1})]},
+            "impl": {"launches": [xg(defines={"SPARSE": 1}, pdl=True)]},
         } if dsa else flavor.d_exchange_op(g, xg, tail))
         ops["dcp_init"] = {
             "params": ["inout buffer<u8>", "i64"],
