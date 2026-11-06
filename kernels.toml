@@ -55,6 +55,7 @@ source = "source/k31_dsa.cu"
 flags = "plain"
 defines = { CAND32 = 1 }
 
+# vLLM's prefill top-k as vendored: harness/topk/check.py's reference for k31_topk
 [kernels."vllm_topk"]
 sha256 = "b80a4549fabad26bfc8c3c123be15dda42660f87e98748bace4c409cf794dfec"
 source = "source/vllm-topk/topk.cu"
@@ -79,6 +80,7 @@ upstream = "flashinfer-cubin 0.6.18, cubins/8ec29a98612c3670f9f28825d1ed19f09496
 sha256 = "9de645ab4053412ee0832c633510308f4cd3c3fa5d25812924d9a799689f5fc9"
 source = "source/copy_rows.cu"
 
+# K3's fp8 D attention, which no manifest reaches under DSA
 [kernels."cake_k3_mla_wide"]
 sha256 = "ea9833f6b3a5b12350fb0743efdf85aad30fa7cc853934864f712266ce75548a"
 prebuilt = "prebuilt/cake_k3_mla_wide.cubin"

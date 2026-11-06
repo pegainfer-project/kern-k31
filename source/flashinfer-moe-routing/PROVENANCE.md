@@ -5,9 +5,10 @@ Commit: `6870e3ff` (2026-09-21, `nightly-v0.6.18-20260819-342`)
 License: Apache-2.0 (Copyright (c) 2022-2026, NVIDIA CORPORATION), `LICENSE` in
 this directory; every vendored file keeps its upstream header.
 
-These are TensorRT-LLM gen's MoE routing kernels as FlashInfer ships them. A
-D member holds 112 of the 896 experts (every 8th), more than kern's own
-routing glue (`k3_moe_prefill.cu`, 64 local experts at most) handles. The kernels turn the router's precomputed
+These are TensorRT-LLM gen's MoE routing kernels as FlashInfer ships them.
+D's one-GPU oracle routes all 896 experts through them, more than kern's own
+routing glue (`k3_moe_prefill.cu`, 64 local experts at most) handles; a TP8
+member's tables come from `k3_moe_front.cu` instead. The kernels turn the router's precomputed
 top-k ids into the tables the TRT-LLM gen batched GEMMs read. This is the same
 path SGLang takes for K3 (`trtllm_fp4_block_scale_routed_moe` with
 precomputed top-k).

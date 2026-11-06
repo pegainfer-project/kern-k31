@@ -6,13 +6,20 @@ submodule; vLLM's SM100 indexer runs the same kernels). License: MIT,
 `LICENSE` in this directory (upstream's).
 
 `deep_gemm/impls/sm100_mqa_logits.cuh` and `deep_gemm/layout/mqa_logits.cuh`
-are upstream's with one knob, `DG_SF_KV_STRIDE` (default 1, upstream's
-behavior): the paged kernel's per-key UE8M0 scale words sit that many words
-apart in shared memory. K3.1's key cache is token-major, 144 bytes a token
-(128 e4m3, the scale word, 12 pad), so that kern can push and deal it row by
-row; TMA moves at least 16 bytes in its inner dimension, so a page's 64 scale
-words land as one 3-D box of 64 x 16 bytes (`DG_SF_KV_STRIDE 4`), and the warp
-that transposes them for UTCCP reads every fourth word and writes them
-compact, each chunk at or below where it was read. The contiguous-KV kernel
-keeps stride 1. Every other file comes from the submodule unchanged;
+are upstream's with two knobs for the paged kernel, each off by default
+(upstream's behavior):
+
+- `DG_SF_KV_STRIDE` (default 1): the per-key UE8M0 scale words sit that many
+  words apart in shared memory. kern's key cache is token-major (the layout is
+  in `source/k31_dsa.cu`), and TMA moves at least 16 bytes in its inner
+  dimension, so a page's 64 scale words land as one 3-D box of 64 x 16 bytes
+  (`DG_SF_KV_STRIDE 4`), and the warp that transposes them for UTCCP reads
+  every fourth word and writes them compact, each chunk at or below where it
+  was read. The contiguous-KV kernel keeps stride 1.
+- `DG_SF_KV_F32` (default 0): the scale words are plain f32, as in SGLang's
+  index-K page. UTCCP gets each scale's exponent as UE8M0, and the math warps
+  multiply the key's logit by the mantissa the exponent left out, read from
+  the page.
+
+Every other file comes from the submodule unchanged;
 `kernels.toml` puts this directory first on the include path.

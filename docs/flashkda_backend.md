@@ -28,7 +28,7 @@ This study covers what P's `span_kda` should run. Every claim comes from reading
    - State pool: it reads and writes a bf16 pool line in place at kern's line stride. That path is bit-identical to the plain path and runs at the same speed.
    - Accuracy: its output is the closest of the bf16-state backends to an fp32 token-by-token reference.
    - Shipping: it ships as **generated CUDA C source** plus a prebuilt NVRTC cubin, with an `extern "C"` entry point. It is the easiest of the fast backends to vendor and modify.
-   - **But it is not graph-safe over changing lengths, so kern runs cuDNN FROST for now.** Its packed path publishes per-sequence tensormaps that the host builds from `cu_seqlens` (`PublishTensorMaps` after a pageable host-to-device copy). A graph captured at 8 × 256 and replayed at another length mix left the state wrong (relative error 0.76; `cake_probe.py`). kern replays one graph over every call with no host step. Adopting cake means first moving that descriptor publication onto the device, as FROST's prologue kernel does.
+   - **But it is not graph-safe over changing lengths, so kern runs cuDNN FROST for now.** Its packed path publishes per-sequence tensormaps that the host builds from `cu_seqlens` (`PublishTensorMaps` after a pageable host-to-device copy). A graph captured at 8 × 256 and replayed at another length mix left the state wrong (relative error 0.76). kern replays one graph over every call with no host step. Adopting cake means first moving that descriptor publication onto the device, as FROST's prologue kernel does.
 2. **Every fused backend is limited by the serial chain, not by FLOPs or bandwidth.** The prepare/chain and Triton backends also pay for an HBM round trip.
    - At T = 8192 the best kernel reaches about 14% of the bf16 peak and 41% of the HBM floor (§Roofline).
    - With one sequence, only 96 of the 152 SMs have a chain to run.
@@ -42,14 +42,14 @@ This study covers what P's `span_kda` should run. Every claim comes from reading
    - They only accept an fp32 state, have no pool support, and plan every call on the host. `ptx` also ships without source.
    - They are a later step, not the first one.
 5. **Neither serving engine runs the fastest backend by default** (§What vLLM and SGLang run by default).
-   - **vLLM's default (`auto`) resolves to FlashKDA on SM103.** That is 837 µs at T = 8192, the same as kern today.
+   - **vLLM's default (`auto`) resolves to FlashKDA on SM103.** That is 837 µs at T = 8192, what kern's P ran before FROST.
    - **vLLM's `flashinfer` option** calls FlashInfer's `auto`, which is cute-dsl here (459 µs).
    - **SGLang's default is FLA's Triton `chunk_kda`.** It takes 1942 µs at T = 8192, 5.0× cake, and SGLang never switches away from it automatically.
    - **SGLang's `nvidia_kda` option** only engages for packed multi-sequence batches, padded to 2k/4k/8k/16k buckets. 8 × 256 and 8 × 2048 both cost about 1265 µs that way; a single sequence stays on Triton.
-6. **Moving to cake changes what `span_kda` does in three ways.**
-   - **Output gate and conv-window advance.** `k3_kda_rec` runs these on the 56 SMs the heads leave idle. With cake they need their own kernel, or an edit to cake's epilogue warps.
-   - **State precision.** The carried state is rounded to bf16 at every 32-token chunk boundary. kern's `k3_kda_rec` keeps fp32 in registers.
-   - **What we gain:** about 680 MB of workspace at T = 8192, one launch instead of two, and no 8192-row limit.
+6. **Moving from FlashKDA to a fused backend changed what `span_kda` does.**
+   - **Output gate and conv-window advance.** `k3_kda_rec` ran these on the 56 SMs the heads left idle. With FROST they run in their own kernel after it (`source/k3_kda_epilogue.cu`); with cake they could fold into its epilogue warps.
+   - **State precision.** cake rounds the carried state to bf16 at every 32-token chunk boundary; FROST keeps it fp32 in TMEM, as `k3_kda_rec` kept it fp32 in registers.
+   - **What the move gained:** about 680 MB of workspace at T = 8192, one launch instead of two, and no 8192-row limit.
 
 ### Speed (graph-replayed, µs per call, nonzero bf16 state in and final state out)
 
@@ -58,7 +58,7 @@ This study covers what P's `span_kda` should run. Every claim comes from reading
 | FLA Triton `chunk_kda`, vLLM's K3 copy (`kda_prefill_backend=triton`) | 64 | 9 | 168.2 | 439.0 | 2169.8 | 585.8 | 4143.7 |
 | FLA Triton `chunk_kda`, SGLang's copy (SGLang default), pool in place | 64 | 9 | 146.3 | 394.6 | 1942.2 | 530.7 | 3758.4 |
 | SGLang `nvidia_kda` core, equal-length group padded to its bucket | 64 | 3 + copy | 88.3 | 160.0 | 675.0 | 1265.1 (padded to 8 × 2048) | 1267.3 |
-| FlashKDA (vLLM op; kern's `span_kda` runs at the same speed) | 16 | 2 + copy | 66.4 | 169.5 | 837.2 | 172.5 | 1156.6 |
+| FlashKDA (vLLM op; kern's former `span_kda` ran at the same speed) | 16 | 2 + copy | 66.4 | 169.5 | 837.2 | 172.5 | 1156.6 |
 | FlashInfer small-bh | 16 | 2 | 43.2 | 107.4 | 530.6 | 138.4 | 903.1 |
 | FlashInfer cute-dsl (= `auto`) | 16 | 1 + metadata | 35.3 | 93.2 | 459.4 | 121.0 | 710.9 |
 | cuDNN FROST, via FlashInfer | 16 | 1 + prologue + copy | 39.5 | 96.0 | 450.0 | 123.0 | 697.0 |
@@ -71,13 +71,12 @@ This study covers what P's `span_kda` should run. Every claim comes from reading
 
 Notes on the table:
 - 8 × n means 8 sequences of n tokens packed into one call.
-- Sources: `bench_graph_all.py`, `bench_pool.py`, `bench_fp32_backends.py`, `bench_defaults.py`.
 - The `nvidia_kda` row times only the core call that SGLang's wrapper makes per group. In serving, a single sequence never reaches it (it stays on Triton), so its T = 512 / 1536 / 8192 cells show what the kernel costs, not what SGLang runs. The wrapper's l2norm, staging copies and state transposes are not timed.
 - The ptx and cute-dsl-persistent rows were run with an fp32 state, because that is their contract. Converting a bf16 line to fp32 and back would add a few µs per call; that cost was not measured.
 
 ### Agreement with an fp32 token-by-token recurrence
 
-The reference is a token-by-token fp32 recurrence with no chunking (`agree_ref.py`). The table gives the relative L2 error of the output and of the final state.
+The reference is a token-by-token fp32 recurrence with no chunking. The table gives the relative L2 error of the output and of the final state.
 
 | | FLA Triton (vLLM) | FLA Triton (SGLang) | SGLang nvidia_kda | FlashKDA | small-bh | cute-dsl | cuDNN | cake | cute-dsl-persistent | ptx |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -85,20 +84,20 @@ The reference is a token-by-token fp32 recurrence with no chunking (`agree_ref.p
 | Final state, T = 8192 | 2.89e-3 | 3.34e-3 | 2.80e-3 | 4.85e-3 | 3.21e-3 | 3.61e-3 | 3.61e-3 | 3.69e-3 | 4.00e-3 | 3.30e-3 |
 
 - T = 1536 gives the same picture.
-- FlashKDA with an "f32 state" is bit-identical to FlashKDA with a bf16 state, because its recurrence is bf16 either way (`agree_all.py`). It is therefore not a valid reference, and earlier agreement numbers measured against it were relative to a bf16 recurrence.
-- kern's own `k3_kda_rec` keeps an fp32 state in registers and was not measured here.
+- FlashKDA with an "f32 state" is bit-identical to FlashKDA with a bf16 state, because its recurrence is bf16 either way. It is therefore not a valid reference, and earlier agreement numbers measured against it were relative to a bf16 recurrence.
+- kern's former `k3_kda_rec` kept an fp32 state in registers and was not measured here.
 
 ### Contract and shipping
 
 | | FlashKDA (+ kern `k3_kda_rec`) | small-bh | cute-dsl | cuDNN FROST | cake | cute-dsl-persistent | ptx | tirx |
 |---|---|---|---|---|---|---|---|---|
 | bf16 state in and out | yes | yes | yes | yes | yes | no, fp32 only | no, fp32 only | no, fp32 only |
-| Carried-state precision | bf16 smem, rounded every 16 tokens; `k3_kda_rec` keeps fp32 in registers | fp32 registers, bf16 copy per chunk | fp32 TMEM | fp32 TMEM | bf16 at every 32-token boundary (decay MMA reads the bf16 copy) | fp32 TMEM | fp32 TMEM (inferred) | fp32 TMEM, scaled frame |
-| State pool, in place | no (`k3_kda_rec` adds `line_index`) | no | `ssm_state_indices` | `state_indices`, free row stride | `ssm_state_indices`, free row stride, measured bit-exact | no | no | no |
+| Carried-state precision | bf16 smem, rounded every 16 tokens; `k3_kda_rec` kept fp32 in registers | fp32 registers, bf16 copy per chunk | fp32 TMEM | fp32 TMEM | bf16 at every 32-token boundary (decay MMA reads the bf16 copy) | fp32 TMEM | fp32 TMEM (inferred) | fp32 TMEM, scaled frame |
+| State pool, in place | no (`k3_kda_rec` added `line_index`) | no | `ssm_state_indices` | `state_indices`, free row stride | `ssm_state_indices`, free row stride, measured bit-exact | no | no | no |
 | Checkpoints | one per sequence in the vLLM binding (inferred) | no | yes, every multiple of 32 | yes, at kernel level, relative to the call | yes, relative to the call; switches module | no | no | no |
 | int64 `cu_seqlens` under graph capture | yes | yes | required | yes (compile key) | required | yes | yes | yes |
 | Length limit | H·T < 2³¹; `k3_kda_rec` ≤ 8192 rows | none found | H·T·128 < 2³¹ | none found | none found | B·T·H·128 < 2³¹ | ≤ 16384 per sequence | total < 2²¹ |
-| Ships as | AOT cubin (already in kern) | CuTe DSL JIT | CuTe DSL JIT, one build for all shapes | CuTe DSL JIT; AOT dump proven | generated CUDA C + NVRTC cubin, prebuilt | CuTe DSL JIT | static PTX, ptxas at first use | TVM TIRx JIT |
+| Ships as | AOT cubin (kern's P before FROST) | CuTe DSL JIT | CuTe DSL JIT, one build for all shapes | CuTe DSL JIT; AOT dump proven | generated CUDA C + NVRTC cubin, prebuilt | CuTe DSL JIT | static PTX, ptxas at first use | TVM TIRx JIT |
 | Host work per call | none | caches max length | metadata kernel | none | per-sequence tensormaps built on the host from `cu_seqlens` and copied in (captured: a replay keeps the capture's) | `cu_seqlens.tolist()` sync + plan | plan + `abs().max()` sync | plan |
 
 ## Roofline
@@ -144,7 +143,7 @@ The reference is a token-by-token fp32 recurrence with no chunking (`agree_ref.p
   - Run one sequence on more than 96 CTAs. That requires splitting chains and handing the state between CTAs (ptx, cute-dsl-persistent and cuDNN's `piece_chain` can do this), or using a d_v split. Today these only pay off when a pack has more chains than SMs.
 - **Packs.** At 8 × 2048 (768 chains, 5.05 waves), one CTA per chain pays for 6 full waves. That is why ptx and cute-dsl-persistent, which split chains over exactly 152 CTAs, win there by 15%.
 
-ncu counters for the main kernel at T = 8192 (`ncu_all.sh`, `ncu_tc.sh`, `ncu_fp32.sh` and the `ncu_*table.py` condensers):
+ncu counters for the main kernel at T = 8192:
 
 | Kernel | Grid × block | Dynamic smem | Regs | mma.sync | UMMA | TMEM ld/st instructions | DRAM read / write |
 |---|---|---|---|---|---|---|---|
@@ -228,12 +227,12 @@ SGLang forces K3 decode to Triton (`arg_groups/kimi_k3_hook.py`), whatever the p
 
 ## Backends in detail
 
-### FlashKDA (what kern runs today)
+### FlashKDA (what kern ran before FROST)
 
 **Where the source is.**
-- Vendored upstream at `source/flash-kda/` (commit 7afb9f4).
+- Upstream commit 7afb9f4, once vendored here and since removed.
 - vLLM's `_flashkda_C` is the same design. Its fat binary has only sm_90a, sm_100 and sm_120 code, so GB300 runs the sm_100 code: HMMA plus TMA, with no tcgen05 or TMEM.
-- kern's P runs FlashKDA's prepare kernel followed by its own `source/k3_kda_rec.cu`.
+- kern's P ran FlashKDA's prepare kernel followed by its own `k3_kda_rec`, both since removed.
 
 **Algorithm.** BT = 16, fixed (`fwd_launch.cu:31`).
 
@@ -261,13 +260,13 @@ SGLang forces K3 decode to Triton (`arg_groups/kimi_k3_hook.py`), whatever the p
 - The state lives as a bf16 tile in shared memory and is rounded every 16 tokens (:718-719). `StateFP32` only changes the input/output format.
 - One step is 104 dependent HMMAs per warp plus a 32 KB shared-memory read-modify-write of the state, about 1.16 µs.
 
-**What `k3_kda_rec` changes.**
-- It reads and writes the state through `line_index`, which is the state pool.
-- It keeps the state in fp32 registers and rounds it only as an MMA operand; the line is stored bf16.
-- Warp 9 advances the conv windows.
-- 56 extra gate CTAs sit on the SMs the heads leave idle. They apply RMS·γ·sigmoid(gate) as tiles are published through release/acquire progress counters.
-- Its grid is `nseq·96 + 56`, block 512, with 182 KB of shared memory.
-- It is still mma.sync over 16-token tiles, and it is capped at 8192 rows because the βs are held in shared memory.
+**What `k3_kda_rec` changed.**
+- It read and wrote the state through `line_index`, which is the state pool.
+- It kept the state in fp32 registers and rounded it only as an MMA operand; the line was stored bf16.
+- Warp 9 advanced the conv windows.
+- 56 extra gate CTAs sat on the SMs the heads left idle. They applied RMS·γ·sigmoid(gate) as tiles were published through release/acquire progress counters.
+- Its grid was `nseq·96 + 56`, block 512, with 182 KB of shared memory.
+- It was still mma.sync over 16-token tiles, and it was capped at 8192 rows because the βs were held in shared memory.
 
 **Why it is slow on GB300.**
 - The chain is 71% of the time: 512 steps × 1.16 µs on 96 SMs.
@@ -306,7 +305,7 @@ SGLang forces K3 decode to Triton (`arg_groups/kimi_k3_hook.py`), whatever the p
 - `cu_seqlens` is int32 or int64, and must be int64 under graph capture.
 - **State pool.** With `ssm_state_indices` (int32 `[N]`), the kernel computes `state_base = slot · state_slot_stride + (head·128 + row)·128`. It uses that base for both the read and the write (`f4112648ad.cu:857-862, 1368`), so the update is in place.
 - **Pool shape.** The pool must be `[rows, H, 128, 128]` with the inner three dimensions dense. The row stride may be anything at least H·128² elements and 16 B-aligned (`kda_prefill.py:630-652`).
-- **Pool measurement** (`bench_pool.py`). The pool was a line with 64 KiB of other data after the state. The pool path was bit-identical to the plain path, other rows and the line tails were untouched, and the time was unchanged.
+- **Pool measurement.** The pool was a line with 64 KiB of other data after the state. The pool path was bit-identical to the plain path, other rows and the line tails were untouched, and the time was unchanged.
 - **Checkpoints.** Any checkpoint request switches module. An interval that is not a multiple of 32 runs on a BT = 16 module (`b956ea8571`). A multiple of 32 runs on a BT = 32 module without the tensor-core decay (`b21b675208`). Positions are relative to the sequence start in the call, and the output is packed bf16 `[C, H, 128, 128]`.
 - **Not accepted:** `initial_state_indices` / `initial_state_source`; an fp32 state without indices (`kda_prefill.py:776-779`, the "does not support this contract" error seen earlier).
 
@@ -373,7 +372,7 @@ SGLang forces K3 decode to Triton (`arg_groups/kimi_k3_hook.py`), whatever the p
 
 ### cuDNN FROST
 
-The ABI, AOT cubin export, pool and checkpoints are covered in `cudnn-vendor.md` (go/no-go: GO). This section covers only the kernel internals.
+kern's ABI port is `scripts/cudnn_kda_abi.py` and its AOT build `source/cudnn-frost-kda/`. This section covers only the kernel internals.
 
 **Shape of the run.**
 - BT = 16.
@@ -450,7 +449,7 @@ The ABI, AOT cubin export, pool and checkpoints are covered in `cudnn-vendor.md`
 
 **Why it "failed" before.**
 - The earlier `FileNotFoundError(2, …)` was `tvm_ffi.cpp.load_inline` running `ninja`. The binary is only in the venv's `bin/`, which is not on PATH when the venv's python is called by absolute path.
-- With that directory on PATH it runs: `kernel_kda_fwd_stream_m128`, 1024 threads, 232,448 B of shared memory, 64 registers (`bench_fp32_backends.py`).
+- With that directory on PATH it runs: `kernel_kda_fwd_stream_m128`, 1024 threads, 232,448 B of shared memory, 64 registers.
 
 **Algorithm and kernel, as far as the PTX and the host shim show.**
 - BT = 32 (`kda_kernels/ptx/scheduler.py:33`).
@@ -492,55 +491,42 @@ The ABI, AOT cubin export, pool and checkpoints are covered in `cudnn-vendor.md`
 
 ## Recommendation for P's `span_kda`
 
-**Adopt cake's direct serving module (`flashkda_bf16_fused_m128_f4112648ad`).** It reads and writes the KDA line in place through `ssm_state_indices` / `state_slot_stride`. Steps:
+**kern runs cuDNN FROST.** It is graph-safe over changing lengths (its prologue kernel publishes the per-sequence descriptors on the device), reads and writes the KDA line in place, keeps an fp32 state in TMEM and has in-kernel checkpoints. `source/k3_kda_epilogue.cu` applies the output gate and advances the conv windows after it.
+
+**cake is the next step, once its descriptor publication moves onto the device** (Conclusion 1). Its direct serving module (`flashkda_bf16_fused_m128_f4112648ad`) reads and writes the line in place through `ssm_state_indices` / `state_slot_stride`. Adopting it would take:
 
 1. **Vendor the source.** Copy the generated `.cu` with its binding header and NVRTC flags (sm_103a, fast-math), and add a PROVENANCE entry: FlashInfer 0.7.2.post1, module hash, Apache-2.0. Build the cubin with kern's build, and check that it is byte-equal to the prebuilt one in `flashinfer_jit_cache`, or at least that its SASS is identical.
 2. **ABI port.**
    - One launch: grid `seqs·96`, block 1024, 232,064 B of dynamic shared memory.
-   - A load-time static buffer holding the six encoded tensormaps for q, k, v, g, β and o over capacity-sized span buffers.
+   - The six tensormaps for q, k, v, g, β and o, encoded per sequence on the device, as FROST's prologue does.
    - `seq_order` as the identity.
    - Null tape and checkpoint pointers.
    - `state_slot_stride = line_bytes / 2`.
    - Capture the Python launch's parameter bytes and diff them against kern's packed bytes, using the kernel-capture lift flow.
 3. **Glue.**
-   - `span_gather` writes β token-major. This is the same change the cuDNN plan needed.
-   - The output gate (RMS·γ·sigmoid) and the conv-window advance that `k3_kda_rec` does today become one small kernel after the KDA kernel. `cudnn-vendor.md` estimates it at about 7 / 20 / 90 µs for T = 512 / 1536 / 8192.
-   - Because the cake source is plain CUDA C, the follow-up is to fuse the gate into the epilogue warps (4-7). Each CTA owns one (sequence, head) with all 128 d_v, so the RMS is local to the CTA.
+   - `span_gather` already writes β token-major for FROST, which cake needs too.
+   - `k3_kda_epilogue` stays as it is. Because the cake source is plain CUDA C, the follow-up is to fuse the gate into the epilogue warps (4-7). Each CTA owns one (sequence, head) with all 128 d_v, so the RMS is local to the CTA.
 4. **Gates.**
    - `kern test` against the current P manifest.
    - The P e2e KL check (≤ 1e-2).
    - `kern bench` of `span_kda` at 512 / 1536 / 8192 and at the packed N the service actually sees.
    - A run of K3.1-shaped random LB = −5 gates at maximum magnitude, to exercise the midpoint re-centering.
 
-**What we gain.**
-- KDA kernel time drops about 2.2×: 837 → 387 µs at T = 8192, and 66 → 32 µs at T = 512. Some of that goes back to the standalone gate until it is fused.
-- One launch, no 81 KiB/token workspace (about 680 MB at T = 8192), and no 8192-row limit.
-- Better agreement with an fp32 recurrence than vLLM's FlashKDA (4.0e-3 against 5.8e-3).
+**What it would gain over FROST.**
+- KDA kernel time drops 14–17%: 450 → 387 µs at T = 8192, 37 → 32 µs at T = 512 (pool in place, both).
+- Slightly closer agreement with an fp32 recurrence (4.0e-3 against 4.4e-3 on the output).
 
-**What we lose or must watch.**
-- **The idle-SM gate overlap** of `k3_kda_rec`, until the gate is fused into cake's epilogue.
-- **Precision of the carried state.** The state between 32-token chunks is bf16, where `k3_kda_rec` keeps fp32 in registers. The measurement says this costs nothing visible against fp32; the e2e KL gate decides.
+**What it would lose or must watch.**
+- **Precision of the carried state.** The state between 32-token chunks is bf16, where FROST keeps fp32 in TMEM. The measurement says this costs nothing visible against fp32; the e2e KL gate decides.
 - **The persistent vtile route for packs.** It bakes in H, LB and the scale and ignores `cu_seqlens`, so it is unsafe for mixed lengths. Packs with more than 152 chains will pay for full waves, as every one-CTA-per-chain backend does.
 - **In-kernel checkpoints** are relative to the call and switch module. Keep snapshots at grid points by splitting the span, as the scheduler already does.
 
 **What comes after.**
 - If packed P batches dominate, the next 15% is in splitting chains over all 152 SMs. ptx and cute-dsl-persistent show this at 8 × 2048. It would mean a host planner emitting a per-step piece table, which fits kern's pool-decides / runtime-executes split, plus an fp32 handoff between CTAs.
 - Neither of those two backends can be taken as is: they need an fp32 state and have no pool, and ptx has no source.
-- cuDNN FROST remains the fallback with the best-documented AOT path and in-kernel checkpoints. It costs 14–17% more than cake.
 
-## Measurement files
+## Measurement setup
 
-These sit next to this study in the experiment directory, under `results/kda-backends/`:
-
-| Purpose | Scripts | Logs |
-|---|---|---|
-| Graph timing, all backends | `bench_graph_all.py` | `bench-graph-all.log` |
-| Pool in place | `bench_pool.py` | `bench-pool.log` |
-| fp32-state backends | `bench_fp32_backends.py` | `bench-fp32-backends.log` |
-| vLLM / SGLang defaults (FLA Triton, nvidia_kda) | `bench_defaults.py`, `debug_nvidia.py` | `bench-defaults.log`, `kernel-inventory-defaults.log`, `debug-nvidia.log` |
-| Earlier cuDNN measurements | `bench_fair.py` | `bench-fair.log` |
-| Kernel inventory | `kernel_inventory.py` | `kernel-inventory.log` |
-| ncu counters | `ncu_one.py`, `ncu_one_fp32.py`, `ncu_all.sh`, `ncu_tc.sh`, `ncu_fp32.sh`, `ncu_table.py`, `ncu_tc_table.py` | `ncu-*.log` |
-| Agreement | `agree_ref.py`, `agree_all.py` | `agree-ref.log`, `agree-all.log` |
+The measurement scripts and logs stayed with the experiment; they are not in this repository.
 
 Software versions: FlashInfer 0.7.2.post1, cudnn-frontend 1.32.0, nvidia-cutlass-dsl 4.8.0, and the vLLM nightly build of `_flashkda_C`.

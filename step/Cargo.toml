@@ -3,7 +3,7 @@ name = "k3-step"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Run a Kimi-K3 decode manifest teacher-forced on one rank of a replicated batch, on kern"
+description = "Run a Kimi-K3.1 decode manifest teacher-forced on one rank of a replicated batch, on kern"
 publish = false
 
 [[bin]]
@@ -14,6 +14,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 cudarc = { version = "=0.19.10", features = ["cuda-13030", "f16", "nccl"] }
-kern-manifest = { git = "https://github.com/pegainfer-project/kern", rev = "50175a237cca4295ed6d9ffc3a7d6d5248adddcc" }
-kern-pool = { git = "https://github.com/pegainfer-project/kern", rev = "50175a237cca4295ed6d9ffc3a7d6d5248adddcc" }
-kern-runtime = { git = "https://github.com/pegainfer-project/kern", rev = "50175a237cca4295ed6d9ffc3a7d6d5248adddcc" }
+kern-manifest = { git = "https://github.com/pegainfer-project/kern", rev = "1b5172b8de11f6fa3daa1f718615519428b28821" }
+kern-pool = { git = "https://github.com/pegainfer-project/kern", rev = "1b5172b8de11f6fa3daa1f718615519428b28821" }
+kern-runtime = { git = "https://github.com/pegainfer-project/kern", rev = "1b5172b8de11f6fa3daa1f718615519428b28821" }

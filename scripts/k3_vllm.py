@@ -1,6 +1,7 @@
 """K3 decode on vLLM's memory.
 
-Rewrites a `gen_stage.py --tp N` decode manifest into one a vLLM
+Rewrites a `gen_stage.py --tp N --kv bf16` decode manifest (K3's dense attention; K3.1's DSA D has no
+vLLM layout here) into one a vLLM
 model runner drives (kern's `python/kern_vllm`): `k3_hosted.py`'s program
 boundary, and every state a host state, one per layer, laid out the way
 vLLM's hybrid allocator lays it out.

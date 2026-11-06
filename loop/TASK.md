@@ -1,5 +1,7 @@
 # Task: fewer, faster kernels for Kimi-K3 on kern
 
+> K3's archived loop, kept as it ran: its manifests' flags (`loop/gen`) no longer match `scripts/gen_stage.py`.
+
 Kimi-K3 (93 layers: 3 of every 4 KDA, every 4th MLA; 896-expert MoE on
 every layer; attention residuals) is served on GB300 (`sm_103a`) by the kern
 runtime, split into prefill (P) and decode (D):

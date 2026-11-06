@@ -1,6 +1,6 @@
 // K3.1's indexer key, a warp a row, as vLLM's indexer_k_norm_quant_insert makes it: LayerNorm in f32 (eps
 // 1e-5) over the row's 128 bf16 values, rounded to bf16, then e4m3 with one UE8M0 scale
-// 2^ceil(log2(max(amax, 1e-4) / 448)) into its 144-byte cache row (128 e4m3, the scale's packed word).
+// 2^ceil(log2(max(amax, 1e-4) / 448)) into its cache row (the layout is in k31_dsa.cu).
 // k31_dsa.cu's k31_idx_key and k3_mla_prep.cu's IDX_KEY build share it.
 #pragma once
 #include <cuda_bf16.h>

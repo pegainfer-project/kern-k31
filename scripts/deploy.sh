@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# scripts/deploy.sh <kern checkout> <kernel index> <out>: the manifests of a full-K3 P/D
+# scripts/deploy.sh <kern checkout> <kernel index> <out>: the manifests of a full-K3.1 P/D
 # deployment, each verified by the checkout's kern.
 #   <out>/p/stage{0..7}.json  P: the packed 93-layer prefill (16 sequences a chunk of 8192 rows)
 #                             cut into PP8 stages every 12 layers
-#   <out>/d.json              D: the 93-layer TP8 / EP8 / DCP8 decode step (64 sequences)
-# Both at the generator's defaults: fp8 pages, a bf16 KDA state, 1M context.
+#   <out>/d.json              D: the 93-layer TP8 / DCP8 decode step, experts EP2 x TP4 (64 sequences)
+# Both at the generator's defaults: fp8 pages under DSA, a bf16 KDA state, 1M context.
 # The kern checkout is the commit step/Cargo.toml pins, built (`cargo build --release`); the kernel
 # index is kern master's kernel_index/.
 set -euo pipefail
