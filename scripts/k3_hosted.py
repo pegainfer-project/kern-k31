@@ -43,25 +43,26 @@ def cut(calls: list[dict]) -> list[dict]:
     end = next(i for i, c in enumerate(calls) if c["label"] == "out.res")
     steps = [renamed(c, "hidden", "resid") for c in calls[: end + 1]]
     final = steps[-1]
-    assert final["op"].startswith("land_add2_attnres_rms"), f"out.res is `{final['op']}`"
+    assert final["op"].startswith("land_") and "attnres_rms" in final["op"], f"out.res is `{final['op']}`"
     assert sum(a.get("buf") == "normed" for a in final["args"]) == 1, "out.res writes `normed` once"
     return steps[:-1] + [renamed(final, "normed", "hidden")]
 
 
 def head(lm_head: dict) -> dict:
     """The base's `out.lm_head` over `head_in`, one row per sequence."""
-    a, w, _, _, n, k, ld = lm_head["args"]
+    a, w, _, _, n, ld = lm_head["args"]
     assert lm_head["op"] == "gemm_f32" and n == ld, f"out.lm_head is `{lm_head['op']}` {lm_head['args']}"
     return {"calls": [{"label": "head", "op": "gemm_f32",
-                       "args": [{"buf": "head_in"}, w, {"buf": "logits"}, {"var": "seqs"}, n, k, ld]}]}
+                       "args": [{"buf": "head_in"}, w, {"buf": "logits"}, {"var": "seqs"}, n, ld]}]}
 
 
 def hosted(m: dict) -> dict:
     p = m["programs"]
     calls = p["decode"]["calls"]
     lm_head = next(c for c in calls if c["label"] == "out.lm_head")
-    _, _, _, _, vocab, width, _ = (a.get("i32") for a in lm_head["args"])
+    vocab = lm_head["args"][4]["i32"]
     hidden = {**m["buffers"]["hidden"]}
+    width = hidden["shape"][1]
     assert all("hidden" not in bufs(v["calls"]) for k, v in p.items() if k != "decode"), "only decode names `hidden`"
     programs = {k: v for k, v in p.items() if k != "decode"} | {
         "decode_batch": {**p["decode"], "calls": cut(calls)},
