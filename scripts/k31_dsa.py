@@ -1,18 +1,19 @@
 """K3.1's DSA layer for gen_stage.py: the indexer, its top 2048 and the sparse attention over the fp8 latent
 pages, as vLLM's Kimi K3.1 runs them on SM100 (FlashInferMLASparse over the plain fp8 cache).
 
-Both sides project the indexer from the layer's input (`wk | weights_proj`, 160 bf16 columns) and from q_norm
-(`wq_b`, 32 heads of 128), bf16 GEMMs as vLLM's unquantized ones. The key goes through its LayerNorm into
-`idx.<l>`, a token-major state of 144-byte rows (128 e4m3, a UE8M0 scale word, padding) on the latent pages'
-slots; the query to e4m3 with UE8M0 scales and bf16 head weights (source/k31_dsa.cu).
+Both sides project the indexer from the layer's input (`wk | weights_proj`, 160 columns) and from q_norm
+(`wq_b`, 32 heads of 128): bf16 GEMMs as vLLM's unquantized ones, but for a DCP member, whose `wk |
+weights_proj` columns come f32 out of the fused wfu GEMM (`fold`). The key goes through its LayerNorm into
+`idx.<l>`, a token-major state on the latent pages' slots (the layout is in source/k31_dsa.cu); the query to
+e4m3 with UE8M0 scales and bf16 head weights.
 
 P scores every row against its sequence's keys up to its own position: the keys gathered sequence after
 sequence into one stream (k31_idx_plan / k31_idx_gather), DeepGEMM's bf16 MQA logits over it, a top-k per bf16
 row, the picks as cache slots. D scores its rows against their paged keys (DeepGEMM's paged MQA logits and
-its scheduler), the same top-k, the same slots. Then both run the absorbed query (k31_absorb on P,
-k3_mla_absorb_mma's OUT_HEADS=128 build on D) through TRT-LLM gen's sparse MLA and the latent output through
-W_UV and the gate (k31_vup_gate): the 96 heads ride as 128, the pad heads' query never written and their
-output never read.
+its scheduler), the same top-k, the same slots. Then both run the absorbed query (k31_absorb_tc on P and
+from ABSORB_TC_MIN rows on D, k3_mla_absorb_mma's OUT_HEADS=128 build below) through TRT-LLM gen's sparse MLA:
+the 96 heads ride as 128, the pad heads' query never written and their output never read. The latent output
+goes through W_UV and the gate in k31_vup_gate(_tc), or, for a DCP member, in k3_dcp's SPARSE exchange.
 """
 import math
 

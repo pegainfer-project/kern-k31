@@ -8,8 +8,9 @@ this directory; the vendored file keeps its upstream header.
 
 FlashInfer ships Cake-generated FP8 MLA decode kernels for Kimi-K3 (96 heads,
 latent 512 + rope 64, 64-token pages) behind
-`trtllm_batch_decode_with_kv_cache_mla(backend="cake")`. D runs them over
-SGLang's fp8 cache (`gen_stage.py --kv fp8`).
+`trtllm_batch_decode_with_kv_cache_mla(backend="cake")`. K3's D ran them over
+SGLang's fp8 cache. Under K3.1, `--kv fp8` means DSA, and no manifest the
+generator writes launches them.
 
 ## What is vendored
 
@@ -18,7 +19,7 @@ From `csrc/cake_kimi_k3_mla/` of the FlashInfer checkout, unmodified:
 - `cake_kimi_k3_mla_fp8_paged_attention_ea17187e76fd47ab2653_kernel.cu`, the
   `main_wide` program: a two-CTA cluster per (row tile, split) item.
 
-Only this one is vendored, because it is the only program D launches. SGLang
+Only this one is vendored, because it is the only program K3's D launched. SGLang
 captures its decode graphs planned for the longest context it admits.
 FlashInfer's planner (`flashinfer/mla/cake_kimi_k3_mla.py`, `plan_attention`)
 for a DCP8 member's share of the capture context (at least 8,192 positions),

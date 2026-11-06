@@ -1,5 +1,7 @@
 # The K3 kernel loop
 
+> K3's archived loop, kept as it ran: its manifests' flags (`loop/gen`) no longer match `scripts/gen_stage.py`.
+
 Agents optimize the P and D kernels of Kimi-K3 overnight against a fixed
 workload, on sub-models small enough to measure in minutes. The orchestrator
 merges what passes into `main`.

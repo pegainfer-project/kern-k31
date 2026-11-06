@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Generate Kimi-K3's two manifests for kern: P, the packed prefill a
-pipeline cuts into stages, and D, the TP / EP / DCP decode step.
+"""Generate Kimi-K3.1's two manifests for kern: P, the packed prefill a
+pipeline cuts into stages, and D, the TP / DCP decode step.
 
-A fork of kern's tools/gen_k3.py; the rest of kern's tools (the manifest
-helpers, `once`, the kernel index, the FMHA and batched-GEMM ABI ports) are
-imported from the kern checkout KERN names:
+Begun as kern's tools/gen_k3.py, which kern no longer carries; the rest of
+kern's tools (the manifest helpers, `once`, the kernel index, the FMHA and
+batched-GEMM ABI ports) are imported from the kern checkout KERN names:
 
     KERN=<kern checkout> KERN_INDEX_DIR=<kern master>/kernel_index \
       python3 scripts/gen_stage.py --chunk 8192 > p.json
@@ -19,14 +19,12 @@ back to back (`cu_seqlens`, at most N rows), on one GPU holding every expert,
 and the head on each sequence's last row: `next_token` is one token a
 sequence. A KDA layer runs cuDNN's FROST KDA prefill (scripts/cudnn_kda_abi.py)
 from and to each sequence's line in place, then source/k3_kda_epilogue.cu. An
-MLA layer expands the context's latent rows by kv_b and runs TensorRT-LLM's
-context FMHA (docs/k3-kernel-abi.md K13), or, over bf16 pages, for a call of at
-most --mla-short rows, attends in the latent space. The MoE runs TRT-LLM gen's
+MLA layer is a DSA layer (below). The MoE runs TRT-LLM gen's
 batched GEMMs over every expert (k3_moe_bmm.py), routed in one call
 (source/k3_moe_route.cu).
 
-D (`--tp 8`, R = 8 below): the decode step as SGLang's TP / EP / DCP decode runs it
-(decode/sglang-tp8-dcp8-ep8), one batch replicated on the group's R ranks.
+D (`--tp 8`, R = 8 below): the decode step laid out as SGLang's TP / DCP decode runs it
+(decode/sglang-tp8-dcp8-ep8), but for the experts, one batch replicated on the group's R ranks.
 The KV of an MLA layer is dealt by position (`kv.<l>` shards `by: position`:
 position p on member p % R), so every member runs the MLA's q side for every
 row and all 96 heads over its own positions (q_a / kv_a, q_b and the absorb
@@ -51,21 +49,21 @@ on one GPU holding every expert, with nothing to exchange or sum: the oracle
 the group is checked against (step/, scripts/compare_steps.py). `--layers 2`
 (one KDA layer, one MoE layer) has no MLA layer and no paged state.
 
-K3.1's MLA layers are DSA layers (scripts/k31_dsa.py): over the fp8 cache, P and a one-GPU D score the
-keys with the indexer and attend each row's top 2048 through TRT-LLM gen's sparse MLA in place of the
-dense passes above; under DCP each member scores its own positions, pushes its top-k into every
-member's Lamport stage, each member merges them once all have landed, and the sparse partials meet in
-k3_dcp's SPARSE exchange.
+K3.1's MLA layers are DSA layers (scripts/k31_dsa.py) over the fp8 cache: P and a one-GPU D score the
+keys with the indexer and attend each row's top 2048 through TRT-LLM gen's sparse MLA; under DCP each
+member scores its own positions, pushes the best of its top-k into every member's Lamport stage, each
+member cuts the group's top-k once all have landed, and the sparse partials meet in k3_dcp's SPARSE
+exchange. Over bf16 pages an MLA layer runs K3's dense attention instead: P expands the context's latent
+rows by kv_b and runs TensorRT-LLM's context FMHA (kern's docs/k3-kernel-abi.md K13), or, for a call of
+at most --mla-short rows, attends in the latent space; D runs FlashInfer's CuTe-DSL MLA decode.
 
-`--kv` picks the MLA cache: SGLang's fp8 (scripts/k3_kv_fp8.py, the default)
-or bf16 (scripts/k3_kv_bf16.py). A flavor owns its page bytes, D's absorb,
+`--kv` picks the MLA cache: SGLang's fp8 (scripts/k3_kv_fp8.py, the default, DSA)
+or bf16 (scripts/k3_kv_bf16.py, dense). A flavor owns its page bytes, D's absorb,
 attention and exchange, and P's absorbed short path (bf16's alone).
 
-The kernels are kern's own (docs/k3-kernel-abi.md, source/k3_*.cu): B is a
-runtime argument, every launch takes one row per block.x, and the landing /
-residual / norm / append work is fused into its neighbours. The launch
-sequence still follows pegainfer's certified `k3_step` operand for operand;
-only the kernel boundaries moved.
+The kernels are kern's own (kern's docs/k3-kernel-abi.md, source/k3_*.cu): B
+is a runtime argument, every launch takes one row per block.x, and the
+landing / residual / norm / append work is fused into its neighbours.
 """
 import argparse
 import json
@@ -95,7 +93,7 @@ KV = {"fp8": k3_kv_fp8, "bf16": k3_kv_bf16}
 
 # D's expert groups: expert e in group e % D_EP, held by the tp / D_EP members r with r // (tp / D_EP) == that
 # group, each a slice of every expert's intermediate width. EP8 left the step waiting at the MoE all-reduce for
-# the rank with the most active experts (1.09-1.29x the mean on real routing, results/roofline/moe.md); a quarter
+# the rank with the most active experts (1.09-1.29x the mean on real routing); a quarter
 # of I costs FC1 / FC2 the same per byte, where TP8's eighth (FC2 at K = 384) does not.
 D_EP = 2
 # k3_ar_fused.cu's KGRID, one block an SM: every block resident on 148 and 152 SMs, a multiple of the cluster of 8
@@ -1498,8 +1496,7 @@ def main():
     ap.add_argument("--window", type=int, default=65536,
                     help="P: the cached keys an MLA layer expands and attends in one round")
     ap.add_argument("--kv", choices=tuple(KV), default="fp8",
-                    help="the MLA cache: SGLang's fp8 (e4m3; D attends it with FlashInfer's Cake kernel, P lifts it to "
-                         "bf16 for the expansion and has no absorbed short path) or bf16")
+                    help="the MLA cache: SGLang's fp8 (e4m3, K3.1's DSA on P and D) or bf16 (K3's dense attention)")
     ap.add_argument("--moe-variants", metavar="FC1,FC2",
                     help="the batched-GEMM variants of the MoE by name (default: the index's picks)")
     a = ap.parse_args()

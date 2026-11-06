@@ -1,14 +1,14 @@
 """gen_stage.py's fp8 MLA cache (`--kv fp8`, the default): SGLang's fp8 one, 64-token pages of e4m3 [576] rows
-at scale 1.
+at scale 1. fp8 means DSA: gen_stage.py runs every MLA layer of P and D through k31_dsa.py's sparse
+attention over these pages.
 
-The append and D's absorbed query land in e4m3 as SGLang casts them (k3_mla_prep's KV_FP8 build,
-k3_mla_absorb_mma's Q_FP8 build). D, always under DCP, attends with FlashInfer's Cake kernel
-(source/flashinfer-cake-k3-mla), its splits planned by FlashInfer's planner at 148 SMs for a member's share of
-the capture context (scripts/cake_plan.py), and the exchange's CAKE build merges its splits with the members'.
-P lifts the pages to bf16 as it gathers them (k3_mla_glue.cu's KV_FP8 build): every call expands its context,
-no absorbed short path. Its attention runs on e4m3 as vLLM's FP8 prefill does (`use_prefill_query_quantization`):
-q and the expanded k | v cast at scale 1 into the FMHA's e4m3 builds, o bf16. Its KDA and MLA input
-projections, lat_down and lat_up are MXFP8 as vLLM's online mxfp8 makes them.
+The append lands in e4m3 as SGLang casts it (the KV_FP8 builds), and so does D's absorbed query
+(k3_mla_absorb_mma's Q_FP8 builds). P's KDA and MLA input projections, lat_down and lat_up are MXFP8 as vLLM's
+online mxfp8 makes them.
+
+The dense attention here is K3's, and no manifest reaches it: D's FlashInfer Cake kernel
+(source/flashinfer-cake-k3-mla, planned by scripts/cake_plan.py, merged by the exchange's CAKE build) and P's
+expansion of its context into the FMHA's e4m3 builds (vLLM's `use_prefill_query_quantization`).
 """
 import math
 
@@ -23,7 +23,8 @@ P_MXFP8 = True
 D_PREP = {"KV_FP8": 1}
 Q_ABS = "fp8e4m3"
 
-# D's attention: FlashInfer's Cake-generated Kimi-K3 kernel, its wide route, a two-CTA cluster per (row, split).
+# K3's dense D attention, unreached under DSA: FlashInfer's Cake-generated Kimi-K3 kernel, its wide route, a
+# two-CTA cluster per (row, split).
 # SGLang captures a graph planned for the longest context; Cake's planner (`plan_attention`, ported in
 # scripts/cake_plan.py) for a member's share of it then sends every batch down this route with all rows as the
 # same splits, (first batch, last batch, splits). It plans at 148 SMs, B300's count; GB300 runs the same plan.

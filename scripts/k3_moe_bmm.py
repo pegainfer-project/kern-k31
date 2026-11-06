@@ -2,7 +2,7 @@
 `trtllm_bmm_mxe4m3_mxe2m1_mxe4m3` for FC1 with the fused SiTU gate and
 `trtllm_bmm_bf16_mxe2m1_mxe4m3` for FC2, kern's tools/kernels/abi/trtllm_bmm.py)
 around the glue of source/k3_moe_prefill.cu: the pieces gen_stage.py lays
-out. A fork of kern's tools/k3_moe_bmm.py.
+out. Begun as kern's tools/k3_moe_bmm.py, which kern no longer carries.
 
 One rank holds `local` of the model's 896 experts: every one (P) or every
 `stride`-th one (a D member: 448 of them, the members of expert group g holding g, g + 2, ...), each
@@ -34,7 +34,7 @@ FC1, FC2 = "trtllm_bmm_mxe4m3_mxe2m1_mxe4m3", "trtllm_bmm_bf16_mxe2m1_mxe4m3"
 SHAPE = "k3-prefill-16k-ep4"
 # D's pair, 16-token tiles: a decode step routes a few rows to each expert, and k3_moe_front.cu's tables are built
 # for that tile; the index's picks for SHAPE are P's 128-token ones. FC2 by its K: the 2x unrolled K loop wants K
-# in multiples of 512, so a quarter of I (768) takes the build without it (results/roofline/moe: FlashInfer's best
+# in multiples of 512, so a quarter of I (768) takes the build without it (FlashInfer's best
 # tactic for that split at 16-256 rows of real routing, or within 0.5% of it).
 DECODE_FC1 = ("bmm_MxE4m3_MxE2m1MxE4m3_Fp32_Ab32_Bb32_Cb32_t128x16x256_s6_et128x16_m256x16x32_c2x1x1_rM_TN_transOut_"
               "schPd2x1x2x3_biasFp32M_bN_tma_ldgstsSf_rgTma_clmp_siTuGlu_dynB_sm100f")
