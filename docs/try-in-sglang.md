@@ -48,6 +48,7 @@ python3 -m sglang.launch_server --model-path moonshotai/Kimi-K3.1-Pro --trust-re
   --tp-size 8 --nnodes 2 --node-rank <0|1> --dist-init-addr <P node 0>:<port> \
   --disaggregation-mode prefill --disaggregation-transfer-backend mooncake \
   --page-size 64 --mamba-ssm-dtype bfloat16 --dsa-decode-backend trtllm \
+  --reasoning-parser kimi_k3 --tool-call-parser kimi_k3 \
   --host 0.0.0.0 --port 30000
 ```
 
@@ -62,6 +63,7 @@ python3 -m sglang.launch_server --model-path moonshotai/Kimi-K3.1-Pro --trust-re
   --tp-size 8 --dcp-size 8 --nnodes 2 --node-rank <0|1> --dist-init-addr <D node 0>:<port> \
   --disaggregation-mode decode --disaggregation-transfer-backend mooncake \
   --page-size 64 --mamba-ssm-dtype bfloat16 --dsa-decode-backend trtllm \
+  --reasoning-parser kimi_k3 --tool-call-parser kimi_k3 \
   --max-running-requests 256 --host 0.0.0.0 --port 30000
 ```
 
@@ -85,6 +87,8 @@ What each flag is for:
   the manifest reads them (64-token pages, raw fp8 MLA cache, bf16 KDA state). P must use the same
   three, since it writes the bytes D reads. A different value makes kern refuse the pool at startup,
   naming the layer state that does not match.
+- `--reasoning-parser kimi_k3 --tool-call-parser kimi_k3` are SGLang's own K3.1 output parsers: the chat
+  API then returns `reasoning_content`, `content` and structured `tool_calls` instead of the raw template.
 - `--max-running-requests 256` keeps SGLang within the manifest's 256 sequences a step; left out, SGLang
   sizes over a thousand.
 
