@@ -11,6 +11,13 @@ a hybrid MLA + KDA model, one per layer and kind:
 - `ssm.l<L>`: a KDA layer's recurrent state, SGLang's `[slots, heads,
   128 v, 128 k]` bf16 (`--mamba-ssm-dtype bfloat16`): the base line's rec,
   byte for byte, at a stride of its own size.
+- `idx.l<L>`: a DSA layer's indexer keys, SGLang's index-K page `[pages, 8448]`
+  (64 keys of 128 e4m3, then their 64 f32 scales) instead of D's 144-byte
+  rows: `mla_prep` writes a key there as SGLang's store does, scale
+  max(amax, 1e-4) / 448 (its IDX_PAGED build), and the paged MQA logits read
+  it (DG_SF_KV_F32 + DG_SF_KV_STRIDE 1): the MMA takes the scale's power of
+  two, the epilogue its mantissa, read from the page through one more
+  pointer, the page pool.
 - `conv.l<L>`: its conv window, SGLang's `[slots, 3 taps, q | k | v]` bf16.
   The base keeps the window after rec in the line as `[q, k, v][tap]`, so
   `kda_core` becomes its CONV_TAP_MAJOR build, which takes the window as a
@@ -38,6 +45,8 @@ from k3_vllm import KERNEL_BLOCK, ROW, TOKEN_BYTES, check_mla, mla_host  # noqa:
 
 PINNED = tomllib.loads((pathlib.Path(__file__).resolve().parents[1] / "kernels.toml").read_text())["kernels"]
 KD, TAPS, STREAMS = 128, 3, 3
+IDX_ROW, IDX_PAGE, IDX_KEYS = 144, 8448, 8192  # D's row; SGLang's page and where its scales start
+PAGED_SMEM = 203776
 REC_HEAD = KD * KD * 2
 CONV_HEAD = TAPS * STREAMS * KD * 2
 
@@ -59,13 +68,16 @@ def host_states(m: dict, h: int) -> dict:
         if name.startswith("kv."):
             assert s["bytes_per_token"] in (TOKEN_BYTES, ROW), f"`{name}` is {s['bytes_per_token']} B a token"
             return {f"mla.l{l}": {"host": mla_host(s["bytes_per_token"])}}
+        if name.startswith("idx."):
+            assert s["bytes_per_token"] == IDX_ROW, f"`{name}` is {s['bytes_per_token']} B a token"
+            return {f"idx.l{l}": {"host": {"dtype": "u8", "shape": [0, IDX_PAGE], "strides": [IDX_PAGE, 1]}}}
         return {f"ssm.l{l}": {"host": ssm}, f"conv.l{l}": {"host": conv}}
 
     return {k: v for n, s in m["states"].items() for k, v in hosts(n, s).items()}
 
 
 def layer(state: str) -> int:
-    return int(re.fullmatch(r"(?:kv|kda)\.(\d+)", state)[1])
+    return int(re.fullmatch(r"(?:kv|kda|idx)\.(\d+)", state)[1])
 
 
 def rebind(call: dict) -> dict:
@@ -78,6 +90,9 @@ def rebind(call: dict) -> dict:
         l = layer(a["state"])
         if a["state"].startswith("kv."):
             return [{**a, "state": f"mla.l{l}"}]
+        if a["state"].startswith("idx."):
+            assert a.get("offset", 0) in (0, KD), f"`{call['label']}` reads `{a['state']}` at {a.get('offset')}"
+            return [{**a, "state": f"idx.l{l}"} | ({"offset": IDX_KEYS} if a.get("offset") else {})]
         assert call["op"] == "kda_core", f"`{call['label']}` ({call['op']}) touches `{a['state']}`"
         return [{**a, "state": f"ssm.l{l}"}, {**a, "state": f"conv.l{l}"}]
 
@@ -118,14 +133,44 @@ def kda_core(op: dict, line: int, h: int, modules: dict) -> tuple[dict, dict]:
     return {**op, "params": params, "impl": {**op["impl"], "launches": launches}}, entries
 
 
+def idx_paged(ops: dict, modules: dict) -> tuple[dict, dict]:
+    """`mla_prep` writing its keys into SGLang's index-K page and `idx_logits` reading them: their modules'
+    page builds, the logits' key and scale maps over the page; and the modules they now run."""
+    def tmap(param, dtype, dims, strides, box, swizzle):
+        return {"pack": {"size": 128, "fields": [{"at": 0, "tensormap": {
+            "param": param, "dtype": dtype, "dims": dims, "strides": strides, "box": box, "swizzle": swizzle}}]}}
+
+    maps = {3: tmap(3, "u8", [KD, 64, 0], [KD, IDX_PAGE], [KD, 64, 1], 128),
+            4: tmap(4, "u32", [64, 0], [IDX_PAGE], [64, 1], 0)}
+
+    def remapped(a):
+        fields = a.get("pack", {}).get("fields", [])
+        return maps.get(fields[0]["tensormap"]["param"], a) if len(fields) == 1 and "tensormap" in fields[0] else a
+
+    entries, out = {}, {}
+    for name, defines in (("mla_prep", {"IDX_PAGED": 1}), ("idx_logits", {"DG_SF_KV_F32": 1, "DG_SF_KV_STRIDE": 1})):
+        (l,) = ops[name]["impl"]["launches"]
+        module, entry = variant(l["module"], modules, **defines)
+        entries[module] = entry
+        l = {**l, "module": module}
+        if name == "idx_logits":
+            args = [remapped(a) for a in l["args"]]
+            assert sum(a is maps[3] or a is maps[4] for a in args) == 2, "`idx_logits` maps the cache twice"
+            l = {**l, "entry": l["entry"] + "PKh", "params": l["params"] + ["in state"],
+                 "args": args + [{"param": 3}], "shared_mem": PAGED_SMEM}
+        out[name] = {**ops[name], "impl": {**ops[name]["impl"], "launches": [l]}}
+    return out, entries
+
+
 def on_sglang(m: dict) -> dict:
     lines = {s["bytes_per_seq"] for s in m["states"].values() if "bytes_per_seq" in s}
     assert len(lines) == 1, f"KDA lines of {sorted(lines)} B"
     (line,) = lines
     h = heads(line)
-    (token,) = {s["bytes_per_token"] for s in m["states"].values() if "bytes_per_token" in s}
-    for name in ("mla_prep", "mla_attn"):
-        check_mla(name, m["ops"][name], token)
+    (token,) = {s["bytes_per_token"] for n, s in m["states"].items() if n.startswith("kv.")}
+    for name in ("mla_prep", "mla_attn", "sparse_mla"):
+        if name in m["ops"]:
+            check_mla(name, m["ops"][name], token)
     op, module = kda_core(m["ops"]["kda_core"], line, h, m["modules"])
     mla = next(f"mla.l{layer(n)}" for n in m["states"] if n.startswith("kv."))
     kda = next(layer(n) for n in m["states"] if n.startswith("kda."))
@@ -134,12 +179,13 @@ def on_sglang(m: dict) -> dict:
            "block_table": {"index_into": mla, "stride": KERNEL_BLOCK},
            "kda.line_index": {"index_into": f"ssm.l{kda}", "stride": h * REC_HEAD},
            "kda.conv_index": {"index_into": f"conv.l{kda}", "stride": h * CONV_HEAD}}
-    ops = m["ops"] | {"kda_core": op}
+    paged, pages = idx_paged(m["ops"], m["modules"]) if any(n.startswith("idx.") for n in m["states"]) else ({}, {})
+    ops = m["ops"] | {"kda_core": op} | paged
     used = {l["module"] for o in ops.values() for l in o["impl"]["launches"] if "module" in l}
     return {**m, "model": f"{m['model'].removesuffix('-hosted')}-sglang",
             "states": host_states(m, h),
             "ops": ops,
-            "modules": {k: v for k, v in (m["modules"] | module).items() if k in used},
+            "modules": {k: v for k, v in (m["modules"] | module | pages).items() if k in used},
             "programs": {k: {**p, "calls": [rebind(c) for c in p["calls"]]} for k, p in m["programs"].items()},
             "buffers": b | {k: {**b[k], "domain": d} for k, d in ids.items()}}
 

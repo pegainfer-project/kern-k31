@@ -79,11 +79,12 @@ def check_mla(name: str, op: dict, token: int = TOKEN_BYTES) -> None:
     args = [a for l in op["impl"]["launches"] for a in l.get("args", [])]
     if name == "mla_prep":
         assert {"i64": KERNEL_BLOCK * ROW} in args, "`mla_prep` page stride is not `MLA_HOST`'s"
-    if name == "mla_attn":
+    if name in ("mla_attn", "sparse_mla"):
         maps = [f["tensormap"] for a in args if "pack" in a for f in a["pack"]["fields"] if "tensormap" in f]
         pages = [t for t in maps if t["dims"][-1] == 0]
-        assert pages and all(t["strides"] in ([token, KERNEL_BLOCK * token], [token]) for t in pages), \
-            "`mla_attn` page tensormaps are not `MLA_HOST`'s kernel blocks"
+        block = KERNEL_BLOCK * token
+        assert pages and all(t["strides"] in ([token, block], [token], [token, block, block]) for t in pages), \
+            f"`{name}` page tensormaps are not `MLA_HOST`'s kernel blocks"
 
 
 def restride(name: str, op: dict, line: int, page: int) -> dict:

@@ -69,7 +69,8 @@
 // -DIDX_KEY=<column>: K3.1's DSA indexer key rides in the same row, its 128 columns from `column` on (the
 // wfu GEMM's wk part), and the last warp of each row's last block lands them to bf16 and writes the key
 // into the row's slot of `idx_cache` (k31_idx_key.cuh; idx_key_w / idx_key_b the norm's weight and bias),
-// so D's k31_idx_key launch goes away. The parameters follow `B`.
+// so D's k31_idx_key launch goes away. The parameters follow `B`. With -DIDX_PAGED the key goes into
+// SGLang's index-K page instead of a 144-byte row (k31_idx_page).
 //
 // ---- landing points (pegainfer's chain: land_rms_norm_rbs + rms_norm_rbs)
 //   * every f32 partial column lands to bf16 *first*, x = f32(bf16(P[i])),
@@ -178,7 +179,12 @@ extern "C" __global__ __launch_bounds__(MAXNT) void kern_k3_mla_prep(
       const int l = t & 31;
       const float4 v = *reinterpret_cast<const float4*>(P + IDX_KEY + 4 * l);
       const float x[4] = {landf(v.x), landf(v.y), landf(v.z), landf(v.w)};
+#ifdef IDX_PAGED
+      unsigned char* page = k31_idx_page(idx_cache, s);
+      k31_key_row(x, idx_key_w, idx_key_b, page + (s & 63) * 128, l, page + 8192 + (s & 63) * 4);
+#else
       k31_key_row(x, idx_key_w, idx_key_b, idx_cache + s * 144, l);
+#endif
     }
   }
 #endif

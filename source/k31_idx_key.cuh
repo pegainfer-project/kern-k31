@@ -41,9 +41,12 @@ __device__ __forceinline__ void bf16x4(const __nv_bfloat16* p, float v[4]) {
 }
 
 // Lane l's four values x (columns 4l .. 4l + 3, bf16 values) of a row's key, with the norm's weight w and
-// bias b, into `row`. Every lane of the warp calls it.
+// bias b, into `row`. Every lane of the warp calls it. With `scale`, the row is SGLang's instead
+// (fused_store_index_cache): one f32 scale max(amax, 1e-4) / 448, the values times its reciprocal, and the
+// scale lands at `scale` (its index-K page, k31_idx_page) rather than as the packed word after the row.
 __device__ __forceinline__ void k31_key_row(const float x[4], const __nv_bfloat16* __restrict__ w,
-                                            const __nv_bfloat16* __restrict__ b, unsigned char* row, int l) {
+                                            const __nv_bfloat16* __restrict__ b, unsigned char* row, int l,
+                                            unsigned char* scale = nullptr) {
   float g[4], c[4];
   bf16x4(w + l * 4, g);
   bf16x4(b + l * 4, c);
@@ -55,7 +58,20 @@ __device__ __forceinline__ void k31_key_row(const float x[4], const __nv_bfloat1
   float y[4];
 #pragma unroll
   for (int j = 0; j < 4; ++j) y[j] = rnd((x[j] - mean) * rstd * g[j] + c[j]);
-  const float sc = ue8m0(warp_max(fmaxf(fmaxf(fabsf(y[0]), fabsf(y[1])), fmaxf(fabsf(y[2]), fabsf(y[3])))), 1e-4f);
+  const float amax = warp_max(fmaxf(fmaxf(fabsf(y[0]), fabsf(y[1])), fmaxf(fabsf(y[2]), fabsf(y[3]))));
+  if (scale) {
+    const float sc = fmaxf(amax, 1e-4f) / 448.f, inv = 1.0f / sc;
+    *reinterpret_cast<unsigned*>(row + l * 4) = fp8x4(y[0] * inv, y[1] * inv, y[2] * inv, y[3] * inv);
+    if (l == 0) *reinterpret_cast<float*>(scale) = sc;
+    return;
+  }
+  const float sc = ue8m0(amax, 1e-4f);
   *reinterpret_cast<unsigned*>(row + l * 4) = fp8x4(y[0] / sc, y[1] / sc, y[2] / sc, y[3] / sc);
   if (l == 0) *reinterpret_cast<unsigned*>(row + 128) = ue8m0x4(sc);
+}
+
+// SGLang's index-K page: 64 tokens' keys of 128 bytes, then their 64 f32 scales, 8448 bytes; slot s is
+// token s % 64 of page s / 64.
+__device__ __forceinline__ unsigned char* k31_idx_page(unsigned char* cache, long long s) {
+  return cache + (s >> 6) * 8448;
 }

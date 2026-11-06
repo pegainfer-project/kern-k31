@@ -63,7 +63,8 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                                                const cute::TmaDescriptor& tensor_map_kv,
                                                const cute::TmaDescriptor& tensor_map_sf_kv,
                                                const cute::TmaDescriptor& tensor_map_weights,
-                                               const MakeScheduler& make_scheduler) {
+                                               const MakeScheduler& make_scheduler,
+                                               const uint8_t* sf_kv_pages = nullptr) {
     constexpr bool kIsFP4 = cute::is_same_v<qk_dtype_t, cutlass::float_e2m1_t>;
     using Scheduler = decltype(make_scheduler(0u));
     constexpr bool kIsPaged = Scheduler::kIsPaged;
@@ -295,13 +296,16 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
         // kern: `stride` words a source element; a chunk's compact output lands at or below its source
         auto utccp_required_smem_warp_transpose = [&](const uint32_t* smem_ptr, const uint32_t* src = nullptr,
-                                                      const uint32_t& stride = 1) {
+                                                      const uint32_t& stride = 1, const bool& f32 = false) {
             DG_STATIC_ASSERT(kNumUTCCPAlignedElems == 128, "Invalid aligned elements");
             src = src ? src : smem_ptr;
             uint32_t values[4];
             #pragma unroll
-            for (uint32_t i = 0; i < 4; ++ i)
+            for (uint32_t i = 0; i < 4; ++ i) {
                 values[i] = ptx::ld_shared(src + (i * 32 + lane_idx) * stride);
+                if (f32)
+                    values[i] = (values[i] >> 23 & 0xffu) * 0x01010101u;
+            }
             __syncwarp();
             ptx::st_shared(smem_ptr + lane_idx * 4, values[0], values[1], values[2], values[3]);
         };
@@ -357,7 +361,8 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                 for (uint32_t i = 0; i < kNumSFKV / kNumUTCCPAlignedElems; ++ i) {
                     auto smem_ptr = smem.smem_sf_kv[kv_stage_idx] + i * kNumUTCCPAlignedElems;
                     utccp_required_smem_warp_transpose(
-                        smem_ptr, smem.smem_sf_kv[kv_stage_idx] + i * kNumUTCCPAlignedElems * kSFStride, kSFStride);
+                        smem_ptr, smem.smem_sf_kv[kv_stage_idx] + i * kNumUTCCPAlignedElems * kSFStride, kSFStride,
+                        kIsPaged and DG_SF_KV_F32);
                 }
                 cutlass::arch::fence_view_async_shared();
                 __syncwarp();
@@ -490,6 +495,11 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                     if (seq_k_start[i] <= kv_offset and kv_offset < seq_k_end[i])
                         ptx::st_global_low_bf16(output_bases[i] + kv_offset, result);
                 };
+                // kern: the summed pair times the key's mantissa, in f32, back to bf16 (DG_SF_KV_F32)
+                const auto scaled = [&](const nv_bfloat162& sum, const float& m) {
+                    const auto r = __hadd_rn(__low2bfloat16(sum), __high2bfloat16(sum));
+                    return __halves2bfloat162(__float2bfloat16_rn(__bfloat162float(r) * m), __float2bfloat16_rn(0.0f));
+                };
                 const auto reduce_pairs = [&](const float* chunk, const nv_bfloat162* chunk_weights, const uint32_t& num_heads,
                                               nv_bfloat162& sum_0, nv_bfloat162& sum_1) {
                     #pragma unroll
@@ -505,6 +515,17 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                 #pragma unroll (kIsPaged ? 1 : 2)
                 for (uint32_t kv_split_idx = 0; kv_split_idx < task.num_kv_splits; ++ kv_split_idx) {
                     const auto kv_offset = task.kv_token_base + kv_split_idx * SPLIT_KV + math_thread_idx;
+                    // kern: DG_SF_KV_F32 gave the MMA a key's scale rounded down to a power of two; the rest of
+                    // it (1 <= m < 2) scales the key's whole logit, as ReLU and the head sum are linear in it
+                    float mantissa = 1.0f;
+                    if constexpr (kIsPaged and DG_SF_KV_F32) {
+                        if (kv_offset / 64 < scheduler.task_num_kv_pages) {
+                            const uint32_t page = __ldg(scheduler.task_block_table_row + kv_offset / 64);
+                            const uint32_t bits = __ldg(reinterpret_cast<const uint32_t*>(
+                                sf_kv_pages + static_cast<uint64_t>(page) * (64 * (kHeadDim + 4)) + 64 * kHeadDim) + kv_offset % 64);
+                            mantissa = __uint_as_float((bits & 0x7fffffu) | 0x3f800000u);
+                        }
+                    }
                     CUTE_TIE_DECL(tmem_pipeline.advance(kNumMathWarpGroups), tmem_stage_idx, tmem_phase);
                     smem.full_tmem_barriers[tmem_stage_idx].wait(tmem_phase);
                     ptx::tcgen05_after_thread_sync();
@@ -526,7 +547,11 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                             reduce_pairs(accum, weights[i] + kHeadBase / 2, kNumChunkHeads, sum_0, sum_1);
                         };
                         visit_tmem_head_chunks<kNumHeads>(tmem_stage_idx * UMMA_N + i * kNumHeads, accum, reduce_head_chunk);
-                        store_token(i, kv_offset, sum_0, sum_1);
+                        if constexpr (kIsPaged and DG_SF_KV_F32)
+                            store_token(i, kv_offset, __floats2bfloat162_rn(0.0f, 0.0f),
+                                        scaled(__hadd2_rn(sum_0, sum_1), mantissa));
+                        else
+                            store_token(i, kv_offset, sum_0, sum_1);
                     }
                 }
             };
@@ -601,8 +626,17 @@ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_sf_kv,
-                            const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
+                            const __grid_constant__ cute::TmaDescriptor tensor_map_weights
+#if DG_SF_KV_F32
+                            , const uint8_t* sf_kv_pages  // kern: the key cache's pages, for the f32 scales
+#endif
+                            ) {
     DG_STATIC_ASSERT(UMMA_N == math::constexpr_align(BLOCK_Q * kNumHeads, 8u), "Invalid Q tile shape");
+#if DG_SF_KV_F32
+    DG_STATIC_ASSERT(PAGE_KV == 64 and BLOCK_Q == 4, "f32 key scales: 64-token pages");
+#else
+    const uint8_t* sf_kv_pages = nullptr;
+#endif
 
     const auto make_scheduler = [&](const uint32_t& sm_idx) {
         return sched::SM100PagedMQALogitsScheduler<kNumHeads, BLOCK_Q, SPLIT_KV, PAGE_KV, kSplitsPerChunk>(
@@ -616,7 +650,7 @@ void sm100_paged_mqa_logits(const uint32_t num_q_tokens_total,
                                decltype(make_scheduler), kNumMathWarpGroups>(
         logits_stride, logits,
         tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv, tensor_map_weights,
-        make_scheduler);
+        make_scheduler, sf_kv_pages);
 }
 
 } // namespace deep_gemm
