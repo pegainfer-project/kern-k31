@@ -10,6 +10,13 @@
 #ifndef DG_SF_KV_STRIDE
 #define DG_SF_KV_STRIDE 1
 #endif
+// kern: DG_SF_KV_F32 1 reads a paged KV's scale words as plain f32 (SGLang's index-K page: 64 keys, then
+// 64 f32 scales): UTCCP gets each one's exponent byte as the four UE8M0 scales of the word, and the math
+// warps multiply the key's logit by the mantissa the exponent left out, read from the page in global memory
+// (sm100_paged_mqa_logits' last parameter).
+#ifndef DG_SF_KV_F32
+#define DG_SF_KV_F32 0
+#endif
 
 namespace deep_gemm::layout {
 
