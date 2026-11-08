@@ -24,7 +24,7 @@ Q_ABS = "bf16"
 # (tools/kernels-bin/README.md), two entries in one module. It walks a row
 # in 128-token tiles; each row runs as `mla_bsk[b]` splits of a 2-CTA
 # cluster and a reduction merges them. The parameter ABI packed below is
-# the DSL's flattened struct layout (docs/k3-kernel-abi.md K5).
+# the DSL's flattened struct layout (kern-k3-pp-prefill's docs/k3-kernel-abi.md K5).
 MLA_MODULE = "mla_decode_h96_p64"
 MLA_MAIN = ("kernel_cutlass_split_kv_kernel_flashinfercute_dslattentionmonolithicmla_decode_fp16"
             "BlackwellMultiHeadLatentAttentionForwardFP16_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____0")

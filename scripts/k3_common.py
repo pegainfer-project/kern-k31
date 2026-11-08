@@ -49,7 +49,7 @@ ROWS = "rows"
 CTX = "ctx"
 
 # Launch geometry per entry, as the kernel headers document it
-# (docs/k3-kernel-abi.md §1). grid.x is always the batch.
+# (kern-k3-pp-prefill's docs/k3-kernel-abi.md §1). grid.x is always the batch.
 GEOM = {
     "kern_k3_land_add_attnres_rms": ([T, 1, 1], [1024, 1, 1], 0),
     "kern_k3_kda_core": ([T, HEADS, 1], [128, 1, 1], 0),
