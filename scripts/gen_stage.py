@@ -54,14 +54,14 @@ keys with the indexer and attend each row's top 2048 through TRT-LLM gen's spars
 member scores its own positions, pushes the best of its top-k into every member's Lamport stage, each
 member cuts the group's top-k once all have landed, and the sparse partials meet in k3_dcp's SPARSE
 exchange. Over bf16 pages an MLA layer runs K3's dense attention instead: P expands the context's latent
-rows by kv_b and runs TensorRT-LLM's context FMHA (kern's docs/k3-kernel-abi.md K13), or, for a call of
+rows by kv_b and runs TensorRT-LLM's context FMHA (kern-k3-pp-prefill's docs/k3-kernel-abi.md K13), or, for a call of
 at most --mla-short rows, attends in the latent space; D runs FlashInfer's CuTe-DSL MLA decode.
 
 `--kv` picks the MLA cache: SGLang's fp8 (scripts/k3_kv_fp8.py, the default, DSA)
 or bf16 (scripts/k3_kv_bf16.py, dense). A flavor owns its page bytes, D's absorb,
 attention and exchange, and P's absorbed short path (bf16's alone).
 
-The kernels are kern's own (kern's docs/k3-kernel-abi.md, source/k3_*.cu): B
+The kernels are kern's own (kern-k3-pp-prefill's docs/k3-kernel-abi.md, source/k3_*.cu): B
 is a runtime argument, every launch takes one row per block.x, and the
 landing / residual / norm / append work is fused into its neighbours.
 """

@@ -13,6 +13,7 @@ bytes as well.
 | `trtllm_sparse_mla_h576_v512_e4m3.cubin` | the same bundle as FlashInfer 0.7.2.post1 ships it: the sparse MLA kernel (e4m3 q and KV 576 / 512, bf16 o, 2-CTA, persistent) FlashInfer runs for K3.1 on SM100 and SM103, P and D alike | `LICENSE.trtllm-gen.txt` |
 | `cake_k3_mla_wide.cubin` | built from `../source/flashinfer-cake-k3-mla/` (FlashInfer's Cake MLA decode): K3's fp8 D, which no manifest reaches under DSA | Apache-2.0, see that directory and its `PROVENANCE.md` |
 | `cudnn_frost_kda.cubin` | the vendored cuDNN frontend FROST KDA prefill in `../source/cudnn-frost-kda/`, compiled by its `build.py` (CuTe DSL; deterministic) | Apache-2.0 / MIT, see that directory |
+| `mla_decode_h96_p64.cubin` | FlashInfer's CuTe-DSL MLA decode compiled for K3's bf16 D by `../source/flashinfer-mla-dsl/build.py` | BSD-3-Clause, see that directory and its `PROVENANCE.md` |
 | `flashinfer_moe_routing.cubin` | built from `../source/flashinfer-moe-routing/` | Apache-2.0, see that directory and its `PROVENANCE.md` |
 
 No source recipe is available here for the TRT-LLM gen cubins.
