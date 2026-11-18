@@ -142,6 +142,21 @@ def pieces(local, tokens, tokens_max, out_rows, prefix="", names=None, stride=No
             "impl": {"launches": [glue("kern_k3g_finalize_rms", [out_rows, 1, 1], block=H // 8, mod=pglue)]},
         },
     }
+    if stride == 2 and tile == 16:
+        # A row contributes at most TOPK routes. After each expert gets its first
+        # tile, every additional tile needs another tile's worth of routes.
+        limit = 32
+        bound = trtllm_bmm.max_ctas(limit, TOPK, local, tile)
+        small_ctas = {"clamp": [{"mul": [tokens, TOPK]}, 0, bound]}
+        for name in ("moe_fc1", "moe_fc2"):
+            launches = ops[name]["impl"]["launches"]
+            large, = launches
+            x, _, z = large["grid"]
+            small = {**large, "grid": [x, small_ctas, z]}
+            launches[:] = ([small] if tokens_max <= limit else
+                           [{**small, "when": {"var": tokens, "max": limit}},
+                            {**large, "when": {"var": tokens, "min": limit + 1}}])
+
     # The batched GEMMs wait on the grid before them (griddepcontrol.wait) and trigger their dependents
     # early: with `pdl` launched as programmatic dependents, their CTAs land while the kernel before
     # them finishes.
